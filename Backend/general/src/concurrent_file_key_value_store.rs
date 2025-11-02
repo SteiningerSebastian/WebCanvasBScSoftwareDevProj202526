@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{collections::HashMap, fmt::Display, sync::{Arc, Mutex}};
 
 use arc_swap::ArcSwap;
 
@@ -8,6 +8,15 @@ use crate::file_key_value_store::{self, FileKeyValueStore, KeyValueStore};
 pub enum Error {
     FileStoreError(file_key_value_store::Error),
     MutexLockPoisoned,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::FileStoreError(e) => write!(f, "File store error: {}", e),
+            Error::MutexLockPoisoned => write!(f, "Mutex lock poisoned"),
+        }
+    }
 }
 
 impl From<file_key_value_store::Error> for Error {
