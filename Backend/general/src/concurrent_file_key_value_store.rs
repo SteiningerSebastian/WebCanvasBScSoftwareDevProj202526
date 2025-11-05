@@ -27,7 +27,16 @@ impl From<file_key_value_store::Error> for Error {
 
 pub struct ConcurrentFileKeyValueStore {
     state: Arc<ArcSwap<HashMap<String, String>>>,
-    write_lock: Mutex<FileKeyValueStore>,
+    write_lock: Arc<Mutex<FileKeyValueStore>>,
+}
+
+impl Clone for ConcurrentFileKeyValueStore {
+    fn clone(&self) -> Self {
+        ConcurrentFileKeyValueStore {
+            state: Arc::clone(&self.state),
+            write_lock: Arc::clone(&self.write_lock),
+        }
+    }
 }
 
 pub struct TransactionRef<'a> {
@@ -56,7 +65,7 @@ impl ConcurrentFileKeyValueStore {
     pub fn new(file_path: &str) -> Result<Self, Error> {
         let store = FileKeyValueStore::new(file_path).map_err(Error::FileStoreError)?;
         let a = store.get_committed_arc();
-        let write_lock: Mutex<FileKeyValueStore> = Mutex::new(store);
+        let write_lock: Arc<Mutex<FileKeyValueStore>> = Arc::new(Mutex::new(store));
 
         Ok(Self {
             state: a,
