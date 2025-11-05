@@ -39,6 +39,7 @@ metadata:
   labels:
     app: veritas
 spec:
+  serviceName: veritas-headless
   replicas: 5
   selector:
     matchLabels:
