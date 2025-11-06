@@ -70,7 +70,7 @@ spec:
                 name: veritas-config
           volumeMounts:
             - name: app-data
-              mountPath: /app
+              mountPath: /data
           resources:
             limits:
               cpu: 500m
