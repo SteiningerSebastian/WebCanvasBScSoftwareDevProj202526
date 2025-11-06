@@ -68,6 +68,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: veritas-config
+          env:
+            - name: ORDINAL_NUMBER
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
           volumeMounts:
             - name: app-data
               mountPath: /data
