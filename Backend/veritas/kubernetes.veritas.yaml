@@ -98,6 +98,7 @@ spec:
             periodSeconds: 10
             successThreshold: 1
             failureThreshold: 3
+          imagePullPolicy: Always
   podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
