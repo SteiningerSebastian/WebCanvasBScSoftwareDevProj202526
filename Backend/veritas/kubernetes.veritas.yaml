@@ -68,6 +68,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: veritas-config
+          volumeMounts:
+            - name: app-data
+              mountPath: /app
           resources:
             limits:
               cpu: 500m
@@ -95,13 +98,17 @@ spec:
             periodSeconds: 10
             successThreshold: 1
             failureThreshold: 3
-          resources:
-            requests:
-              cpu: "50m"
-              memory: "64Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
   podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  volumeClaimTemplates:
+    - metadata:
+        name: app-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 128Mi

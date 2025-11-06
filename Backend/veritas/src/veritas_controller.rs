@@ -68,6 +68,7 @@ impl VeritasController {
 }
 
 impl VeritasController{
+
     /// Start serving HTTP requests.
     /// This function will block the current thread.
     pub fn start_http_serving(&self){
