@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::{env};
 use std::process;
 use std::time::{Duration};
-use tracing::{info, debug, warn, error, trace, Level};
+use actix_web::rt::System;
+use tracing::{info, debug, error, trace, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
@@ -39,12 +41,13 @@ fn main() {
         },
         Err(_) => {
             eprintln!("Environment variable LOG_LEVEL is not set");
-                if cfg!(debug_assertions) {
-                    eprintln!("Defaulting LOG_LEVEL to DEBUG for debug build");
-                    Level::TRACE
-                } else {
-                    Level::WARN
-                }
+            if cfg!(debug_assertions) {
+                eprintln!("Defaulting LOG_LEVEL to DEBUG for debug build");
+                Level::DEBUG
+            } else {
+                eprintln!("Defaulting LOG_LEVEL to WARN for release build");
+                Level::WARN
+            }
         }
     };
 
@@ -57,7 +60,7 @@ fn main() {
 
     // For debug builds, set VERITAS_NODES to a default value if not set
     if cfg!(debug_assertions) {
-        let debug_nodes = "127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4,localhost";
+        let debug_nodes = "localhost,127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4";
         unsafe {
             env::set_var("VERITAS_NODES", debug_nodes);
         }
@@ -101,8 +104,14 @@ fn main() {
     let ordinal_number = match env::var("ORDINAL_NUMBER") {
         Ok(v) => v,
         Err(_) => {
-            error!("Environment variable ORDINAL_NUMBER is not set");
-            process::exit(1);
+            if cfg!(debug_assertions) {
+                // For debug builds, default to 0
+                debug!("Environment variable ORDINAL_NUMBER is not set, defaulting to 0 for debug build");
+                "0".to_string()
+            } else {
+                error!("Environment variable ORDINAL_NUMBER is not set");
+                process::exit(1);
+            }
         }
     };
 
@@ -119,19 +128,20 @@ fn main() {
         panic!("Failed to initialize key-value store at '{}': {}", PATH_TO_KV_STORE, e);
     });
 
-    let veritas_controller = VeritasController::new(id, kv_store, 80);
-    match veritas_controller {
-        Err(e) => {
-            panic!("Failed to create VeritasController: {}", e);
-        }
-        Ok(mut vc) => {
-            vc.start_ticking(
-                nodes_tokens,
-                dns_ttl,
-                Duration::from_secs(5),
-            ).unwrap();
+    let veritas_controller = VeritasController::<ConcurrentFileKeyValueStore>::new(id, kv_store);
+    let arc_vc = Arc::new(veritas_controller);
 
-            vc.start_http_serving();
-        }
-    }
+    // Start the Actix system and serve HTTP requests
+    let sys = System::new();
+
+    let arc_vc_clone = Arc::clone(&arc_vc);
+    sys.runtime().spawn(async move {
+        arc_vc_clone.start_ticking(nodes_tokens, Duration::from_secs(2), dns_ttl).await;
+    });
+
+    sys.block_on(async {
+        // Panic on failure - as the microservice is not functional without it
+        arc_vc.start_serving_http().await.unwrap();
+    });
+    
 }

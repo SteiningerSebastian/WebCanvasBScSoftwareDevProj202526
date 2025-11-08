@@ -25,6 +25,12 @@ impl From<file_key_value_store::Error> for Error {
     }
 }
 
+pub trait ConcurrentKeyValueStore {
+    fn begin_transaction(&'_ self) -> Result<TransactionRef<'_>, Error>;
+    fn get(&self, key: &str) -> Option<String>;
+    fn set(&self, key: &str, value: &str) -> Result<(), Error>;
+}
+
 pub struct ConcurrentFileKeyValueStore {
     state: Arc<ArcSwap<HashMap<String, String>>>,
     write_lock: Arc<Mutex<FileKeyValueStore>>,
@@ -38,6 +44,9 @@ impl Clone for ConcurrentFileKeyValueStore {
         }
     }
 }
+
+unsafe impl Send for ConcurrentFileKeyValueStore {}
+unsafe impl Sync for ConcurrentFileKeyValueStore {}
 
 pub struct TransactionRef<'a> {
     _transaction_mutex_guard: std::sync::MutexGuard<'a, FileKeyValueStore>,
@@ -72,78 +81,7 @@ impl ConcurrentFileKeyValueStore {
             write_lock,
         })
     }
-
-    /// Returns a clone of the value associated with `key` from the store's committed snapshot.
-    ///
-    /// This method performs a lock-free read: it accesses the atomic committed snapshot and does
-    /// not acquire the write mutex, so it will not block concurrent writers. Because it reads
-    /// the last committed state, it will not observe uncommitted changes made by an ongoing
-    /// transaction.
-    ///
-    /// Parameters
-    /// - `key`: The key to look up (borrowed `&str`).
-    ///
-    /// Returns
-    /// - `Some(String)` with a cloned, owned value if the key exists in the committed snapshot.
-    /// - `None` if the key is not present.
-    ///
-    /// Notes
-    /// - The returned `String` is an owned clone; modifying it does not affect the store.
-    /// - Lookup is typically O(1) (hash map lookup).
-    /// - Safe for concurrent calls from multiple threads.
-    /// - If you require a view that includes in-progress writes, perform the read
-    ///   from within a transaction that has acquired the lock.
-    ///
-    /// Example
-    /// ```ignore
-    /// if let Some(value) = store.get("my_key") {
-    ///     println!("value: {}", value);
-    /// }
-    /// ```
-    pub fn get(&self, key: &str) -> Option<String> {
-        // As we swap the entire map on commit, we can read without locks.
-        let committed_map = self.state.load();
-        committed_map.get(key).cloned()
-    }
-
-    // Use &self, acquire write lock when needed
-    pub fn set(&self, key: &str, value: &str) -> Result<(), Error> {
-        let mut store = self.write_lock.lock()
-            .map_err(|_| Error::MutexLockPoisoned)?;
-
-        store.set(key, value);
-        store.commit().map_err(Error::FileStoreError)?;
-
-        Ok(())
-    }
-
-    /// Begins a new transaction by acquiring a write lock on the underlying key-value store.
-    /// 
-    /// This method returns a `TransactionRef` which holds the write lock for the duration of the transaction,
-    /// allowing multiple operations to be performed atomically. Changes made within the transaction are
-    /// staged in-memory and can be committed together. The transaction ensures that no other thread can
-    /// write to the store until the transaction is completed or dropped.
-    /// 
-    /// # Returns
-    ///
-    /// A `Result<TransactionRef, Error>` that provides transactional access to the key-value store.
-    ///
-    /// # Example
-    /// 
-    /// ``` ignore
-    /// let store = ConcurrentFileKeyValueStore::new("data.txt").unwrap();
-    /// let mut txn = store.begin_transaction().unwrap();
-    /// txn.set("key", "value");
-    /// txn.commit().unwrap();
-    /// ```
-    pub fn begin_transaction(&'_ self) -> Result<TransactionRef<'_>, Error> {
-        let _transaction_mutex_guard = self.write_lock.lock()
-            .map_err(|_| Error::MutexLockPoisoned)?;
-        Ok(TransactionRef { _transaction_mutex_guard, committed: false })
-    }
 }
-
-
 
 impl<'a> TransactionRef<'a> {
     // operate on the inner store while holding the exclusive lock
@@ -180,6 +118,100 @@ impl<'a> TransactionRef<'a> {
         self.committed = true;
         Ok(())
     }  
+}
+
+impl ConcurrentKeyValueStore for ConcurrentFileKeyValueStore {
+    /// Returns a clone of the value associated with `key` from the store's committed snapshot.
+    ///
+    /// This method performs a lock-free read: it accesses the atomic committed snapshot and does
+    /// not acquire the write mutex, so it will not block concurrent writers. Because it reads
+    /// the last committed state, it will not observe uncommitted changes made by an ongoing
+    /// transaction.
+    ///
+    /// Parameters
+    /// - `key`: The key to look up (borrowed `&str`).
+    ///
+    /// Returns
+    /// - `Some(String)` with a cloned, owned value if the key exists in the committed snapshot.
+    /// - `None` if the key is not present.
+    ///
+    /// Notes
+    /// - The returned `String` is an owned clone; modifying it does not affect the store.
+    /// - Lookup is typically O(1) (hash map lookup).
+    /// - Safe for concurrent calls from multiple threads.
+    /// - If you require a view that includes in-progress writes, perform the read
+    ///   from within a transaction that has acquired the lock.
+    ///
+    /// Example
+    /// ```ignore
+    /// if let Some(value) = store.get("my_key") {
+    ///     println!("value: {}", value);
+    /// }
+    /// ```
+    fn get(&self, key: &str) -> Option<String> {
+        // As we swap the entire map on commit, we can read without locks.
+        let committed_map = self.state.load();
+        committed_map.get(key).cloned()
+    }
+
+    /// Sets the value for `key` in the store, acquiring the write lock to ensure exclusive access.
+    /// This method will block until the lock is acquired.
+    /// 
+    /// Parameters:
+    /// - `key`: The key to set (borrowed `&str`).
+    /// - `value`: The value to associate with the key (borrowed `&str`).
+    /// 
+    /// Returns:
+    /// - `Ok(())` on success.
+    /// - `Err(Error::MutexLockPoisoned)` if the write lock is poisoned.
+    /// - `Err(Error::FileStoreError)` if committing the change to the underlying store fails.
+    /// 
+    /// # Notes:
+    /// - This method acquires the write mutex, blocking other writers and transactions.
+    /// - After setting the value, it immediately commits the change to persist it.
+    /// - For multiple related changes, consider using a transaction via `begin_transaction()`.
+    /// 
+    /// # Example:
+    /// ``` ignore
+    /// let store = ConcurrentFileKeyValueStore::new("data.txt").unwrap();
+    /// store.set("key", "value").unwrap();
+    /// let value = store.get("key").unwrap();
+    /// assert_eq!(value, "value");
+    /// ```
+    fn set(&self, key: &str, value: &str) -> Result<(), Error> {
+        let mut store = self.write_lock.lock()
+            .map_err(|_| Error::MutexLockPoisoned)?;
+
+        store.set(key, value);
+        store.commit().map_err(Error::FileStoreError)?;
+
+        Ok(())
+    }
+
+    /// Begins a new transaction by acquiring a write lock on the underlying key-value store.
+    /// 
+    /// This method returns a `TransactionRef` which holds the write lock for the duration of the transaction,
+    /// allowing multiple operations to be performed atomically. Changes made within the transaction are
+    /// staged in-memory and can be committed together. The transaction ensures that no other thread can
+    /// write to the store until the transaction is completed or dropped.
+    /// 
+    /// # Returns
+    ///
+    /// A `Result<TransactionRef, Error>` that provides transactional access to the key-value store.
+    ///
+    /// # Example
+    /// 
+    /// ``` ignore
+    /// let store = ConcurrentFileKeyValueStore::new("data.txt").unwrap();
+    /// let mut txn = store.begin_transaction().unwrap();
+    /// txn.set("key", "value");
+    /// txn.commit().unwrap();
+    /// ```
+    fn begin_transaction(&'_ self) -> Result<TransactionRef<'_>, Error> {
+        let _transaction_mutex_guard = self.write_lock.lock()
+            .map_err(|_| Error::MutexLockPoisoned)?;
+        Ok(TransactionRef { _transaction_mutex_guard, committed: false })
+    }
 }
 
 impl<'a> Drop for TransactionRef<'a> {
