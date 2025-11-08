@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use serde_json;
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub enum Error{
@@ -107,6 +108,8 @@ impl FileKeyValueStore {
 
         // If no files exist, start with empty store
         if !any_exist {
+            info!("FileKeyValueStore: No existing files found at {:?}, creating new FileKeyValueStore.", file_path);
+
             // No files exist, start fresh
             return Ok(Self {
                 committed,
@@ -183,14 +186,23 @@ impl FileKeyValueStore {
         // If a majority (count >= 2) exists, return it
         if let Some((bytes, count)) = counts.iter().max_by_key(|(_, c)| *c) {
             if *count >= 2 {
+                info!("FileKeyValueStore: Majority read successful from replicas");
+                if *count == contents.len() {
+                    debug!("FileKeyValueStore: All replicas agree");
+                } else {
+                    warn!("FileKeyValueStore: Some replicas disagreed, but majority found");
+                }
+
                 return Ok(bytes.clone());
             }
         }
 
+        error!("FileKeyValueStore: No majority found among replicas - could not recover data");
         Err(Error::MajorityUnreachable(None))
     }
 
 
+    /// Internal method to write the current state to disk atomically.
     fn write_to_disk(&self) -> Result<(), Error> {
         // Ensure parent directory exists (if any)
         if let Some(parent) = self.file_path.parent() {
