@@ -6,9 +6,9 @@ WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y musl-tools gcc build-essential ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace manifests first for layer caching
-COPY Cargo.toml Cargo.lock ./
 COPY veritas/Cargo.toml veritas/Cargo.toml
 COPY general/Cargo.toml general/Cargo.toml
+COPY Cargo.toml Cargo.lock ./
 
 # Create minimal placeholder src files so workspace members have a target
 # This does NOT build anything — it only satisfies Cargo's manifest checks so `cargo fetch` can run.
