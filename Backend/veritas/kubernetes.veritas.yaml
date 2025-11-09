@@ -87,7 +87,7 @@ spec:
               memory: 128Mi
           livenessProbe:
             httpGet:
-              path: /tick
+              path: /tick/0
               port: http
               scheme: HTTP
             initialDelaySeconds: 30
@@ -97,7 +97,7 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /tick
+              path: /tick/0
               port: http
               scheme: HTTP
             initialDelaySeconds: 5

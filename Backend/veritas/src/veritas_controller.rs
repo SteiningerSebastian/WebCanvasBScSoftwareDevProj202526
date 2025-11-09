@@ -1,20 +1,38 @@
-use actix_web::{App, HttpRequest, HttpServer, cookie::time::format_description::modifier::Period, web};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, ResponseError, http::{StatusCode, header::ContentType}, web};
 use general::{concurrent_file_key_value_store::ConcurrentKeyValueStore, dns::{self, DNSLookup}, file_key_value_store};
-use tokio::task::JoinSet;
+use reqwest::Client;
+use tokio::{task::JoinSet};
 use tracing::{debug, info, trace, warn};
-use std::{fmt::Display, ops::Add, path, sync::{RwLock, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::Duration};
+use std::{fmt::Display, sync::{RwLock, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::Duration};
 
 #[derive(Debug)]
 pub enum Error {
     FileKeyValueStoreError(file_key_value_store::Error),
-    LockPoisoned,
+    QuorumNotReached,
+    ForwardRequestError(reqwest::Error),
+}
+
+impl ResponseError for Error {
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code())
+            .insert_header(ContentType::html())
+            .body(self.to_string())
+    }
+
+    fn status_code(&self) -> StatusCode {
+        match *self {
+            Error::QuorumNotReached => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::FileKeyValueStoreError(e) => write!(f, "File key-value store error: {}", e),
-            Error::LockPoisoned => write!(f, "Lock poisoned"),
+            Error::QuorumNotReached => write!(f, "Quorum not reached"),
+            Error::ForwardRequestError(e) => write!(f, "Failed to forward request: {}", e),
         }
     }
 }
@@ -30,7 +48,6 @@ enum State {
     Initializing,
     Running,
     QuorumNotReached,
-    Stopped,
 }
 
 pub struct AppState<F> where F: ConcurrentKeyValueStore + Clone + Send + Sync + 'static {
@@ -39,10 +56,13 @@ pub struct AppState<F> where F: ConcurrentKeyValueStore + Clone + Send + Sync + 
     state: RwLock<State>,
     candidate_id: AtomicUsize,
     leader_id: AtomicUsize,
+    id: usize,
+    node_tokens: Vec<String>,
+    dns_lookup: dns::DNSLookup,
+
 }
 
 pub struct VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + Sync + 'static {
-    id: usize,
     state: web::Data<AppState<F>>,
 }
 
@@ -56,15 +76,17 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// let kv_store = ConcurrentFileKeyValueStore::new(...);
     /// let controller = VeritasController::new(1, kv_store);
     /// ```
-    pub fn new(id: usize, kv_store: F) -> Self {
+    pub fn new(id: usize, kv_store: F, node_tokens: Vec<String>, dns_ttl: Duration) -> Self {
         VeritasController {
-            id,
             state: web::Data::new(AppState {
+                id,
                 time: AtomicU64::new(0),
                 kv_store: kv_store,
                 state: RwLock::new(State::Initializing),
                 candidate_id: AtomicUsize::new(id),
-                leader_id: AtomicUsize::new(id),
+                leader_id: AtomicUsize::new(usize::MAX), // Use the last id as no leader - quorum unreachable
+                node_tokens: node_tokens,
+                dns_lookup: dns::DNSLookup::new(dns_ttl),
             }),
         }
     }
@@ -78,26 +100,24 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// - node_tokens: A vector of node identifiers (hostnames or IPs) to check
     /// - period: Duration between each tick/check
     /// - dns_ttl: Duration for DNS cache TTL
-    pub async fn start_ticking(&self, node_tokens: Vec<String>, period: std::time::Duration, dns_ttl: Duration) {
+    pub async fn start_ticking(&self, period: std::time::Duration) {
         // Placeholder for ticking logic
-        trace!("VeritasController {} started ticking.", self.id);
-
-        let dns_lookup = dns::DNSLookup::new(dns_ttl);
+        trace!("VeritasController {} started ticking.", self.state.id);
 
         loop {
             let mut n_available_nodes: usize = 1; // Count self as available
-            let mut candidate_id: usize = self.id; // Start with self as candidate
+            let mut lowest_candidate_id: usize = self.state.id; // Start with self as candidate
 
             // Check the health of other nodes
-            for i in 0..node_tokens.len() {
-                if i == self.id {
+            for i in 0..self.state.node_tokens.len() {
+                if i == self.state.id {
                     continue; // Skip self
                 }
 
-                let token = &node_tokens[i];
-                trace!("VeritasController {} checking node: {}", self.id, token);
+                let token = &self.state.node_tokens[i];
+                trace!("VeritasController {} checking node: {}", self.state.id, token);
 
-                match dns_lookup.resolve_node(token) {
+                match self.state.dns_lookup.resolve_node(token) {
                     Ok(ip) => {
                         trace!("Resolved node '{}' to IP: {}", token, ip);
 
@@ -117,7 +137,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                             n_available_nodes += 1;
 
                             // Update the candidate id - elect the lowest id among available nodes
-                            candidate_id = candidate_id.min(i);
+                            lowest_candidate_id = lowest_candidate_id.min(i);
 
                         } else {
                             debug!("Failed to tick node '{}' at IP: {}", token, ip);
@@ -127,64 +147,64 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                         trace!("Failed to resolve node '{}': {}", token, e);
                     }
                 }
-            }
 
-            trace!("VeritasController {} found {} available nodes.", self.id, n_available_nodes);
+                trace!("VeritasController {} found {} available nodes.", self.state.id, n_available_nodes);
 
-            // Update internal state based on available nodes
-            {
-                let mut state_guard = self.state.state.write().unwrap();
-                if n_available_nodes * 2 > node_tokens.len() {
-                    // Quorum reached
-                    if *state_guard != State::Running {
-                        trace!("VeritasController {} transitioning to Running state.", self.id);
-                    }
-                    *state_guard = State::Running;
-                } else {
-                    // Quorum not reached
-                    if *state_guard != State::QuorumNotReached {
-                        warn!("VeritasController {} transitioning to QuorumNotReached state.", self.id);
-                    } 
-                    *state_guard = State::QuorumNotReached;
-                }
-            }
-
-            // Update the candidate_id
-            self.state.candidate_id.store(candidate_id, Ordering::SeqCst);
-
-            if self.id == candidate_id {
-                info!("VeritasController {} is the current leader candidate.", self.id);
-                // Ask other nodes to elect me as leader
-                let n_votes = self.ask_for_votes(dns_lookup.clone()).await + 1; // Count self vote
-                trace!("VeritasController {} received {} votes.", self.id, n_votes);
-                if n_votes * 2 > node_tokens.len() {
-                    trace!("VeritasController {} has been elected as leader with {} votes.", self.id, n_votes);
-
-                    if self.state.leader_id.load(Ordering::SeqCst) != self.id {
-                        info!("VeritasController {} is now the new leader. Wait out the current period - for current leader to step down.", self.id);
-                        tokio::time::sleep(period).await;
-
-                        // After wainting for the old leader to step down - ask for votes again to make sure we are still the leader.
-                        let n_votes = self.ask_for_votes(dns_lookup.clone()).await + 1;
-                        if n_votes * 2 <= node_tokens.len() {
-                            warn!("VeritasController {} failed to be elected as leader after waiting for old leader to step down, only received {} votes.", self.id, n_votes);
-                            continue;
+                // Update internal state based on available nodes
+                {
+                    let mut state_guard = self.state.state.write().unwrap();
+                    if n_available_nodes * 2 > self.state.node_tokens.len() {
+                        // Quorum reached
+                        if *state_guard != State::Running {
+                            trace!("VeritasController {} transitioning to Running state.", self.state.id);
                         }
+                        *state_guard = State::Running;
+                    } else {
+                        // Quorum not reached
+                        if *state_guard != State::QuorumNotReached {
+                            warn!("VeritasController {} transitioning to QuorumNotReached state.", self.state.id);
+                        } 
+                        *state_guard = State::QuorumNotReached;
                     }
-
-                    // I am now the leader
-                    self.state.leader_id.store(self.id, Ordering::SeqCst);
-                    info!("VeritasController {} has taken over as leader.", self.id);
-                } else {
-                    warn!("VeritasController {} failed to be elected as leader, only received {} votes.", self.id, n_votes);
                 }
-            } else {
-                trace!("VeritasController {} recognizes {} as the current leader candidate.", self.id, candidate_id);
-            }
 
-            // Tick the other nodes
-            trace!("VeritasController {} tick.", self.id);
-            tokio::time::sleep(period).await;
+                self.state.candidate_id.store(lowest_candidate_id, Ordering::SeqCst);
+
+                if self.state.id == lowest_candidate_id {
+                    info!("VeritasController {} is the current leader candidate.", self.state.id);
+                    // Ask other nodes to elect me as leader
+                    let n_votes = self.ask_for_votes().await + 1; // Count self vote
+                    trace!("VeritasController {} received {} votes.", self.state.id, n_votes);
+                    if n_votes * 2 > self.state.node_tokens.len() {
+                        trace!("VeritasController {} has been elected as leader with {} votes.", self.state.id, n_votes);
+
+                        if self.state.leader_id.load(Ordering::SeqCst) != self.state.id {
+                            info!("VeritasController {} is now the new leader. Wait out the current period - for current leader to step down.", self.state.id);
+                            tokio::time::sleep(period).await;
+
+                            // After wainting for the old leader to step down - ask for votes again to make sure we are still the leader.
+                            let n_votes = self.ask_for_votes().await + 1;
+                            if n_votes * 2 <= self.state.node_tokens.len() {
+                                warn!("VeritasController {} failed to be elected as leader after waiting for old leader to step down, only received {} votes.", self.state.id, n_votes);
+                                continue;
+                            }
+
+                            info!("VeritasController {} has taken over as leader.", self.state.id);
+                        }
+
+                        // I am now the leader
+                        self.state.leader_id.store(self.state.id, Ordering::SeqCst);
+                    } else {
+                        warn!("VeritasController {} failed to be elected as leader, only received {} votes.", self.state.id, n_votes);
+                    }
+                } else {
+                    trace!("VeritasController {} recognizes {} as the current leader candidate.", self.state.id, lowest_candidate_id);
+                }
+
+                // Tick the other nodes
+                trace!("VeritasController {} tick.", self.state.id);
+                tokio::time::sleep(period).await;
+            }
         }
     }
 
@@ -232,26 +252,17 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// ```ignore
     /// let responses = controller.broadcast_and_collect_responses("/status", node_tokens, dns_lookup).await;
     /// ```
-    async fn broadcast_and_collect_responses(&self, path: &str, node_tokens: Vec<String>, dns_lookup: DNSLookup) -> Vec<Option<String>> {
-        // Initialize a vector to hold responses from each node
-        let mut responses:Vec<Option<String>> = Vec::new();
-        responses.reserve(node_tokens.len());
-        for (i, _) in node_tokens.iter().enumerate() {
-            if i == self.id {
-                // Skip self
-                responses.push(None);
-                continue;
-            }
-        }
-
+    async fn broadcast_and_collect_responses(id:usize, path: &str, node_tokens: &Vec<String>, dns_lookup: &DNSLookup, timeout: Duration) -> JoinSet<Option<(usize, String)>> {
         let mut req_set = JoinSet::new();
         let path = path.to_string();
 
         // Broadcast the request to all nodes and collect responses
         for i in 0..node_tokens.len() {
-            if i == self.id {
+            if i == id {
                 continue; // Skip self
             }
+
+            trace!("Broadcasting request to node: {}", i);
 
             let node = node_tokens[i].clone();
             let dns_lookup = dns_lookup.clone();
@@ -263,14 +274,14 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                         // Send request to the node and handle response
                         let rsp = reqwest::Client::new()
                             .get(&format!("http://{}:80{}", ip, path))
-                            .timeout(Duration::from_secs(1)) // We are in a local network, so timeout can be short
+                            .timeout(timeout) // We are in a local network, so timeout can be short
                             .send().await;
 
                         match rsp {
                             Ok(response) => {
                                 if response.status().is_success() {
                                     match response.text().await {
-                                        Ok(text) => Some(text),
+                                        Ok(text) => Some((i ,text)),
                                         Err(e) => {
                                             debug!("Failed to read response text from node '{}': {}", node, e);
                                             None
@@ -295,36 +306,34 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             };
             req_set.spawn(req);
         }
-
-        // Collect all responses
-        req_set.join_all().await
+        req_set
     }
 
     /// Ask other nodes for votes and count the number of granted votes
-    /// 
-    /// Parameters:
-    /// - dns_lookup: DNSLookup instance for resolving node addresses
     /// 
     /// Returns:
     /// - usize: Number of granted votes
     /// 
     /// # Examples
     /// ```ignore
-    /// let votes = controller.ask_for_votes(dns_lookup).await;
+    /// let votes = controller.ask_for_votes(dns_lookup, node_tokens).await;
     /// ```
-    async fn ask_for_votes(&self, dns_lookup: DNSLookup) -> usize{
+    async fn ask_for_votes(&self) -> usize{
         // Placeholder for asking votes logic
         let candidate_id = self.state.candidate_id.load(Ordering::SeqCst);
 
         // Only ask for votes if we are the candidate
-        assert!(candidate_id == self.id);
+        assert!(candidate_id == self.state.id);
         
-        trace!("VeritasController {} asking for votes for candidate {}.", self.id, candidate_id);
-        let responses = self.broadcast_and_collect_responses("/vote", vec![], dns_lookup).await;
-        let votes = responses.iter().enumerate().map(|(i, e)| {
-            if let Some(vote) = e {
+        trace!("VeritasController {} asking for votes for candidate {}.", self.state.id, candidate_id);
+        let rsp_set = Self::broadcast_and_collect_responses(self.state.id, &format!("/vote/{}", candidate_id), &self.state.node_tokens, &self.state.dns_lookup, Duration::from_secs(1)).await;
+        // Wait for all responses
+        let responses = rsp_set.join_all().await;
+
+        let votes = responses.iter().map(| e| {
+            if let Some((i, vote)) = e {
                 // Process the vote
-                trace!("VeritasController {} received vote from {}: {}", self.id, i, vote);
+                trace!("VeritasController {} received vote from {}: {}", self.state.id, i, vote);
                 let vote_granted: bool = vote.to_lowercase() == "true";
                 vote_granted
             }else{
@@ -334,7 +343,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         });
 
         // Count the number of granted votes
-        votes.filter(|e| *e).count() as usize
+        votes.filter(|e| *e == true).count() as usize
     }
 
     /// An example handler that increments and returns a counter
@@ -385,6 +394,151 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         vote
     }
 
+    /// Handle the peek request to retrieve a value from the key-value store.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the peek requestq
+    /// - data: Shared application state
+    /// Returns:
+    /// - String: The value associated with the requested key, or an empty string if not found
+    pub async fn peek(req: HttpRequest, data: web::Data<AppState<F>>) -> String {
+        let key: String = req.match_info().get("key")
+            .unwrap_or("")
+            .to_string();
+
+        trace!("Peek handler called with key: {}", key);
+
+        match data.kv_store.get(&key) {
+            Some(value) => value,
+            None => "".to_string(),
+        }
+    }
+
+    /// Handle the get request to retrieve a value from a quorum of nodes.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the get request
+    /// - data: Shared application state
+    /// 
+    /// Returns:
+    /// - Result<String, Error>: The value associated with the requested key if quorum is reached, otherwise an error
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let value = controller.get(req, data).await?;
+    /// ```
+    pub async fn get_eventual(req: HttpRequest, data: web::Data<AppState<F>>) -> Result<String, Error> {
+        let key: String = req.match_info().get("key")
+            .unwrap_or("")
+            .to_string();
+
+        trace!("Get handler called with key: {}", key);
+        // Ask the quorum of nodes for the value
+        let mut join_set = Self::broadcast_and_collect_responses(data.id, &format!("/peek/{}", key), &data.node_tokens, &data.dns_lookup, Duration::from_millis(100)).await;
+
+        let mut responses: Vec<String> = Vec::new();
+        // Wait for a quorum of responses
+        for _ in 0..data.node_tokens.len() {
+            let next = join_set.join_next().await;
+            if let Some(rsp) = next {
+                if let Ok(res) = rsp {
+                    if let Some((_, text)) = res {
+                        responses.push(text);
+                        // Break if we have a quorum
+                        if responses.len() * 2 > data.node_tokens.len() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if we reached a quorum - if not, return an error
+        if responses.len() * 2 <= data.node_tokens.len() {
+            return Err(Error::QuorumNotReached);
+        }
+
+        // Process responses to find the most recent value
+        let responses = responses.iter().map(|i| {
+            let time = i.split_once(";");
+            if let Some((t, v)) = time {
+                let t = t.parse::<u64>().unwrap_or(0);
+                (t, v.to_string())
+            }else{
+                (0, "".to_string())
+            }
+        });
+
+        let newest = responses.max_by_key(|i|i.0).unwrap_or((0, "".to_string())).1;
+        Ok(newest)
+    }
+
+    /// Handle a request by either processing it as the leader or forwarding it to the current leader.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the incoming request
+    /// - data: Shared application state
+    /// - bytes: The body of the incoming request
+    /// 
+    /// Returns:
+    /// - Result<String, Error>: The response from handling the request or forwarding it to the leader
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let response = controller.handle_by_leader(req, data, bytes).await?;
+    /// ```
+    pub async fn handle_by_leader(req: HttpRequest, data: web::Data<AppState<F>>, bytes: web::Bytes) -> Result<String, Error> {
+        if data.leader_id.load(Ordering::SeqCst) == data.id {
+            // Hey, it's me, the leader
+            trace!("Handling request as leader. {}", req.path());
+
+            match req.path() {
+                "/get/{key}" => {
+                    // For the leader, it is guranteed that we have the latest value
+                    // So we can just get it from the local store
+                    return Self::get_eventual(req, data).await;
+                },
+                _ => {
+                    warn!("Unhandled path: {}", req.path());
+                    Ok("UNHANDLED".to_string())
+                }
+            }
+        }else{
+            debug!("Forwarding request to leader {}.", data.leader_id.load(Ordering::SeqCst));
+
+            let uri = format!("http://{}:80{}", data.node_tokens[data.leader_id.load(Ordering::SeqCst)], req.uri());
+            
+            let client = Client::new();
+            
+            // Build the request to forward
+            let mut request_builder = client.request(
+                reqwest::Method::from_bytes(req.method().as_str().as_bytes())
+                .unwrap_or(reqwest::Method::GET),
+                uri
+            );
+
+            // Copyt the headers
+            for (key, value) in req.headers().iter() {
+                if let Ok(name) = key.as_str().parse::<reqwest::header::HeaderName>() {
+                    if let Ok(val) = value.to_str() {
+                        request_builder = request_builder.header(name, val);
+                    }
+                }
+            }
+
+            // Set the body
+            request_builder = request_builder.body(bytes.to_vec());
+
+            // Send the request and await the response
+            let request = request_builder.send().await.map_err(Error::ForwardRequestError)?;
+            let status = request.status();
+            let body = request.text().await.map_err(Error::ForwardRequestError)?;
+
+            trace!("Forwarded request to leader returned status: {}", status);
+            Ok(body)
+        }
+    }
+
     /// Start serving HTTP requests
     pub async fn start_serving_http(&self) -> std::io::Result<()> {
         let shared = self.state.clone();
@@ -394,11 +548,15 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 .app_data(shared.clone())
                 .route("/tick/{time}", web::get().to(VeritasController::<F>::tick))
                 .route("/vote/{sender}", web::get().to(VeritasController::<F>::vote))
+                .route("/peek/{key}", web::get().to(VeritasController::<F>::peek))
+                .route("/get_eventual/{key}", web::get().to(VeritasController::<F>::get_eventual))
+                .route("/get/{key}", web::get().to(VeritasController::<F>::handle_by_leader))
+                .route("/set/{key}", web::post().to(VeritasController::<F>::handle_by_leader))
         });
 
-        server.bind(("127.0.0.1", 80))?.run().await?;
+        // Bind to all interfaces on port 80
+        server.bind(("0.0.0.0", 80))?.run().await?;
 
         Ok(())
     }
 }
-

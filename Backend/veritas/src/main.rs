@@ -128,7 +128,7 @@ fn main() {
         panic!("Failed to initialize key-value store at '{}': {}", PATH_TO_KV_STORE, e);
     });
 
-    let veritas_controller = VeritasController::<ConcurrentFileKeyValueStore>::new(id, kv_store);
+    let veritas_controller = VeritasController::<ConcurrentFileKeyValueStore>::new(id, kv_store, nodes_tokens, dns_ttl);
     let arc_vc = Arc::new(veritas_controller);
 
     // Start the Actix system and serve HTTP requests
@@ -136,7 +136,7 @@ fn main() {
 
     let arc_vc_clone = Arc::clone(&arc_vc);
     sys.runtime().spawn(async move {
-        arc_vc_clone.start_ticking(nodes_tokens, Duration::from_secs(2), dns_ttl).await;
+        arc_vc_clone.start_ticking(Duration::from_secs(2)).await;
     });
 
     sys.block_on(async {

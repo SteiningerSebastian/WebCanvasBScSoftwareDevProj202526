@@ -16,3 +16,6 @@ docker build --file $dockerfile `
 # Push both tags
 docker push $tag1
 docker push $tag2
+
+kubectl set image statefulset/veritas veritas=sebastiansteininger/veritas:alpha -n default
+kubectl rollout restart statefulset/veritas -n default
