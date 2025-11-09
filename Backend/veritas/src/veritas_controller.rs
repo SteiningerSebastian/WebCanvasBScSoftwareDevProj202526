@@ -1,5 +1,6 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, ResponseError, http::{StatusCode, header::ContentType}, web};
-use general::{concurrent_file_key_value_store::ConcurrentKeyValueStore, dns::{self, DNSLookup}, file_key_value_store};
+use general::{concurrent_file_key_value_store::{self, ConcurrentKeyValueStore}, dns::{self, DNSLookup}};
+use regex::Regex;
 use reqwest::Client;
 use tokio::{task::JoinSet};
 use tracing::{debug, info, trace, warn};
@@ -7,9 +8,10 @@ use std::{fmt::Display, sync::{RwLock, atomic::{AtomicU64, AtomicUsize, Ordering
 
 #[derive(Debug)]
 pub enum Error {
-    FileKeyValueStoreError(file_key_value_store::Error),
+    FileKeyValueStoreError(concurrent_file_key_value_store::Error),
     QuorumNotReached,
     ForwardRequestError(reqwest::Error),
+    LockPoisoned,
 }
 
 impl ResponseError for Error {
@@ -33,12 +35,13 @@ impl Display for Error {
             Error::FileKeyValueStoreError(e) => write!(f, "File key-value store error: {}", e),
             Error::QuorumNotReached => write!(f, "Quorum not reached"),
             Error::ForwardRequestError(e) => write!(f, "Failed to forward request: {}", e),
+            Error::LockPoisoned => write!(f, "Lock poisoned error"),
         }
     }
 }
 
-impl From<file_key_value_store::Error> for Error {
-    fn from(e: file_key_value_store::Error) -> Self {
+impl From<concurrent_file_key_value_store::Error> for Error {
+    fn from(e: concurrent_file_key_value_store::Error) -> Self {
         Error::FileKeyValueStoreError(e)
     }
 }
@@ -49,6 +52,17 @@ enum State {
     Running,
     QuorumNotReached,
 }
+
+impl Clone for State {
+    fn clone(&self) -> Self {
+        match self {
+            State::Initializing => State::Initializing,
+            State::Running => State::Running,
+            State::QuorumNotReached => State::QuorumNotReached,
+        }
+    }
+}
+impl Copy for State {}
 
 pub struct AppState<F> where F: ConcurrentKeyValueStore + Clone + Send + Sync + 'static {
     time: AtomicU64,
@@ -244,6 +258,9 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// - path: The request path to broadcast
     /// - node_tokens: A vector of node identifiers (hostnames or IPs) to send the request to
     /// - dns_lookup: DNSLookup instance for resolving node addresses
+    /// - timeout: Duration to wait for each request
+    /// - method: HTTP method to use for the request
+    /// - body: Optional body to include in the request
     /// 
     /// Returns:
     /// - Vec<Option<String>>: A vector of optional responses from each node
@@ -252,7 +269,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// ```ignore
     /// let responses = controller.broadcast_and_collect_responses("/status", node_tokens, dns_lookup).await;
     /// ```
-    async fn broadcast_and_collect_responses(id:usize, path: &str, node_tokens: &Vec<String>, dns_lookup: &DNSLookup, timeout: Duration) -> JoinSet<Option<(usize, String)>> {
+    async fn broadcast_and_collect_responses(id:usize, path: &str, node_tokens: &Vec<String>, dns_lookup: &DNSLookup, timeout: Duration, method: reqwest::Method, body: Option<String>) -> JoinSet<Option<(usize, String)>> {
         let mut req_set = JoinSet::new();
         let path = path.to_string();
 
@@ -267,14 +284,17 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             let node = node_tokens[i].clone();
             let dns_lookup = dns_lookup.clone();
             let path = path.clone();
+            let method = method.clone();
+            let body = body.clone();
             let req = async move {
                 match dns_lookup.resolve_node(&node) {
                     Ok(ip) => {
                         trace!("Resolved node '{}' to IP: {}", node, ip);
                         // Send request to the node and handle response
                         let rsp = reqwest::Client::new()
-                            .get(&format!("http://{}:80{}", ip, path))
+                            .request(method.clone(), &format!("http://{}:80{}", ip, path))
                             .timeout(timeout) // We are in a local network, so timeout can be short
+                            .body(body.unwrap_or_default()) // Add body if provided
                             .send().await;
 
                         match rsp {
@@ -326,7 +346,15 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         assert!(candidate_id == self.state.id);
         
         trace!("VeritasController {} asking for votes for candidate {}.", self.state.id, candidate_id);
-        let rsp_set = Self::broadcast_and_collect_responses(self.state.id, &format!("/vote/{}", candidate_id), &self.state.node_tokens, &self.state.dns_lookup, Duration::from_secs(1)).await;
+        let rsp_set = Self::broadcast_and_collect_responses(
+            self.state.id, 
+            &format!("/vote/{}", candidate_id), 
+            &self.state.node_tokens, 
+            &self.state.dns_lookup, 
+            Duration::from_secs(1),
+            reqwest::Method::GET,
+            None
+        ).await;
         // Wait for all responses
         let responses = rsp_set.join_all().await;
 
@@ -434,7 +462,15 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         trace!("Get handler called with key: {}", key);
         // Ask the quorum of nodes for the value
-        let mut join_set = Self::broadcast_and_collect_responses(data.id, &format!("/peek/{}", key), &data.node_tokens, &data.dns_lookup, Duration::from_millis(100)).await;
+        let mut join_set = Self::broadcast_and_collect_responses(
+            data.id, 
+            &format!("/peek/{}", key), 
+            &data.node_tokens, 
+            &data.dns_lookup, 
+            Duration::from_millis(100),
+            reqwest::Method::GET,
+            None
+        ).await;
 
         let mut responses: Vec<String> = Vec::new();
         // Wait for a quorum of responses
@@ -472,6 +508,103 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         let newest = responses.max_by_key(|i|i.0).unwrap_or((0, "".to_string())).1;
         Ok(newest)
     }
+    
+    /// Handle the set request to store a value in the key-value store from the leader.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the set request
+    /// - data: Shared application state
+    /// - bytes: The body of the incoming request
+    /// 
+    /// Returns:
+    /// - Result<String, Error>: The new value associated with the requested key
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let response = controller.set_by_leader(req, data, bytes).await?;
+    /// ```
+    pub async fn set_by_leader(req: HttpRequest, data: web::Data<AppState<F>>, bytes: web::Bytes) -> Result<String, Error> {
+        let key: String = req.match_info().get("key")
+            .unwrap_or("")
+            .to_string();
+
+        let value = String::from_utf8(bytes.to_vec()).unwrap_or("".to_string());
+
+        debug!("Set handler called with key: {} and value: {}", key, value);
+
+        // Set the value in the local key-value store
+        data.kv_store.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+
+        Ok(value)
+    }
+
+    /// Handle the set request when this node is the leader.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the set request
+    /// - data: Shared application state
+    /// - bytes: The body of the incoming request
+    /// 
+    /// Returns:
+    /// - Result<String, Error>: The new value associated with the requested key
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let response = controller.set_for_leader(req, data, bytes).await?;
+    /// ```
+    async fn set_for_leader(req: HttpRequest, data: web::Data<AppState<F>>, bytes: web::Bytes) -> Result<String, Error> {
+        let key: String = req.match_info().get("key")
+            .unwrap_or("")
+            .to_string();
+
+        let value = String::from_utf8(bytes.to_vec()).unwrap_or("".to_string());
+
+        debug!("Set handler called with key: {} and value: {}", key, value);
+
+        // Set the value in the local key-value store
+        data.kv_store.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+
+        // Broadcast the set to other nodes to replicate the value
+        let key: String = req.match_info().get("key")
+            .unwrap_or("")
+            .to_string();
+        let value = String::from_utf8(bytes.to_vec()).unwrap_or("".to_string());
+
+        debug!("Broadcasting set request for key: {} to other nodes.", key);
+
+        let _ = Self::broadcast_and_collect_responses(
+            data.id, 
+            &format!("/force_set/{}", key), 
+            &data.node_tokens, 
+            &data.dns_lookup, 
+            Duration::from_millis(100),
+            reqwest::Method::POST,
+            Some(value.clone())
+        ).await;
+
+        Ok(value)
+    }
+
+    /// Handle the get request when this node is the leader.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the get request
+    /// - data: Shared application state
+    /// 
+    /// Returns:
+    /// - Result<String, Error>: The value associated with the requested key
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let value = controller.get_for_leader(req, data).await?;
+    /// ```
+    pub async fn get_for_leader(req: HttpRequest, data: web::Data<AppState<F>>) -> Result<String, Error> {
+        Self::get_eventual(req, data).await
+        //TODO: Read Repair - reach quorum before returning value to make sure no gurantees are broken.
+        // (for read 2, write 2) we need to read 3 equal values to guarantee consistency.
+
+
+    }
 
     /// Handle a request by either processing it as the leader or forwarding it to the current leader.
     /// 
@@ -488,22 +621,22 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// let response = controller.handle_by_leader(req, data, bytes).await?;
     /// ```
     pub async fn handle_by_leader(req: HttpRequest, data: web::Data<AppState<F>>, bytes: web::Bytes) -> Result<String, Error> {
-        if data.leader_id.load(Ordering::SeqCst) == data.id {
+        let state = *(&data).state.read().map_err(|_|Error::LockPoisoned)?;
+        
+        if state == State::Running && data.leader_id.load(Ordering::SeqCst) == data.id {
             // Hey, it's me, the leader
             trace!("Handling request as leader. {}", req.path());
-
-            match req.path() {
-                "/get/{key}" => {
-                    // For the leader, it is guranteed that we have the latest value
-                    // So we can just get it from the local store
-                    return Self::get_eventual(req, data).await;
-                },
-                _ => {
-                    warn!("Unhandled path: {}", req.path());
-                    Ok("UNHANDLED".to_string())
-                }
+            
+            // Handle the request locally - as we are the leader
+            if Regex::new(r"^\/get\/([^\/]+)$").unwrap().is_match("/get/{key}") {
+                return Self::get_for_leader(req, data).await;
+            } else if Regex::new(r"^\/set\/([^\/]+)$").unwrap().is_match("/get/{key}") {
+                return Self::set_for_leader(req, data, bytes).await;
+            } else {
+                warn!("Unhandled path: {}", req.path());
+                Ok("UNHANDLED".to_string())
             }
-        }else{
+        } else {
             debug!("Forwarding request to leader {}.", data.leader_id.load(Ordering::SeqCst));
 
             let uri = format!("http://{}:80{}", data.node_tokens[data.leader_id.load(Ordering::SeqCst)], req.uri());
@@ -548,6 +681,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 .app_data(shared.clone())
                 .route("/tick/{time}", web::get().to(VeritasController::<F>::tick))
                 .route("/vote/{sender}", web::get().to(VeritasController::<F>::vote))
+                .route("/force_set/{key}", web::post().to(VeritasController::<F>::set_by_leader))
                 .route("/peek/{key}", web::get().to(VeritasController::<F>::peek))
                 .route("/get_eventual/{key}", web::get().to(VeritasController::<F>::get_eventual))
                 .route("/get/{key}", web::get().to(VeritasController::<F>::handle_by_leader))

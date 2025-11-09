@@ -1828,6 +1828,7 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "general",
+ "regex",
  "reqwest",
  "threadpool",
  "tokio",
