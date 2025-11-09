@@ -572,7 +572,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         debug!("Broadcasting set request for key: {} to other nodes.", key);
 
-        let _ = Self::broadcast_and_collect_responses(
+        let responses = Self::broadcast_and_collect_responses(
             data.id, 
             &format!("/force_set/{}", key), 
             &data.node_tokens, 
@@ -581,6 +581,21 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             reqwest::Method::POST,
             Some(value.clone())
         ).await;
+
+        // Count successful replications
+        let mut n_successful = 1; // Count self
+        responses.join_all().await.iter().for_each(|e| {
+            if let Some(_) = e {
+                n_successful += 1;
+            }
+        });
+
+        // If the quorum is not reached, return an error. The change may still be applied - but no guarantees.
+        trace!("Set request for key: {} replicated to {} nodes.", key, n_successful);
+        if n_successful * 2 <= data.node_tokens.len() {
+            warn!("Failed to replicate set request for key: {} to a quorum of nodes.", key);
+            return Err(Error::QuorumNotReached);
+        }
 
         Ok(value)
     }
