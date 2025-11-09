@@ -11,6 +11,7 @@ pub enum Error {
     FileKeyValueStoreError(concurrent_file_key_value_store::Error),
     QuorumNotReached,
     ForwardRequestError(reqwest::Error),
+    UnauthorizedSet,
     LockPoisoned,
 }
 
@@ -36,6 +37,7 @@ impl Display for Error {
             Error::QuorumNotReached => write!(f, "Quorum not reached"),
             Error::ForwardRequestError(e) => write!(f, "Failed to forward request: {}", e),
             Error::LockPoisoned => write!(f, "Lock poisoned error"),
+            Error::UnauthorizedSet => write!(f, "Unauthorized set request"),
         }
     }
 }
@@ -524,6 +526,20 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// let response = controller.set_by_leader(req, data, bytes).await?;
     /// ```
     pub async fn set_by_leader(req: HttpRequest, data: web::Data<AppState<F>>, bytes: web::Bytes) -> Result<String, Error> {
+        // We only accept set requests from the current leader node
+        // Others must be rejected and sent to the correct leader by the caller
+        let sender: String = req.match_info().get("sender")
+            .unwrap_or("")
+            .to_string();
+
+        let sender_id = sender.parse::<usize>().unwrap_or(usize::MAX);
+        trace!("Set by leader handler called from sender ID: {}", sender_id);
+        if sender_id != data.leader_id.load(Ordering::SeqCst) {
+            warn!("Received set request from non-leader sender ID: {}. Current leader ID: {}", sender_id, data.leader_id.load(Ordering::SeqCst));
+            return Err(Error::UnauthorizedSet);
+        }
+        
+        // Process the set request
         let key: String = req.match_info().get("key")
             .unwrap_or("")
             .to_string();
@@ -574,7 +590,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         let responses = Self::broadcast_and_collect_responses(
             data.id, 
-            &format!("/force_set/{}", key), 
+            &format!("/force_set/{}/{}", data.id, key), // Include sender id so the receiver can verify that this node is the leader
             &data.node_tokens, 
             &data.dns_lookup, 
             Duration::from_millis(100),
@@ -696,7 +712,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 .app_data(shared.clone())
                 .route("/tick/{time}", web::get().to(VeritasController::<F>::tick))
                 .route("/vote/{sender}", web::get().to(VeritasController::<F>::vote))
-                .route("/force_set/{key}", web::post().to(VeritasController::<F>::set_by_leader))
+                .route("/force_set/{sender}/{key}", web::post().to(VeritasController::<F>::set_by_leader))
                 .route("/peek/{key}", web::get().to(VeritasController::<F>::peek))
                 .route("/get_eventual/{key}", web::get().to(VeritasController::<F>::get_eventual))
                 .route("/get/{key}", web::get().to(VeritasController::<F>::handle_by_leader))
