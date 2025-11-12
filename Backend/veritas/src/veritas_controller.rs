@@ -11,6 +11,8 @@ pub enum Error {
     FileKeyValueStoreError(concurrent_file_key_value_store::Error),
     QuorumNotReached,
     ForwardRequestError(reqwest::Error),
+    TransactionBeginError(concurrent_file_key_value_store::Error),
+    TransactionCommitError(concurrent_file_key_value_store::Error),
     UnauthorizedSet,
     LockPoisoned,
 }
@@ -38,6 +40,8 @@ impl Display for Error {
             Error::ForwardRequestError(e) => write!(f, "Failed to forward request: {}", e),
             Error::LockPoisoned => write!(f, "Lock poisoned error"),
             Error::UnauthorizedSet => write!(f, "Unauthorized set request"),
+            Error::TransactionBeginError(e) => write!(f, "Failed to begin transaction: {}", e),
+            Error::TransactionCommitError(e) => write!(f, "Failed to commit transaction: {}", e),
         }
     }
 }
@@ -163,64 +167,64 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                         trace!("Failed to resolve node '{}': {}", token, e);
                     }
                 }
-
-                trace!("VeritasController {} found {} available nodes.", self.state.id, n_available_nodes);
-
-                // Update internal state based on available nodes
-                {
-                    let mut state_guard = self.state.state.write().unwrap();
-                    if n_available_nodes * 2 > self.state.node_tokens.len() {
-                        // Quorum reached
-                        if *state_guard != State::Running {
-                            trace!("VeritasController {} transitioning to Running state.", self.state.id);
-                        }
-                        *state_guard = State::Running;
-                    } else {
-                        // Quorum not reached
-                        if *state_guard != State::QuorumNotReached {
-                            warn!("VeritasController {} transitioning to QuorumNotReached state.", self.state.id);
-                        } 
-                        *state_guard = State::QuorumNotReached;
-                    }
-                }
-
-                self.state.candidate_id.store(lowest_candidate_id, Ordering::SeqCst);
-
-                if self.state.id == lowest_candidate_id {
-                    info!("VeritasController {} is the current leader candidate.", self.state.id);
-                    // Ask other nodes to elect me as leader
-                    let n_votes = self.ask_for_votes().await + 1; // Count self vote
-                    trace!("VeritasController {} received {} votes.", self.state.id, n_votes);
-                    if n_votes * 2 > self.state.node_tokens.len() {
-                        trace!("VeritasController {} has been elected as leader with {} votes.", self.state.id, n_votes);
-
-                        if self.state.leader_id.load(Ordering::SeqCst) != self.state.id {
-                            info!("VeritasController {} is now the new leader. Wait out the current period - for current leader to step down.", self.state.id);
-                            tokio::time::sleep(period).await;
-
-                            // After wainting for the old leader to step down - ask for votes again to make sure we are still the leader.
-                            let n_votes = self.ask_for_votes().await + 1;
-                            if n_votes * 2 <= self.state.node_tokens.len() {
-                                warn!("VeritasController {} failed to be elected as leader after waiting for old leader to step down, only received {} votes.", self.state.id, n_votes);
-                                continue;
-                            }
-
-                            info!("VeritasController {} has taken over as leader.", self.state.id);
-                        }
-
-                        // I am now the leader
-                        self.state.leader_id.store(self.state.id, Ordering::SeqCst);
-                    } else {
-                        warn!("VeritasController {} failed to be elected as leader, only received {} votes.", self.state.id, n_votes);
-                    }
-                } else {
-                    trace!("VeritasController {} recognizes {} as the current leader candidate.", self.state.id, lowest_candidate_id);
-                }
-
-                // Tick the other nodes
-                trace!("VeritasController {} tick.", self.state.id);
-                tokio::time::sleep(period).await;
             }
+
+            trace!("VeritasController {} found {} available nodes.", self.state.id, n_available_nodes);
+
+            // Update internal state based on available nodes
+            {
+                let mut state_guard = self.state.state.write().unwrap();
+                if n_available_nodes * 2 > self.state.node_tokens.len() {
+                    // Quorum reached
+                    if *state_guard != State::Running {
+                        trace!("VeritasController {} transitioning to Running state.", self.state.id);
+                    }
+                    *state_guard = State::Running;
+                } else {
+                    // Quorum not reached
+                    if *state_guard != State::QuorumNotReached {
+                        warn!("VeritasController {} transitioning to QuorumNotReached state.", self.state.id);
+                    } 
+                    *state_guard = State::QuorumNotReached;
+                }
+            }
+
+            self.state.candidate_id.store(lowest_candidate_id, Ordering::SeqCst);
+
+            if self.state.id == lowest_candidate_id {
+                info!("VeritasController {} is the current leader candidate.", self.state.id);
+                // Ask other nodes to elect me as leader
+                let n_votes = self.ask_for_votes().await + 1; // Count self vote
+                trace!("VeritasController {} received {} votes.", self.state.id, n_votes);
+                if n_votes * 2 > self.state.node_tokens.len() {
+                    trace!("VeritasController {} has been elected as leader with {} votes.", self.state.id, n_votes);
+
+                    if self.state.leader_id.load(Ordering::SeqCst) != self.state.id {
+                        info!("VeritasController {} is now the new leader. Wait out the current period - for current leader to step down.", self.state.id);
+                        tokio::time::sleep(period).await;
+
+                        // After wainting for the old leader to step down - ask for votes again to make sure we are still the leader.
+                        let n_votes = self.ask_for_votes().await + 1;
+                        if n_votes * 2 <= self.state.node_tokens.len() {
+                            warn!("VeritasController {} failed to be elected as leader after waiting for old leader to step down, only received {} votes.", self.state.id, n_votes);
+                            continue;
+                        }
+
+                        info!("VeritasController {} has taken over as leader.", self.state.id);
+                    }
+
+                    // I am now the leader
+                    self.state.leader_id.store(self.state.id, Ordering::SeqCst);
+                } else {
+                    warn!("VeritasController {} failed to be elected as leader, only received {} votes.", self.state.id, n_votes);
+                }
+            } else {
+                trace!("VeritasController {} recognizes {} as the current leader candidate.", self.state.id, lowest_candidate_id);
+            }
+
+            // Tick the other nodes
+            trace!("VeritasController {} tick.", self.state.id);
+            tokio::time::sleep(period).await;
         }
     }
 
@@ -577,8 +581,18 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         debug!("Set handler called with key: {} and value: {}", key, value);
 
-        // Set the value in the local key-value store
-        data.kv_store.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+        { // Making sure local set is atomic with transaction / order of set operations
+            let transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
+            
+            // Prepend the current time to the value for versioning
+            let value = format!("{};{}", data.time.load(Ordering::SeqCst), value);
+
+            // Set the value in the local key-value store first do gurantee linearizability when reading from leader.
+            data.kv_store.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+
+            // Commit the transaction
+            transaction.commit().map_err(Error::TransactionCommitError)?;
+        } // End of atomic block / transaction
 
         // Broadcast the set to other nodes to replicate the value
         let key: String = req.match_info().get("key")
