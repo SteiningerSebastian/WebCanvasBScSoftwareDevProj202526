@@ -11,6 +11,7 @@ pub enum Error {
     FileKeyValueStoreError(concurrent_file_key_value_store::Error),
     QuorumNotReached,
     ForwardRequestError(reqwest::Error),
+    DNSLookupError(std::io::Error),
     TransactionBeginError(concurrent_file_key_value_store::Error),
     TransactionCommitError(concurrent_file_key_value_store::Error),
     UnauthorizedSet,
@@ -42,6 +43,7 @@ impl Display for Error {
             Error::UnauthorizedSet => write!(f, "Unauthorized set request"),
             Error::TransactionBeginError(e) => write!(f, "Failed to begin transaction: {}", e),
             Error::TransactionCommitError(e) => write!(f, "Failed to commit transaction: {}", e),
+            Error::DNSLookupError(e) => write!(f, "DNS lookup error: {}", e),
         }
     }
 }
@@ -419,6 +421,10 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         let vote = if sender_id == data.candidate_id.load(Ordering::SeqCst) {
             debug!("Granting vote to sender ID: {}", sender_id);
+
+            // Accepting the sender as the new leader - assuming they will get the necessary votes
+            data.leader_id.store(sender_id, Ordering::SeqCst);
+
             "true".to_string()
         } else {
             debug!("Denying vote to sender ID: {}", sender_id);
@@ -682,9 +688,17 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 Ok("UNHANDLED".to_string())
             }
         } else {
-            debug!("Forwarding request to leader {}.", data.leader_id.load(Ordering::SeqCst));
+            let leader_id = data.leader_id.load(Ordering::SeqCst);
 
-            let uri = format!("http://{}:80{}", data.node_tokens[data.leader_id.load(Ordering::SeqCst)], req.uri());
+            debug!("Forwarding request to leader {}.", leader_id);
+
+            let ip = data.dns_lookup.resolve_node(&data.node_tokens[leader_id]).map_err(|e| {
+                debug!("Failed to resolve leader node: {}", e);
+                Error::DNSLookupError(e)
+            })?;
+
+            let uri = format!("http://{}:80{}", ip, req.uri());
+            trace!("Forwarding request to leader at URI: {}", uri);
             
             let client = Client::new();
             
@@ -707,8 +721,8 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             // Set the body
             request_builder = request_builder.body(bytes.to_vec());
 
-            // Send the request and await the response
-            let request = request_builder.send().await.map_err(Error::ForwardRequestError)?;
+            // Send the request and await the response (response timeout is 1 second - local network)
+            let request = request_builder.timeout(Duration::from_secs(1)).send().await.map_err(Error::ForwardRequestError)?;
             let status = request.status();
             let body = request.text().await.map_err(Error::ForwardRequestError)?;
 
