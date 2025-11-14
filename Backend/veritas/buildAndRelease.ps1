@@ -30,3 +30,6 @@ docker push $tag2
 # Deploy to Kubernetes
 kubectl set image statefulset/veritas veritas=sebastiansteininger/veritas:alpha -n default
 kubectl rollout restart statefulset/veritas -n default
+
+# Wait for rollout to complete
+kubectl rollout status statefulset/veritas -n default

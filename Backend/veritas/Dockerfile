@@ -23,7 +23,7 @@ COPY . .
 RUN cargo build --release -p veritas
 
 # Runtime stage - use distroless for smaller image
-FROM gcr.io/distroless/static-debian12
+FROM scratch AS runtime
 ARG BINARY=veritas
 EXPOSE 80
 COPY --from=builder /usr/src/app/target/x86_64-unknown-linux-musl/release/${BINARY} /app
