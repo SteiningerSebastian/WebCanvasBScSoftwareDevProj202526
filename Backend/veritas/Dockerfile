@@ -1,38 +1,30 @@
-ARG CARGO_IMAGE=rust:latest
-FROM ${CARGO_IMAGE} AS builder
+# Use latest Rust version that supports edition2024
+FROM rust:1.91-slim AS chef
 WORKDIR /usr/src/app
+RUN apt-get update && \
+    apt-get install -y musl-tools pkg-config && \
+    rm -rf /var/lib/apt/lists/* && \
+    cargo install cargo-chef && \
+    rustup target add x86_64-unknown-linux-musl
 
-# Install musl and other build deps
-RUN apt-get update && apt-get install -y musl-tools gcc build-essential ca-certificates && rm -rf /var/lib/apt/lists/*
-
-# Copy workspace manifests first for layer caching
-COPY veritas/Cargo.toml veritas/Cargo.toml
-COPY general/Cargo.toml general/Cargo.toml
-COPY Cargo.toml Cargo.lock ./
-
-# Create minimal placeholder src files so workspace members have a target
-# This does NOT build anything — it only satisfies Cargo's manifest checks so `cargo fetch` can run.
-RUN mkdir -p veritas/src general/src && \
-    echo 'fn main() { println!("placeholder"); }' > veritas/src/main.rs && \
-    echo 'pub fn _lib_placeholder() {}' > general/src/lib.rs
-
-# Fetch dependencies (populate cargo cache) WITHOUT producing a binary
-RUN cargo fetch
-
-# Add musl target and set target env (for statically linked artifact)
-RUN rustup target add x86_64-unknown-linux-musl
-ENV CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
-
-# Now copy full workspace source (overwrites the placeholders)
+# Plan the build
+FROM chef AS planner
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build the real package; fail the build if this step errors
+# Build dependencies only (cached layer)
+FROM chef AS builder
+COPY --from=planner /usr/src/app/recipe.json recipe.json
+ENV CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Build the actual application
+COPY . .
 RUN cargo build --release -p veritas
 
-# Final image
-FROM scratch
+# Runtime stage - use distroless for smaller image
+FROM gcr.io/distroless/static-debian12
 ARG BINARY=veritas
-
 EXPOSE 80
 COPY --from=builder /usr/src/app/target/x86_64-unknown-linux-musl/release/${BINARY} /app
 ENTRYPOINT ["/app"]

@@ -1,0 +1,11 @@
+target
+**/target
+.git
+.venv
+venv
+node_modules
+.cache
+*.rs.bk
+.idea
+.vscode
+*.log
