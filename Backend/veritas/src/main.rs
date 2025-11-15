@@ -6,7 +6,7 @@ use actix_web::rt::System;
 use tracing::{info, debug, error, trace, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
+use general::concurrent_file_key_value_store::{ConcurrentFileKeyValueStore};
 
 mod veritas_controller;
 use veritas_controller::VeritasController;
@@ -24,6 +24,8 @@ pub fn parse_node_names(raw: &str) -> Vec<String> {
 }
 
 fn main() {
+    println!("Veritas starting up...");
+
     // Get the log level from the environment variable LOG_LEVEL
     let log_level = match env::var("LOG_LEVEL") {
         Ok(v) => {
@@ -43,7 +45,7 @@ fn main() {
             eprintln!("Environment variable LOG_LEVEL is not set");
             if cfg!(debug_assertions) {
                 eprintln!("Defaulting LOG_LEVEL to DEBUG for debug build");
-                Level::DEBUG
+                Level::TRACE
             } else {
                 eprintln!("Defaulting LOG_LEVEL to WARN for release build");
                 Level::WARN
@@ -60,7 +62,7 @@ fn main() {
 
     // For debug builds, set VERITAS_NODES to a default value if not set
     if cfg!(debug_assertions) {
-        let debug_nodes = "localhost,127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4";
+        let debug_nodes = "localhost,127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1";
         unsafe {
             env::set_var("VERITAS_NODES", debug_nodes);
         }
