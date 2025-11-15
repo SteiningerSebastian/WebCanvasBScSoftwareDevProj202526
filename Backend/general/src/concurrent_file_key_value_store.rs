@@ -26,8 +26,76 @@ impl From<file_key_value_store::Error> for Error {
 }
 
 pub trait ConcurrentKeyValueStore {
+    /// Begins a new transaction, returning a TransactionRef that holds the write lock.
+    ///
+    /// This method acquires the write mutex, blocking other writers and transactions
+    /// until the returned TransactionRef is dropped or committed.
+    /// 
+    /// # Returns
+    /// - `Ok(TransactionRef)`: on successful acquisition of the write lock.
+    /// - `Err(Error::MutexLockPoisoned)`: if the write lock is poisoned.
+    /// 
+    /// # Example
+    /// ``` ignore
+    /// let store = ConcurrentFileKeyValueStore::new("data.txt").unwrap();
+    /// let mut txn = store.begin_transaction().unwrap();
+    /// txn.set("key", "value");
+    /// txn.commit().unwrap();
+    /// ```
     fn begin_transaction(&'_ self) -> Result<TransactionRef<'_>, Error>;
+
+    /// Returns a clone of the value associated with `key` from the store's committed snapshot.
+    /// 
+    /// This method performs a lock-free read: it accesses the atomic committed snapshot and does
+    /// not acquire the write mutex, so it will not block concurrent writers. Because it reads
+    /// the last committed state, it will not observe uncommitted changes made by an ongoing
+    /// transaction.
+    /// 
+    /// # Parameters
+    /// - `key`: The key to look up (borrowed `&str`).
+    /// 
+    /// # Returns
+    /// - `Some(String)` with a cloned, owned value if the key exists in the committed snapshot.
+    /// - `None` if the key is not present.
+    /// 
+    /// # Notes
+    /// - The returned `String` is an owned clone; modifying it does not affect the store.
+    /// - Lookup is typically O(1) (hash map lookup).
+    /// - Safe for concurrent calls from multiple threads.
+    /// - If you require a view that includes in-progress writes, perform the read
+    ///  from within a transaction that has acquired the lock.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// if let Some(value) = store.get("my_key") {
+    ///    println!("value: {}", value);
+    /// }
+    /// ```
     fn get(&self, key: &str) -> Option<String>;
+
+    /// Sets the value for `key` in the store, acquiring the write lock to ensure exclusive access.
+    /// This method will block until the lock is acquired.
+    /// 
+    /// # Parameters:
+    /// - `key`: The key to set (borrowed `&str`).
+    /// - `value`: The value to associate with the key (borrowed `&str`).
+    /// # Returns:
+    /// - `Ok(())` on success.
+    /// - `Err(Error::MutexLockPoisoned)` if the write lock is poisoned.
+    /// - `Err(Error::FileStoreError)` if committing the change to the underlying store fails.
+    /// 
+    /// # Notes:
+    /// - This method acquires the write mutex, blocking other writers and transactions.
+    /// - After setting the value, it immediately commits the change to persist it.
+    /// - For multiple related changes, consider using a transaction via `begin_transaction()`.
+    /// 
+    /// # Example:
+    /// ``` ignore
+    /// let store = ConcurrentFileKeyValueStore::new("data.txt").unwrap();
+    /// store.set("key", "value").unwrap();
+    /// let value = store.get("key").unwrap();
+    /// assert_eq!(value, "value");
+    /// ```
     fn set(&self, key: &str, value: &str) -> Result<(), Error>;
 }
 
