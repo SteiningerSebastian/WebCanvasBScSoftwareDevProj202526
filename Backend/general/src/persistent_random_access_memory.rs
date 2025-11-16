@@ -144,6 +144,20 @@ impl Pointer {
         }
     }
 
+    /// Dereferences the pointer to get a byte vector of exact length.
+    /// 
+    /// Warning: Changes to the returned value will not be reflected in persistent memory.
+    /// You must explicitly write back to persistent memory if you want to persist changes.
+    /// 
+    /// Returns:
+    /// - Result containing the byte vector on success or Error on failure.
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        unsafe {
+            (*self.memory.as_ptr()).read(self.pointer, buf)?;
+        }
+        Ok(())
+    }
+
     /// Writes the given value of type T to the location pointed to by this Pointer.
     ///     
     /// Parameters:
@@ -159,6 +173,20 @@ impl Pointer {
             );
         
             (*self.memory.as_ptr()).write(self.pointer, slice)?;
+        };
+        Ok(())
+    }
+
+    /// Writes the given byte slice to the location pointed to by this Pointer.
+    /// 
+    /// Parameters:
+    /// - buf: The byte slice to be written to persistent memory.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    pub fn write_exact(&mut self, buf: &[u8]) -> Result<(), Error> {
+        unsafe {
+            (*self.memory.as_ptr()).write(self.pointer, buf)?;
         };
         Ok(())
     }
@@ -348,7 +376,6 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
     fn persist(&self) -> Result<(), Error> {
         // write the current cached page if it is unsynced
         self.flush_page()?;
-
 
         // Iterate over unsynced pages and flush them
         let mut unsynced_pages = self.unsynced_pages.borrow_mut();

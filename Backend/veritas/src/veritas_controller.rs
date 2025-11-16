@@ -4,7 +4,7 @@ use regex::Regex;
 use reqwest::Client;
 use tokio::{task::JoinSet};
 use tracing::{debug, error, info, trace, warn};
-use std::{fmt::Display, sync::{Arc, RwLock, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::Duration};
+use std::{fmt::Display, sync::{RwLock, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::Duration};
 use lazy_regex::{Lazy, lazy_regex};
 
 const VERITAS_TIME_KEY: &str = "VERITAS::TIME";
@@ -311,7 +311,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
     /// Handle the campaingn to become the leader
     async fn handle_election_campaign(&self, period: Duration) {
-        info!("VeritasController {} is the current leader candidate.", self.state.id);
+        debug!("VeritasController {} is the current leader candidate.", self.state.id);
         // Ask other nodes to elect me as leader
         let n_votes = self.ask_for_votes().await + 1; // Count self vote
         trace!("VeritasController {} received {} votes.", self.state.id, n_votes);
@@ -1234,6 +1234,12 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// ```
     async fn get_add_for_leader(key: &str, data: web::Data<AppState<F>>) -> Result<String, Error> {
         debug!("Get-and-add handler called with key: {}", key);
+
+        // Ensure we have the latest value before incrementing
+        // No need to do this inside the transaction as we just need to ensure we have the latest value
+        // before we do the read-modify-write cycle. As the leader any concurrent writes will be serialized
+        let current_value = Self::get_for_leader(key, data.clone()).await?;
+        Self::set_if_newer(key, &current_value, &data.kv_store)?;
 
         let (old_value, value) = {
             let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;

@@ -6,7 +6,7 @@ mod tests {
     use std::{fs, rc::Rc};
 
     const TEST_SIZE: usize = 16384; // 4 pages
-    const TEST_PATH: &str = "C:/Users/sebas/Repos/WebCanvas/Backend/general/testdata/test_persistent_memory";
+    const TEST_PATH: &str = "C:/data/test_persistent_memory.ignore";
 
     fn cleanup_test_files() {
         let _ = fs::remove_file(format!("{}.page0", TEST_PATH));

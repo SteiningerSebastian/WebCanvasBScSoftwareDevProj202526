@@ -23,14 +23,14 @@ fn bench_malloc_free(c: &mut Criterion) {
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
     const MEMORY_SIZE: usize = 4096 * 200; // 200 pages
-    const ALLOCS_PER_SAMPLE: usize = 2_000;
-    for &size in &[8usize, 64, 256, 1024, 2048] {
+    const ALLOCS_PER_SAMPLE: usize = 1_000; // time is per 1000 allocs/frees
+    for &size in &[64, 2048] {
         group.throughput(Throughput::Elements(ALLOCS_PER_SAMPLE as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &alloc_size| {
             b.iter_batched(
                 || {
                     let dir = tempfile::tempdir().expect("tempdir");
-                    let path = dir.path().join("fpram");
+                    let path = dir.path().join("f.ignore.pram");
                     let path_str = path.to_string_lossy().to_string();
                     let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                     (dir, fpram, alloc_size)
@@ -63,14 +63,14 @@ fn bench_salloc(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(32));
     const MEMORY_SIZE: usize = 4096 * 200; // 200 pages
     const SALLOC_SIZE: usize = 64;
-    const OPS_PER_SAMPLE: usize = 5_000;
+    const OPS_PER_SAMPLE: usize = 1_000;
 
     group.throughput(Throughput::Elements(OPS_PER_SAMPLE as u64));
     group.bench_function("salloc_64B", |b| {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("fpram");
+                let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
                 let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 (dir, fpram)
@@ -79,8 +79,8 @@ fn bench_salloc(c: &mut Criterion) {
                 let _keep_dir = dir;
                 for i in 0..OPS_PER_SAMPLE {
                     let pointer = (i * SALLOC_SIZE) as u64;
-                    let mut p = fpram.salloc(pointer, SALLOC_SIZE).expect("salloc");
-                    p.write(&0u64).expect("write");
+                    let _ = fpram.salloc(pointer, SALLOC_SIZE).expect("salloc");
+                    // p.write(&0u64).expect("write"); // optional write to touch page
                 }
                 black_box(());
             },
@@ -96,7 +96,7 @@ fn bench_random_access(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(32));
     const MEMORY_SIZE: usize = 4096 * 500; // 2MB
     const TOTAL_PTRS: usize = 20_000; // pre-allocated pointers
-    const OPS_PER_SAMPLE: usize = 10_000; // random ops per timed sample
+    const OPS_PER_SAMPLE: usize = 1_000; // random ops per timed sample
 
     // Random writes
     group.throughput(Throughput::Elements(OPS_PER_SAMPLE as u64));
@@ -104,7 +104,7 @@ fn bench_random_access(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("fpram");
+                let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
                 let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
@@ -134,7 +134,7 @@ fn bench_random_access(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("fpram");
+                let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
                 let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
@@ -163,52 +163,14 @@ fn bench_random_access(c: &mut Criterion) {
     });
     group.finish();
 }
-
-fn bench_persist(c: &mut Criterion) {
-    let mut group = c.benchmark_group("persist");
-    group.sample_size(16);
-    group.measurement_time(Duration::from_secs(32));
-    const MEMORY_SIZE: usize = 4096 * 100; // 100 pages
-    const WRITES_PER_SAMPLE: usize = 2_000;
-
-    for &dirty_pages in &[10usize, 25, 50, 75, 100] {
-        group.bench_with_input(BenchmarkId::new("persist_dirty_pages", dirty_pages), &dirty_pages, |b, &n_dirty| {
-            b.iter_batched(
-                || {
-                    let dir = tempfile::tempdir().expect("tempdir");
-                    let path = dir.path().join("fpram");
-                    let path_str = path.to_string_lossy().to_string();
-                    let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
-                    (dir, fpram)
-                },
-                |(dir, fpram)| {
-                    let _keep_dir = dir;
-                    let mut rng = SimpleRandom::new(98765);
-                    for _ in 0..WRITES_PER_SAMPLE {
-                        let page_idx = (rng.next() as usize) % n_dirty;
-                        let offset_in_page = (rng.next() % 4000) as u64; // leave room
-                        let pointer_value = (page_idx * 4096) as u64 + offset_in_page;
-                        let mut p = fpram.salloc(pointer_value, std::mem::size_of::<u64>()).expect("salloc");
-                        let v: u64 = rng.next();
-                        p.write(&v).expect("write");
-                    }
-                    fpram.persist().expect("persist");
-                    black_box(());
-                },
-                BatchSize::SmallInput,
-            );
-        });
-    }
-    group.finish();
-}
-
+ 
 fn bench_sequential_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_access");
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
     const MEMORY_SIZE: usize = 4096 * 500; // 2MB
     const ELEMENTS: usize = 200_000; // 1.6MB for u64
-    const OPS_PER_SAMPLE: usize = 10_000;
+    const OPS_PER_SAMPLE: usize = 1_000;
 
     // Sequential writes
     group.throughput(Throughput::Elements(OPS_PER_SAMPLE as u64));
@@ -216,7 +178,7 @@ fn bench_sequential_access(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("fpram");
+                let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
                 let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let array = fpram
@@ -243,7 +205,7 @@ fn bench_sequential_access(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("fpram");
+                let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
                 let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let array = fpram
@@ -282,14 +244,14 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
     const READ_HEAVY_LEN: usize = 2048;
     const WRITE_HEAVY_LEN: usize = 2048;
     const COLD_LEN: usize = 256;
-    const ITERS: usize = 10_000; // per-sample work
+    const ITERS: usize = 1_000; // per-sample work
 
     group.throughput(Throughput::Elements(ITERS as u64));
     group.bench_function("mixed_pattern_u64", |b| {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("fpram");
+                let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
                 let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let hot = fpram.malloc(HOT_LEN * ELEMENT_SIZE).expect("hot alloc");
@@ -356,5 +318,5 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_random_access, bench_malloc_free, bench_salloc, bench_persist, bench_sequential_access, bench_mixed_hot_cold);
+criterion_group!(benches, bench_malloc_free, bench_salloc, bench_random_access, bench_sequential_access, bench_mixed_hot_cold);
 criterion_main!(benches);

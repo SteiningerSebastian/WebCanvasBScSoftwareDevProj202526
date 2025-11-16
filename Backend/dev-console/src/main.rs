@@ -4,7 +4,7 @@ use std::mem::size_of;
 fn main() {
     // Create a temporary directory to hold backing page files
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("demo_fpram");
+    let path = dir.path().join("demo.ignore._fpram");
     let path_str = path.to_string_lossy().to_string();
 
     // Create a 4-page (16KiB) persistent RAM instance
@@ -23,6 +23,17 @@ fn main() {
     p.write(&0xDEADBEEFu64).expect("write u64");
     let read_val: Box<u64> = p.deref().expect("deref u64");
     println!("malloc -> read 0x{:X}", *read_val);
+
+    let text: String = "Hello, Persistent RAM!".to_string();
+    let text_bytes = text.as_bytes();
+    println!("malloc string -> write '{:X?}'", text_bytes);
+    let mut text_ptr = fpram.malloc(text_bytes.len()).expect("malloc string");
+    text_ptr.write_exact(&text_bytes).expect("write string");
+    
+    let mut read_buf = vec![0u8; text_bytes.len()];
+    text_ptr.read_exact(&mut read_buf).expect("deref string");
+    println!("malloc string -> read '{:X?}'", read_buf);
+    println!("malloc string -> read '{}'", String::from_utf8_lossy(&read_buf));
 
     // --- Array access with .at<T>(index) ---
     let array = fpram.malloc(10 * size_of::<u64>()).expect("malloc array");
