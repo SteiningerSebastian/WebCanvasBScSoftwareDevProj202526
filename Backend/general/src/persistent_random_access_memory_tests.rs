@@ -3,7 +3,7 @@ mod tests {
     use super::super::persistent_random_access_memory::{
         FilePersistentRandomAccessMemory, PersistentRandomAccessMemory, Error
     };
-    use std::fs;
+    use std::{fs, rc::Rc};
 
     const TEST_SIZE: usize = 16384; // 4 pages
     const TEST_PATH: &str = "C:/Users/sebas/Repos/WebCanvas/Backend/general/testdata/test_persistent_memory";
@@ -15,7 +15,7 @@ mod tests {
         let _ = fs::remove_file(format!("{}.page3", TEST_PATH));
     }
 
-    fn create_test_memory() -> FilePersistentRandomAccessMemory {
+    fn create_test_memory() -> Rc<FilePersistentRandomAccessMemory> {
         cleanup_test_files();
         FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH)
     }
@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn test_malloc_basic() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let result = memory.malloc(64);
         assert!(result.is_ok());
         cleanup_test_files();
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn test_malloc_out_of_memory() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let result = memory.malloc(TEST_SIZE + 1);
         assert!(matches!(result, Err(Error::OutOfMemoryError)));
         cleanup_test_files();
@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn test_salloc_basic() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let result = memory.salloc(0, 128);
         assert!(result.is_ok());
         cleanup_test_files();
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Static memory allocation cannot happen after malloc")]
     fn test_salloc_after_malloc_panics() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let _ = memory.malloc(64);
         let _ = memory.salloc(0, 128);
         cleanup_test_files();
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read_u64() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let mut ptr = memory.malloc(8).unwrap();
         
         let value: u64 = 0x1234567890ABCDEF;
@@ -90,7 +90,7 @@ mod tests {
             c: u16,
         }
         
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let mut ptr = memory.malloc(std::mem::size_of::<TestStruct>()).unwrap();
         
         let value = TestStruct { a: 42, b: 0xDEADBEEF, c: 255 };
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read_array() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let mut ptr = memory.malloc(40).unwrap();
         
         let value: [u64; 5] = [1, 2, 3, 4, 5];
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_multiple_allocations() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let mut ptr1 = memory.malloc(64).unwrap();
         let mut ptr2 = memory.malloc(128).unwrap();
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_free_and_realloc() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let ptr1 = memory.malloc(64).unwrap();
         let ptr1_addr = ptr1.pointer;
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_free_merges_adjacent_slots() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let ptr1 = memory.malloc(64).unwrap();
         let ptr2 = memory.malloc(64).unwrap();
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_cross_page_write_and_read() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         // Allocate near page boundary
         let page_size = 4096;
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_persist() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let mut ptr = memory.malloc(8).unwrap();
         
         let value: u64 = 0x123456789ABCDEF0;
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_unsafe_deref_within_page() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let mut ptr = memory.malloc(8).unwrap();
         
         let value: u64 = 0xCAFEBABE;
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_unsafe_deref_cross_page_returns_none() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         // Allocate near page boundary so u64 spans pages
         let page_size = 4096;
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_unsafe_deref_mut_within_page() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         let mut ptr = memory.malloc(8).unwrap();
         
         let value: u64 = 0x1111;
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_malloc_prefers_single_page_allocation() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         // Allocate a large block that leaves a small gap before the page boundary
         let page_size = 4096;
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_reserve_exact_multiple_slots() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         // Create fragmented free space
         let ptr1 = memory.salloc(0,100).unwrap();
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Attempted to reserve a slot that is not fully free")]
     fn test_reserve_exact_panics_on_overlap() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let _ptr1 = memory.salloc(0,100).unwrap();
         
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_large_data_across_multiple_pages() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let data_size = 8192; // 2 pages
         let ptr = memory.malloc(data_size).unwrap();
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_page_swapping() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         // Write to page 0
         let mut ptr1 = memory.salloc(0, 8).unwrap();
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_persist_flushes_all_pages() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         // Write to multiple pages
         let mut ptr1 = memory.salloc(0, 8).unwrap();
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_malloc_exhausts_memory() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let mut allocations = Vec::new();
         let alloc_size = 1024;
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_free_slots_remain_sorted() {
-        let mut memory = create_test_memory();
+        let memory = create_test_memory();
         
         let ptr1 = memory.malloc(100).unwrap();
         let ptr2 = memory.malloc(100).unwrap();
@@ -416,6 +416,35 @@ mod tests {
         let new_ptr2 = memory.malloc(50).unwrap();
         assert!(new_ptr1.pointer < new_ptr2.pointer);
         
+        cleanup_test_files();
+    }
+
+    #[test]
+    fn test_index_into_salloc_array() {
+        #[repr(C)]
+        struct Elem(u64);
+
+        let memory = create_test_memory();
+
+        // allocate an array of 10 u64 elements via static allocation
+        let elem_count = 10;
+        let total_size = (elem_count * size_of::<Elem>()) as usize;
+        let array = memory.malloc( total_size).unwrap();
+
+        // write distinct values into each element using .index(i)
+        for i in 0..elem_count {
+            let mut elem_ptr = array.at::<Elem>(i);
+            let val = Elem((i as u64) * 10 + 1);
+            elem_ptr.write(&val).unwrap();
+        }
+
+        // read them back and verify values
+        for i in 0..elem_count {
+            let mut elem_ptr = array.at::<Elem>(i);
+            let read = elem_ptr.deref::<Elem>().unwrap();
+            assert_eq!(read.0, (i as u64) * 10 + 1);
+        }
+
         cleanup_test_files();
     }
 }
