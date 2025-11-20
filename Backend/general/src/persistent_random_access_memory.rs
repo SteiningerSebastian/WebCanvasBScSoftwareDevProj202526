@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fmt::Display, fs::OpenOptions, io::{BufReader, BufWriter, Read, Write}, rc::{Rc, Weak}};
+use std::{cell::RefCell, fmt::Display, fs::{File, OpenOptions}, io::{Read, Seek, Write}, rc::{Rc, Weak}};
 
 use crate::page_cache::{self, LruKCache};
 
@@ -332,9 +332,9 @@ pub trait PersistentRandomAccessMemory {
 pub struct FilePersistentRandomAccessMemory {
     cached_page: RefCell<Vec<u8>>,
     cached_page_dirty: RefCell<bool>,
-    path: String,
+    file: RefCell<File>,
+    current_cursor_position: RefCell<u64>,
     current_page_index: RefCell<Option<usize>>,
-    unsynced_pages: RefCell<Vec<bool>>,
 
     free_slots: RefCell<Vec<(u64, usize)>>,
     malloc_called: RefCell<bool>,
@@ -441,7 +441,27 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
         // Flush all other dirty pages in the cache
         let mut cache = self.cache.borrow_mut();
 
-        for slot in cache.iter_mut() {
+        // Iterate through all cache slots and flush dirty pages 
+        // First collect all dirty slots, don't sort non dirty slots => less work
+        let mut slots = cache.iter_mut().filter(|s|{
+            if let Some(slot) = s {
+                slot.dirty && slot.data.is_some()
+            } else {
+                false
+            }
+        }).collect::<Vec<_>>();
+
+        // Sort them py page index to minimize seek time
+        slots.sort_by(| a, b| {
+            match (a, b) {
+                (Some(slot_a), Some(slot_b)) => slot_a.page_index.cmp(&slot_b.page_index),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+
+        for slot in slots {
             if let Some(slot) = slot {
                 if slot.dirty {
                     if let Some(data) = slot.data.as_ref() {
@@ -452,21 +472,8 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
             }
         }
 
-        // Iterate over unsynced pages and flush them
-        let mut unsynced = self.unsynced_pages.borrow_mut();
-        for (idx, needs_sync) in unsynced.iter_mut().enumerate() {
-            if !*needs_sync { continue; }
-            let path = Self::get_page_path(&self.path, idx);
-            // Do not truncate; just sync existing contents
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&path)
-                .map_err(|_| Error::WriteError)?;
-            file.sync_all().map_err(|_| Error::FlushError)?;
-            *needs_sync = false;
-        }
+        // Make sure all data is written to disk
+        self.file.borrow_mut().sync_all().map_err(|_| Error::FlushError)?;
 
         Ok(())
     }
@@ -611,27 +618,25 @@ impl FilePersistentRandomAccessMemory {
         let mut free_slots = Vec::new();
         free_slots.push((0, size));
 
-        let page_count = size / page_size;
-
         // Initialize the persistent random access memory
-        for page_index in 0..page_count {
-            let page_path = Self::get_page_path(path, page_index);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&page_path)
-                .expect("Failed to create page file");
-            file.set_len(page_size as u64)
-                .expect("Failed to size page file");
-        }
+        let page_path =  format!("{}.fpram", path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&page_path)
+            .expect("Failed to create page file");
+
+        // Set the file size to the total size
+        file.set_len(size as u64)
+            .expect("Failed to size page file");
 
         let me = Self {
             cached_page: RefCell::new(vec![0; page_size]),
             cached_page_dirty: RefCell::new(false),
-            path: path.to_string(),
+            file: RefCell::new(file),
+            current_cursor_position: RefCell::new(0),
             current_page_index: RefCell::new(None),
-            unsynced_pages: RefCell::new(vec![false; size / page_size]),
             free_slots: RefCell::new(free_slots),
             malloc_called: RefCell::new(false),
             me: Weak::new(),
@@ -843,6 +848,7 @@ impl FilePersistentRandomAccessMemory {
     /// 
     /// Returns:
     /// - The page index as usize.
+    #[inline(always)]
     fn get_page_index(&self, pointer: u64) -> usize {
         (pointer as usize) >> self.page_shift
     }
@@ -854,19 +860,19 @@ impl FilePersistentRandomAccessMemory {
     /// 
     /// Returns:
     /// - The offset within the page as usize.
+    #[inline(always)]
     fn get_page_offset(&self, pointer: u64) -> usize {
         (pointer as usize) & (self.page_size - 1)
     }
 
-    /// Constructs the file path for a given page index.
+    /// Constructs the coursor position in the memory file for a given page index.
     ///     
     /// Parameters:
+    /// - base_path: The base path as a string slice.
     /// - page_index: The index of the page.
-    /// 
-    /// Returns:
-    /// - The file path as a String.
-    fn get_page_path(path: &str, page_index: usize) -> String {
-        format!("{}.page{}", path, page_index)
+    #[inline(always)]
+    fn get_page_offset_in_file(&self, page_index: usize) -> u64 {
+        (page_index * self.page_size) as u64
     }
 
     /// Loads the specified page from persistent storage into memory.
@@ -877,19 +883,20 @@ impl FilePersistentRandomAccessMemory {
     /// Returns:
     /// - Result indicating success or failure.
     fn load_page(&self, page_index: usize) -> Result<(), Error> {
-        let path = Self::get_page_path(&self.path, page_index);
-        
-        let file = std::fs::File::open(&path).map_err(|_| Error::FileReadError)?;
-        let metadata = file.metadata().map_err(|_| Error::FileReadError)?;
-        
-        if metadata.len() == 0 {
-            // Page was created but never written - fill with zeros
-            self.cached_page.borrow_mut().fill(0);
-        } else {
-            let mut reader = BufReader::with_capacity(self.page_size, file);
-            reader.read_exact(self.cached_page.borrow_mut().as_mut())
-                .map_err(|_| Error::FileReadError)?;
+        let page_offset = self.get_page_offset_in_file(page_index);
+        let mut file = self.file.borrow_mut();
+        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
+
+        // Seek to the start of the page if not already there
+        if page_offset != *current_cursor_position {
+            file.seek(std::io::SeekFrom::Start(page_offset)).map_err(|_| Error::ReadError)?;
+            *current_cursor_position = page_offset;
         }
+
+        // Read the page into the cached page buffer
+        file.read_exact(&mut self.cached_page.borrow_mut()).map_err(|_| Error::ReadError)?;
+        // Update the cursor position (Sequential read will be faster as we don't need to seek again)
+        *current_cursor_position += self.page_size as u64;
         
         *self.current_page_index.borrow_mut() = Some(page_index);
         self.cached_page_dirty.replace(false);
@@ -904,20 +911,21 @@ impl FilePersistentRandomAccessMemory {
     /// Returns:
     /// - Result indicating success or failure.
     fn flush_page(&self, page_index: usize, page: &Vec<u8>) -> Result<(), Error> {
-        let path = Self::get_page_path(&self.path, page_index);
-        
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|_| Error::WriteError)?;
-        
-        let mut writer = BufWriter::with_capacity(self.page_size, file);
-        writer.write_all(page).map_err(|_| Error::WriteError)?;
-        writer.flush().map_err(|_| Error::FlushError)?;
+        let mut file = self.file.borrow_mut();
+        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
 
-        self.unsynced_pages.borrow_mut()[page_index] = true;
+        // Caclulate the offset in the file for the page
+        let page_offset = self.get_page_offset_in_file(page_index);
+
+        // Seek to the start of the page if not already there
+        if page_offset != *current_cursor_position {
+            file.seek(std::io::SeekFrom::Start(page_offset)).map_err(|_| Error::ReadError)?;
+            *current_cursor_position = page_offset;
+        }
+
+        // Write the page from the cached page buffer to the file
+        file.write_all(page).map_err(|_| Error::WriteError)?;
+        *current_cursor_position += self.page_size as u64;
 
         Ok(())
     }

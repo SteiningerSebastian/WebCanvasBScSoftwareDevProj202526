@@ -6,20 +6,18 @@ mod tests {
     use std::{fs, rc::Rc};
 
     const TEST_SIZE: usize = 16384; // 4 pages
+    const PAGE_SIZE: usize = 4096;
     const TEST_PATH: &str = "C:/data/test_persistent_memory.ignore";
 
     fn cleanup_test_files() {
-        let _ = fs::remove_file(format!("{}.page0", TEST_PATH));
-        let _ = fs::remove_file(format!("{}.page1", TEST_PATH));
-        let _ = fs::remove_file(format!("{}.page2", TEST_PATH));
-        let _ = fs::remove_file(format!("{}.page3", TEST_PATH));
+        let _ = fs::remove_file(format!("{}.fpram", TEST_PATH));
     }
 
     fn create_test_memory() -> Rc<FilePersistentRandomAccessMemory> {
         cleanup_test_files();
         // Create a new persistent RAM instance for testing
         // use low capacity and history length for faster tests and easier cache eviction tests
-        FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, 4096, 2, 2, 1)
+        FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, PAGE_SIZE, 2, 2, 1)
     }
 
     #[test]
@@ -32,7 +30,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Size must be a multiple of PAGE_SIZE")]
     fn test_new_panics_on_invalid_size() {
-        FilePersistentRandomAccessMemory::new(100, TEST_PATH, 4096, 16, 2, 1);
+        FilePersistentRandomAccessMemory::new(100, TEST_PATH, PAGE_SIZE, 16, 2, 1);
     }
 
     #[test]
@@ -180,7 +178,7 @@ mod tests {
         let memory = create_test_memory();
         
         // Allocate near page boundary
-        let page_size = 4096;
+        let page_size = PAGE_SIZE;
         let ptr = memory.salloc((page_size - 4) as u64, 8).unwrap();
         
         let mut ptr_mut = ptr;
@@ -226,7 +224,7 @@ mod tests {
         let memory = create_test_memory();
         
         // Allocate near page boundary so u64 spans pages
-        let page_size = 4096;
+        let page_size = PAGE_SIZE;
         let mut ptr = memory.salloc((page_size - 4) as u64, 8).unwrap();
         
         let value: u64 = 0xDEADBEEF;
@@ -260,7 +258,7 @@ mod tests {
         let memory = create_test_memory();
         
         // Allocate a large block that leaves a small gap before the page boundary
-        let page_size = 4096;
+        let page_size = PAGE_SIZE;
         let ptr1 = memory.malloc(page_size - 100).unwrap();
         assert_eq!(ptr1.pointer, 0);
         
@@ -371,9 +369,7 @@ mod tests {
         memory.persist().unwrap();
         
         // Verify pages were written to disk
-        assert!(std::path::Path::new(&format!("{}.page0", TEST_PATH)).exists());
-        assert!(std::path::Path::new(&format!("{}.page1", TEST_PATH)).exists());
-        assert!(std::path::Path::new(&format!("{}.page2", TEST_PATH)).exists());
+        assert!(std::path::Path::new(&format!("{}.fpram", TEST_PATH)).exists());
         
         cleanup_test_files();
     }
@@ -453,7 +449,7 @@ mod tests {
     fn test_stress_many_page_swaps_integrity() {
         let memory = create_test_memory();
 
-        let page_size = 4096u64;
+        let page_size = PAGE_SIZE as u64;
         let mut p0 = memory.salloc(0, 8).unwrap();
         let mut p1 = memory.salloc(page_size, 8).unwrap();
         let mut p2 = memory.salloc(page_size * 2, 8).unwrap();
@@ -500,7 +496,7 @@ mod tests {
     #[test]
     fn test_concurrent_reads_different_pages() {
         let memory = create_test_memory();
-        let page_size = 4096u64;
+        let page_size =  PAGE_SIZE as u64;
         
         // Write to all pages
         for page in 0..4 {
@@ -526,7 +522,7 @@ mod tests {
     #[test]
     fn test_write_read_exact_boundary_cases() {
         let memory = create_test_memory();
-        let page_size = 4096u64;
+        let page_size =  PAGE_SIZE as u64;
         
         // Test write at exact page boundary
         let mut ptr = memory.salloc(page_size, 16).unwrap();
@@ -574,7 +570,7 @@ mod tests {
     #[test]
     fn test_page_eviction_preserves_dirty_data() {
         let memory = create_test_memory();
-        let page_size = 4096u64;
+        let page_size =  PAGE_SIZE as u64;
         
         // Write to more pages than cache can hold (cache holds 2 pages)
         let mut ptrs = Vec::new();
@@ -597,7 +593,7 @@ mod tests {
     #[test]
     fn test_alternating_page_access_pattern() {
         let memory = create_test_memory();
-        let page_size = 4096u64;
+        let page_size =  PAGE_SIZE as u64;
         
         let mut p0 = memory.salloc(0, 8).unwrap();
         let mut p1 = memory.salloc(page_size * 3, 8).unwrap();
@@ -640,7 +636,7 @@ mod tests {
     fn test_persist_and_reload_entire_memory() {
         // Fresh start
         cleanup_test_files();
-        let memory = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, 4096, 16, 2, 1);
+        let memory = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, PAGE_SIZE, 16, 2, 1);
 
         // Fill entire memory with a deterministic pattern
         let total = TEST_SIZE;
@@ -654,7 +650,7 @@ mod tests {
 
         // Drop and reload
         drop(memory);
-        let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, 4096, 16, 2, 1);
+        let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, PAGE_SIZE, 16, 2, 1);
 
         let mut read_back = vec![0u8; total];
         memory2.read(0, &mut read_back).unwrap();
@@ -665,7 +661,7 @@ mod tests {
 
     #[test]
     fn test_spanning_write_across_multiple_pages_persist_and_reload() {
-        let page_size = 4096u64;
+        let page_size =  PAGE_SIZE as u64;
         let start = page_size - 50;                  // start near end of page 0
         let len = (page_size as usize) * 2 + 200;    // span three pages in total range
 
@@ -682,7 +678,7 @@ mod tests {
         drop(memory);
 
         // Reload and verify
-        let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, 4096, 16, 2, 1);
+        let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, PAGE_SIZE, 16, 2, 1);
         let mut read_back = vec![0u8; len];
         memory2.read(start, &mut read_back).unwrap();
 
@@ -724,7 +720,7 @@ mod tests {
     #[test]
     fn test_persist_twice_with_interleaved_swaps() {
         let memory = create_test_memory();
-        let page_size = 4096u64;
+        let page_size =  PAGE_SIZE as u64;
 
         // Place four u64s on distinct pages
         let mut p0 = memory.salloc(0, 8).unwrap();
@@ -771,7 +767,7 @@ mod tests {
         drop(memory);
 
         // Reopen and verify second set of values survived
-        let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, 4096, 16, 2, 1);
+        let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, PAGE_SIZE, 16, 2, 1);
         let p0r = memory2.salloc(0, 8).unwrap();
         let p1r = memory2.salloc(page_size -1, 8).unwrap();
         let p2r = memory2.salloc(page_size * 2 -2, 8).unwrap();
