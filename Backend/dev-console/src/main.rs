@@ -55,4 +55,83 @@ fn main() {
 
     // Keep the tempdir alive until program exit so the backing files can be inspected
     println!("Demo complete. Tempdir path: {}", dir.path().display());
+
+    // --- Cache performance test ---
+    const PAGE_SIZE: usize = 1024; // 1KiB
+    const LRU_CAPACITY: usize = 16; // number of pages in LRU cache
+    const LRU_HISTORY_LENGTH: usize = 2; // K value for LRU-K
+    const LRU_PARDON: usize = 4; // pardon value for LRU-K
+
+    const MEMORY_SIZE: usize = PAGE_SIZE * 500; // 2MB
+    const ELEMENT_SIZE: usize = std::mem::size_of::<u64>();
+    const HOT_LEN: usize = 256;
+    const READ_HEAVY_LEN: usize = 2048;
+    const WRITE_HEAVY_LEN: usize = 2048;
+    const COLD_LEN: usize = 256;
+    const ITERS: usize = 1_000; // per-sample work
+
+    // Test cache stats
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("f.ignore.pram");
+    let path_str = path.to_string_lossy().to_string();
+    let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+    
+    let hot = fpram.malloc(HOT_LEN * ELEMENT_SIZE).expect("hot alloc");
+    let rh: general::persistent_random_access_memory::Pointer = fpram.malloc(READ_HEAVY_LEN * ELEMENT_SIZE).expect("rh alloc");
+    let wh = fpram.malloc(WRITE_HEAVY_LEN * ELEMENT_SIZE).expect("wh alloc");
+    let cold = fpram.malloc(COLD_LEN * ELEMENT_SIZE).expect("cold alloc");
+
+    // init small portions to touch pages
+    for i in 0..HOT_LEN { hot.at::<u64>(i).write(&0).expect("init hot"); }
+    for i in 0..READ_HEAVY_LEN { rh.at::<u64>(i).write(&0).expect("init rh"); }
+    for i in 0..WRITE_HEAVY_LEN { wh.at::<u64>(i).write(&0).expect("init wh"); }
+    for i in 0..COLD_LEN { cold.at::<u64>(i).write(&0).expect("init cold"); }
+    
+    let _keep_dir = dir;
+    for i in 0..ITERS {
+        // HOT: frequent read-write (+1)
+        let idx = i % HOT_LEN;
+        let mut p = hot.at::<u64>(idx);
+        let v = *p.deref::<u64>().expect("hot rd");
+        p.write(&(v + 1)).expect("hot wr");
+
+        // READ-HEAVY: 3 reads, occasional write every 16
+        let r1 = i % READ_HEAVY_LEN;
+        let r2 = (i.wrapping_mul(7)) % READ_HEAVY_LEN;
+        let r3 = (i.wrapping_mul(13)) % READ_HEAVY_LEN;
+        let _ = rh.at::<u64>(r1).deref::<u64>().expect("rh rd1");
+        let _ = rh.at::<u64>(r2).deref::<u64>().expect("rh rd2");
+        let _ = rh.at::<u64>(r3).deref::<u64>().expect("rh rd3");
+        if (i & 0xF) == 0 {
+            let mut p = rh.at::<u64>(r1);
+            let v = *p.deref::<u64>().expect("rh wr rd");
+            p.write(&(v + 1)).expect("rh wr");
+        }
+
+        // WRITE-HEAVY: two writes per iter, rare reads
+        let w1 = i % WRITE_HEAVY_LEN;
+        let w2 = (i.wrapping_mul(3)) % WRITE_HEAVY_LEN;
+        let mut p1 = wh.at::<u64>(w1);
+        let v1 = *p1.deref::<u64>().expect("wh rd1");
+        p1.write(&(v1 + 1)).expect("wh wr1");
+        let mut p2 = wh.at::<u64>(w2);
+        let v2 = *p2.deref::<u64>().expect("wh rd2");
+        p2.write(&(v2 + 1)).expect("wh wr2");
+        if (i & 0x1F) == 0 {
+            let _ = p1.deref::<u64>().expect("wh occasional rd");
+        }
+
+        // COLD: rare write (every 128), else read
+        let c = i % COLD_LEN;
+        if (i & 0x7F) == 0 {
+            let mut p = cold.at::<u64>(c);
+            let v = *p.deref::<u64>().expect("cold rd");
+            p.write(&(v + 1)).expect("cold wr");
+        } else {
+            let _ = cold.at::<u64>(c).deref::<u64>().expect("cold read");
+        }
+    }
+
+    println!("Cache Misses: {:.2}%", fpram.get_cache_miss_rate() * 100.0);
+    
 }

@@ -653,6 +653,14 @@ impl FilePersistentRandomAccessMemory {
         }
     }
 
+    /// Returns statistics about the cache as a formatted string.
+    /// 
+    /// Returns:
+    /// - A string containing cache statistics.
+    pub fn get_cache_miss_rate(&self) -> f64 {
+        self.cache.borrow().get_cache_miss_rate()
+    }
+
     /// Returns the current loaded page index, or None if no page is loaded.
     pub fn get_current_page_index(&self) -> Option<usize> {
         self.current_page_index.borrow().clone()

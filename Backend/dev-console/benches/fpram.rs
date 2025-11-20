@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Benchmark
 use std::time::Duration;
 use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory, PersistentRandomAccessMemory};
 
-const PAGE_SIZE: usize = 1024*64; // 64KiB
+const PAGE_SIZE: usize = 4096; // For benchmarks: 4KiB normally 64KiB
 const LRU_CAPACITY: usize = 64; // number of pages in LRU cache
 const LRU_HISTORY_LENGTH: usize = 3; // K value for LRU-K
 const LRU_PARDON: usize = 16; // pardon value for LRU-K

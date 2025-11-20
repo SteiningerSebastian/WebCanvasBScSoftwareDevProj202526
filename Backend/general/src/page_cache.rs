@@ -69,6 +69,9 @@ pub struct LruKCache {
     pages_in_cache: HashSet<usize>,
     free_slots: Vec<usize>,
     page_map: HashMap<usize, usize>, // page_index -> slot_id
+
+    cache_hits: u64,
+    cache_misses: u64,
 }
 
 impl LruKCache {
@@ -92,6 +95,21 @@ impl LruKCache {
             pages_in_cache: HashSet::new(),
             free_slots: (0..slot_count).collect(), // all slots free initially
             page_map: HashMap::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    /// Get the current cache miss rate
+    /// 
+    /// Returns:
+    /// - `f64`: The cache miss rate as a fraction between 0.0 and 1.0
+    pub fn get_cache_miss_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0 // no accesses yet
+        } else {
+            self.cache_misses as f64 / total as f64
         }
     }
 
@@ -102,8 +120,15 @@ impl LruKCache {
     /// 
     /// Returns:
     /// - `bool`: true if the page is in the cache, false otherwise
-    pub fn contains_page(&self, page_index: usize) -> bool {
-        self.pages_in_cache.contains(&page_index)
+    pub fn contains_page(&mut self, page_index: usize) -> bool {
+        let contains = self.pages_in_cache.contains(&page_index);
+        if !contains {
+            self.cache_misses += 1;
+            false
+        } else {
+            self.cache_hits += 1;
+            true
+        }
     }
 
     /// Store a page in the cache
@@ -161,6 +186,9 @@ impl LruKCache {
         
     /// Get a page from cache, transferring its buffer to the caller and returning its dirty flag.
     /// After this call, the slot remains tracked but holds no data until the page is stored again.
+    /// 
+    /// Warning: The caller should first ask the cache if the page exists using `contains_page`. 
+    /// This ensures proper cache hit/miss tracking and avoids unnecessary misses.
     ///
     /// Parameters:
     /// - `page_index`: The index of the page to retrieve
