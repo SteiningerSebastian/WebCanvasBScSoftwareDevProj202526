@@ -1,5 +1,5 @@
 // Rust sketch (place where you prefer)
-use std::{collections::{BinaryHeap, HashMap, HashSet, VecDeque}, fmt::Display, slice::{IterMut}};
+use std::{collections::{BinaryHeap, HashMap, HashSet}, fmt::Display, slice::{IterMut}};
 
 type Clock = u64;
 const INF_SCORE: u64 = u64::MAX / 4;
@@ -18,22 +18,17 @@ impl Display for Error {
 }
 
 pub struct Slot {
-    pub page_index: usize,
-    pub data: Option<Vec<u8>>,
     pub dirty: bool,
-    history: VecDeque<Clock>, // newest at front, len <= K
+    pub page_index: usize,
     epoch: u64, // increments when slot changes to invalidate heap entries
+    history_len: usize,
+    history: [Clock; 8], // newest at front, len <= K
+    pub data: Option<Vec<u8>>,
 }
 
 impl Clone for Slot {
     fn clone(&self) -> Self {
-        Self {
-            page_index: self.page_index,
-            data: self.data.clone(),
-            dirty: self.dirty,
-            history: self.history.clone(),
-            epoch: self.epoch,
-        }
+        panic!("Slot clone should not be used, it is only implemented to satisfy trait bounds for Option::None().");
     }
 }
 
@@ -85,6 +80,7 @@ impl LruKCache {
     /// - `pardon`: The pardon period during which pages with insufficient history are not evicted
     pub fn new(k: usize, slot_count: usize, pardon: usize) -> Self {
         assert!(slot_count > pardon && k >= 1, "slot_count must be greater than pardon and at least 1.");
+        assert!(k <= 8, "k must be at most 8 due to SmallVec size.");
 
         Self {
             k,
@@ -147,8 +143,9 @@ impl LruKCache {
             page_index,
             data: Some(data),
             dirty: dirty,
-            history: VecDeque::new(),
+            history: [0; 8],
             epoch: 0,
+            history_len: 0,
         };
         self.slots[slot_id] = Some(slot);
 
@@ -184,12 +181,13 @@ impl LruKCache {
     }
 
     /// Check pardoned slots to see if any can be reinserted into the eviction heap
+    #[inline]
     fn check_pardons(&mut self) {
         for i in 0..self.pardoned.len() {
             let entry = &self.pardoned[i];
             if let Some(slot) = &self.slots[entry.slot_id] {
                 // Check if pardon conditions are met, if not reinsert into heap
-                if slot.history.len() >= self.k || self.clock - slot.history[0] >= self.pardon as u64 {
+                if slot.history_len >= self.k || self.clock - slot.history[0] >= self.pardon as u64 {
                     // No longer pardoned, reinsert into heap
                     self.heap.push(HeapEntry { score: entry.score, epoch: entry.epoch, slot_id: entry.slot_id });
 
@@ -200,25 +198,34 @@ impl LruKCache {
         }
     }
 
+    /// Update the access history of a slot
+    #[inline]
+    fn update_history(k:usize, clock: u64, slot: &mut Slot) {
+        // Shift history to the left - remove oldest if full
+        slot.history[..k].rotate_left(1);
+        slot.history[k-1] = clock;
+
+        // Update history length
+        if slot.history_len < k {
+            slot.history_len += 1;
+        }
+    }
+
     /// Touch a slot (record an access)
     /// 
     /// Parameters:
     /// - `slot_id`: The ID of the slot being accessed
+    #[inline]
     fn touch(&mut self, slot_id: usize) {
         // Increment clock and update slot history
         self.clock += 1;
 
         // Update the slot's history
         let s = self.slots[slot_id].as_mut().unwrap();
-        s.history.push_front(self.clock);
-
-        // Keep only the last K accesses
-        if s.history.len() > self.k { 
-            s.history.pop_back(); 
-        }
+        Self::update_history(self.k, self.clock, s);
 
         // Compute new score
-        let score = if s.history.len() == self.k {
+        let score = if s.history_len >= self.k {
             self.clock - s.history[self.k - 1]
         } else { 
             INF_SCORE 
@@ -263,6 +270,7 @@ impl LruKCache {
     /// 
     /// Returns:
     /// - `Option<Slot>`: The ID of the evicted slot, or None if no valid slot found
+    #[inline]
     fn evict_one(&mut self) -> Option<Slot> {
         self.check_pardons(); // Check pardoned slots first if they need to be reinserted
 
