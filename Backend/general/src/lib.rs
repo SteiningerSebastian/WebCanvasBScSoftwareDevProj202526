@@ -4,6 +4,8 @@ pub mod dns;
 pub mod thread_pool;
 pub mod persistent_random_access_memory;
 
+mod page_cache;
+
 #[cfg(test)]
 mod persistent_random_access_memory_tests;
 

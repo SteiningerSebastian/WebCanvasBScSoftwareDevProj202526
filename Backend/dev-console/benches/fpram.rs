@@ -2,6 +2,11 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Benchmark
 use std::time::Duration;
 use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory, PersistentRandomAccessMemory};
 
+const PAGE_SIZE: usize = 4096;
+const LRU_CAPACITY: usize = 16; // number of pages in LRU cache
+const LRU_HISTORY_LENGTH: usize = 2; // K value for LRU-K
+const LRU_PARDON: usize = 1; // pardon value for LRU-K
+
 // Simple pseudo-random number generator for reproducible tests
 struct SimpleRandom {
     state: u64,
@@ -32,7 +37,7 @@ fn bench_malloc_free(c: &mut Criterion) {
                     let dir = tempfile::tempdir().expect("tempdir");
                     let path = dir.path().join("f.ignore.pram");
                     let path_str = path.to_string_lossy().to_string();
-                    let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                    let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                     (dir, fpram, alloc_size)
                 },
                 |(dir, fpram, alloc_size)| {
@@ -72,7 +77,7 @@ fn bench_salloc(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                 (dir, fpram)
             },
             |(dir, fpram)| {
@@ -106,7 +111,7 @@ fn bench_random_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
                     let p = fpram.malloc(std::mem::size_of::<u64>()).expect("malloc");
@@ -136,7 +141,7 @@ fn bench_random_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
                     let mut p = fpram.malloc(std::mem::size_of::<u64>()).expect("malloc");
@@ -146,7 +151,7 @@ fn bench_random_access(c: &mut Criterion) {
                 }
                 (dir, fpram, ptrs)
             },
-            |(dir, mut fpram, mut ptrs)| {
+            |(dir, mut fpram,  ptrs)| {
                 let _keep_dir = dir;
                 let mut rng = SimpleRandom::new(54321);
                 let mut sum = 0u64;
@@ -180,7 +185,7 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                 let array = fpram
                     .malloc(ELEMENTS * std::mem::size_of::<u64>())
                     .expect("malloc array");
@@ -207,7 +212,7 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                 let array = fpram
                     .malloc(ELEMENTS * std::mem::size_of::<u64>())
                     .expect("malloc array");
@@ -253,7 +258,7 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
+                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
                 let hot = fpram.malloc(HOT_LEN * ELEMENT_SIZE).expect("hot alloc");
                 let rh = fpram.malloc(READ_HEAVY_LEN * ELEMENT_SIZE).expect("rh alloc");
                 let wh = fpram.malloc(WRITE_HEAVY_LEN * ELEMENT_SIZE).expect("wh alloc");

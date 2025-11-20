@@ -8,7 +8,7 @@ fn main() {
     let path_str = path.to_string_lossy().to_string();
 
     // Create a 4-page (16KiB) persistent RAM instance
-    let fpram = FilePersistentRandomAccessMemory::new(4096 * 4, &path_str);
+    let fpram = FilePersistentRandomAccessMemory::new(4096 * 4, &path_str, 4096, 16, 2, 1);
     println!("Created fpram at {}", path_str);
 
     // --- Static allocation (salloc) example ---
