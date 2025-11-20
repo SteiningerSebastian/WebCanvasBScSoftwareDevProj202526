@@ -70,6 +70,7 @@ pub struct LruKCache {
     clock: Clock,
     slots: Vec<Option<Slot>>,
     heap: BinaryHeap<HeapEntry>, // lazy-updated
+    pardoned: Vec<HeapEntry>,
     pages_in_cache: HashSet<usize>,
     free_slots: Vec<usize>,
     page_map: HashMap<usize, usize>, // page_index -> slot_id
@@ -91,6 +92,7 @@ impl LruKCache {
             clock: 0,
             slots: vec![None; slot_count],
             heap: BinaryHeap::new(),
+            pardoned: Vec::new(),
             pages_in_cache: HashSet::new(),
             free_slots: (0..slot_count).collect(), // all slots free initially
             page_map: HashMap::new(),
@@ -181,6 +183,23 @@ impl LruKCache {
         None
     }
 
+    /// Check pardoned slots to see if any can be reinserted into the eviction heap
+    fn check_pardons(&mut self) {
+        for i in 0..self.pardoned.len() {
+            let entry = &self.pardoned[i];
+            if let Some(slot) = &self.slots[entry.slot_id] {
+                // Check if pardon conditions are met, if not reinsert into heap
+                if slot.history.len() >= self.k || self.clock - slot.history[0] >= self.pardon as u64 {
+                    // No longer pardoned, reinsert into heap
+                    self.heap.push(HeapEntry { score: entry.score, epoch: entry.epoch, slot_id: entry.slot_id });
+
+                    // Remove from pardoned list by swapping with last and popping
+                    self.pardoned.swap_remove(i);
+                }
+            }
+        }
+    }
+
     /// Touch a slot (record an access)
     /// 
     /// Parameters:
@@ -222,39 +241,18 @@ impl LruKCache {
         if self.contains_page(page_index) || self.free_slots.len() > 0 {
             None
         }else{
-            // TODO: Optimize by avoiding repeated allocations here - you can do better!
-            let mut entries: Vec<HeapEntry> = Vec::new();
-            entries.reserve(self.pardon);
-            let mut candidate_slot_id: Option<usize> = None;
+            self.check_pardons(); // Check pardoned slots first if they need to be reinserted
 
             // Remove stale heap entries until the top matches the current epoch.
             while let Some(top) = self.heap.peek() {
                 if let Some(slot) = &self.slots[top.slot_id] {
-                    if slot.history.len() < self.k && self.clock - slot.history[0] < self.pardon as u64 {
-                        if let Some(e) = self.heap.pop() {
-                            entries.push(e);
-                        }
-                        // Not enough history to evict
-                        continue;
-                    }
-
                     if slot.epoch == top.epoch {
-                        candidate_slot_id = Some(top.slot_id);
-                        break;
+                        return Some(self.slots[top.slot_id].as_mut().unwrap()); // valid entry
                     } 
                 }
 
-                // Move to next entry
+                // Move to next entry - remove stale entry
                 let _ = self.heap.pop();
-            }
-
-            // Return pardoned entries back to heap after dropping the peek borrow
-            for entry in entries {
-                self.heap.push(entry);
-            }
-
-            if let Some(id) = candidate_slot_id {
-                return self.slots[id].as_mut();
             }
 
             None
@@ -266,17 +264,10 @@ impl LruKCache {
     /// Returns:
     /// - `Option<Slot>`: The ID of the evicted slot, or None if no valid slot found
     fn evict_one(&mut self) -> Option<Slot> {
-        let mut pardonee: Vec<HeapEntry> = Vec::new();
-        pardonee.reserve(self.pardon);
+        self.check_pardons(); // Check pardoned slots first if they need to be reinserted
 
         while let Some(top) = self.heap.pop() {
             if let Some(slot) = &self.slots[top.slot_id] {
-                if slot.history.len() < self.k && self.clock - slot.history[0] < self.pardon as u64 {
-                    pardonee.push(top);
-                    // Not enough history to evict
-                    continue;
-                }
-
                 // For stall entries, we won't return them just remove them from the heap.
                 if slot.epoch == top.epoch {
                     // valid entry
@@ -287,20 +278,10 @@ impl LruKCache {
                     self.page_map.remove(&self.slots[evict_id].as_ref().unwrap().page_index);
                     self.pages_in_cache.remove(&self.slots[evict_id].as_ref().unwrap().page_index);
 
-                    // Return pardoned entries back to heap
-                    for entry in pardonee {
-                        self.heap.push(entry);
-                    }
-
                     return self.slots[evict_id].take(); // remove and return the slot
                 }
             }
             // else stale entry -> continue popping
-        }
-
-        // Return pardoned entries back to heap
-        for entry in pardonee {
-            self.heap.push(entry);
         }
 
         // No evictable slot found

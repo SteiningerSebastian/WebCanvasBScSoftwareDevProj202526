@@ -2,10 +2,10 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Benchmark
 use std::time::Duration;
 use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory, PersistentRandomAccessMemory};
 
-const PAGE_SIZE: usize = 4096;
-const LRU_CAPACITY: usize = 16; // number of pages in LRU cache
-const LRU_HISTORY_LENGTH: usize = 2; // K value for LRU-K
-const LRU_PARDON: usize = 4; // pardon value for LRU-K
+const PAGE_SIZE: usize = 1024*64; // 64KiB
+const LRU_CAPACITY: usize = 64; // number of pages in LRU cache
+const LRU_HISTORY_LENGTH: usize = 3; // K value for LRU-K
+const LRU_PARDON: usize = 16; // pardon value for LRU-K
 
 // Simple pseudo-random number generator for reproducible tests
 struct SimpleRandom {
@@ -27,7 +27,7 @@ fn bench_malloc_free(c: &mut Criterion) {
     // Reduce sample count and give more measurement time to avoid long warnings
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
-    const MEMORY_SIZE: usize = 4096 * 200; // 200 pages
+    const MEMORY_SIZE: usize = PAGE_SIZE * 200; // 200 pages
     const ALLOCS_PER_SAMPLE: usize = 1_000; // time is per 1000 allocs/frees
     for &size in &[64, 2048] {
         group.throughput(Throughput::Elements(ALLOCS_PER_SAMPLE as u64));
@@ -66,7 +66,7 @@ fn bench_salloc(c: &mut Criterion) {
     let mut group = c.benchmark_group("salloc");
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
-    const MEMORY_SIZE: usize = 4096 * 200; // 200 pages
+    const MEMORY_SIZE: usize = PAGE_SIZE * 200; // 200 pages
     const SALLOC_SIZE: usize = 64;
     const OPS_PER_SAMPLE: usize = 1_000;
 
@@ -99,7 +99,7 @@ fn bench_random_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_access");
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
-    const MEMORY_SIZE: usize = 4096 * 500; // 2MB
+    const MEMORY_SIZE: usize = PAGE_SIZE * 500; // 2MB
     const TOTAL_PTRS: usize = 20_000; // pre-allocated pointers
     const OPS_PER_SAMPLE: usize = 1_000; // random ops per timed sample
 
@@ -173,7 +173,7 @@ fn bench_sequential_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_access");
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
-    const MEMORY_SIZE: usize = 4096 * 500; // 2MB
+    const MEMORY_SIZE: usize = PAGE_SIZE * 500; // 2MB
     const ELEMENTS: usize = 200_000; // 1.6MB for u64
     const OPS_PER_SAMPLE: usize = 1_000;
 
@@ -243,7 +243,7 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_hot_cold");
     group.sample_size(16);
     group.measurement_time(Duration::from_secs(32));
-    const MEMORY_SIZE: usize = 4096 * 500; // 2MB
+    const MEMORY_SIZE: usize = PAGE_SIZE * 500; // 2MB
     const ELEMENT_SIZE: usize = std::mem::size_of::<u64>();
     const HOT_LEN: usize = 256;
     const READ_HEAVY_LEN: usize = 2048;
@@ -323,5 +323,5 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_random_access, bench_malloc_free, bench_salloc, bench_sequential_access, bench_mixed_hot_cold);
+criterion_group!(benches, bench_random_access, bench_sequential_access, bench_mixed_hot_cold, bench_malloc_free, bench_salloc,);
 criterion_main!(benches);
