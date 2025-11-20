@@ -5,7 +5,7 @@ use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory,
 const PAGE_SIZE: usize = 4096;
 const LRU_CAPACITY: usize = 16; // number of pages in LRU cache
 const LRU_HISTORY_LENGTH: usize = 2; // K value for LRU-K
-const LRU_PARDON: usize = 1; // pardon value for LRU-K
+const LRU_PARDON: usize = 4; // pardon value for LRU-K
 
 // Simple pseudo-random number generator for reproducible tests
 struct SimpleRandom {
@@ -323,5 +323,5 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_malloc_free, bench_salloc, bench_random_access, bench_sequential_access, bench_mixed_hot_cold);
+criterion_group!(benches, bench_random_access, bench_malloc_free, bench_salloc, bench_sequential_access, bench_mixed_hot_cold);
 criterion_main!(benches);

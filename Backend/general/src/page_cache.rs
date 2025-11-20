@@ -222,19 +222,39 @@ impl LruKCache {
         if self.contains_page(page_index) || self.free_slots.len() > 0 {
             None
         }else{
+            // TODO: Optimize by avoiding repeated allocations here - you can do better!
+            let mut entries: Vec<HeapEntry> = Vec::new();
+            entries.reserve(self.pardon);
+            let mut candidate_slot_id: Option<usize> = None;
+
             // Remove stale heap entries until the top matches the current epoch.
-            for top in self.heap.iter() {
+            while let Some(top) = self.heap.peek() {
                 if let Some(slot) = &self.slots[top.slot_id] {
                     if slot.history.len() < self.k && self.clock - slot.history[0] < self.pardon as u64 {
+                        if let Some(e) = self.heap.pop() {
+                            entries.push(e);
+                        }
                         // Not enough history to evict
                         continue;
                     }
 
                     if slot.epoch == top.epoch {
-                        // Valid top
-                        return self.slots[top.slot_id].as_mut();
+                        candidate_slot_id = Some(top.slot_id);
+                        break;
                     } 
                 }
+
+                // Move to next entry
+                let _ = self.heap.pop();
+            }
+
+            // Return pardoned entries back to heap after dropping the peek borrow
+            for entry in entries {
+                self.heap.push(entry);
+            }
+
+            if let Some(id) = candidate_slot_id {
+                return self.slots[id].as_mut();
             }
 
             None
@@ -246,7 +266,6 @@ impl LruKCache {
     /// Returns:
     /// - `Option<Slot>`: The ID of the evicted slot, or None if no valid slot found
     fn evict_one(&mut self) -> Option<Slot> {
-        // Perhaps somone can think of a better solution thatn that?
         let mut pardonee: Vec<HeapEntry> = Vec::new();
         pardonee.reserve(self.pardon);
 
