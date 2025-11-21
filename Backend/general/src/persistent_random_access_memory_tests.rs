@@ -11,6 +11,7 @@ mod tests {
 
     fn cleanup_test_files() {
         let _ = fs::remove_file(format!("{}.fpram", TEST_PATH));
+        let _ = fs::remove_file(format!("{}.swap.fpram", TEST_PATH));
     }
 
     fn create_test_memory() -> Rc<FilePersistentRandomAccessMemory> {
@@ -370,6 +371,7 @@ mod tests {
         
         // Verify pages were written to disk
         assert!(std::path::Path::new(&format!("{}.fpram", TEST_PATH)).exists());
+        assert!(std::path::Path::new(&format!("{}.swap.fpram", TEST_PATH)).exists());
         
         cleanup_test_files();
     }

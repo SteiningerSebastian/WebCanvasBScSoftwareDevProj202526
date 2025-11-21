@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fmt::Display, fs::{File, OpenOptions}, io::{Read, Seek, Write}, rc::{Rc, Weak}};
+use std::{cell::RefCell, collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, rc::{Rc, Weak}};
 
 use crate::page_cache::{self, LruKCache};
 
@@ -7,10 +7,13 @@ pub enum Error {
     ReadError,
     WriteError,
     FlushError,
-    FileReadError,
+    FileReadError(io::Error),
     OutOfMemoryError,
     NotOnOnePageError,
     CacheStoreError(page_cache::Error),
+    SwapFileError(io::Error),
+    FileOpenError(io::Error),
+    FileWriteError(io::Error),
 }
 
 impl Display for Error {
@@ -19,10 +22,13 @@ impl Display for Error {
             Error::ReadError => write!(f, "Read Error"),
             Error::WriteError => write!(f, "Write Error"),
             Error::FlushError => write!(f, "Flush Error"),
-            Error::FileReadError => write!(f, "File Read Error"),
+            Error::FileReadError(e) => write!(f, "File Read Error: {}", e),
             Error::OutOfMemoryError => write!(f, "Out of Memory Error"),
             Error::NotOnOnePageError => write!(f, "Data not contained on single page Error"),
             Error::CacheStoreError(e) => write!(f, "Cache Store Error: {}", e),
+            Error::SwapFileError(e) => write!(f, "Swap File Error: {}", e),
+            Error::FileOpenError(e) => write!(f, "File Open Error: {}", e),
+            Error::FileWriteError(e) => write!(f, "File Write Error: {}", e),
         }
     }
 }
@@ -329,10 +335,23 @@ pub trait PersistentRandomAccessMemory {
     fn write(&self, pointer: u64, buf: &[u8]) -> Result<(), Error>;  
 }
 
+/// A persistent random access memory implementation that uses two files as backing storage.
+/// 
+/// The first file is the persistent file that holds the actual "commited" data.
+/// The second file is the swap file that holds the "uncommited" changes.
+/// This is necessary to ensure data atomicity in case of crashes or power failures.
+/// Either all changes are persisted or none are.
+/// 
+/// Warning: This implementation is not thread-safe. Concurrent access to the same instance
+/// may lead to data races or corruption. Use external synchronization if needed.
 pub struct FilePersistentRandomAccessMemory {
     cached_page: RefCell<Vec<u8>>,
     cached_page_dirty: RefCell<bool>,
-    file: RefCell<File>,
+    path: String,
+    swap_file: RefCell<File>,
+    dirty_swaped_pages: RefCell<BTreeSet<usize>>,
+    persistent_file: RefCell<File>,
+
     current_cursor_position: RefCell<u64>,
     current_page_index: RefCell<Option<usize>>,
 
@@ -461,6 +480,7 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
             }
         });
 
+    
         for slot in slots {
             if let Some(slot) = slot {
                 if slot.dirty {
@@ -473,7 +493,10 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
         }
 
         // Make sure all data is written to disk
-        self.file.borrow_mut().sync_all().map_err(|_| Error::FlushError)?;
+        self.swap_file.borrow_mut().sync_all().map_err(|_| Error::FlushError)?;
+
+        // Makes sure taht the swap_file is persisted atomically
+        self.persist_swap_file()?;
 
         Ok(())
     }
@@ -617,24 +640,51 @@ impl FilePersistentRandomAccessMemory {
         // and the free list will not be persisted across restarts.
         let mut free_slots = Vec::new();
         free_slots.push((0, size));
+        
+        let swap_file_path = Self::get_swap_file_path(path);
+        let persistent_file_path = Self::get_persistent_file_path(path);
 
-        // Initialize the persistent random access memory
-        let page_path =  format!("{}.fpram", path);
-        let file = OpenOptions::new()
+        // if the .tmp file exists, rename it back to the swap file
+        let tmp_file_path = format!("{}.tmp", persistent_file_path);
+        if std::path::Path::new(&tmp_file_path).exists() {
+            std::fs::rename(&tmp_file_path, &swap_file_path)
+                .expect("Failed to rename temporary swap file back to swap file");
+        }
+
+        // Initialize the swap file
+        let swap_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(&page_path)
+            .open(&swap_file_path)
             .expect("Failed to create page file");
 
         // Set the file size to the total size
-        file.set_len(size as u64)
+        swap_file.set_len(size as u64)
             .expect("Failed to size page file");
+
+        // Initialize the persistent file
+        let persistent_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&persistent_file_path)
+            .expect("Failed to create persistent file");
+
+        persistent_file.set_len(size as u64)
+            .expect("Failed to size persistent file");
+
+        // As at this point we don't know if the swap file is in a valid state, we copy the persistent file over it.
+        std::fs::copy(persistent_file_path, swap_file_path)
+            .expect("Failed to initialize swap file from persistent file");
 
         let me = Self {
             cached_page: RefCell::new(vec![0; page_size]),
             cached_page_dirty: RefCell::new(false),
-            file: RefCell::new(file),
+            swap_file: RefCell::new(swap_file),
+            dirty_swaped_pages: RefCell::new(BTreeSet::new()),
+            path: path.to_string(),
+            persistent_file: RefCell::new(persistent_file),
             current_cursor_position: RefCell::new(0),
             current_page_index: RefCell::new(None),
             free_slots: RefCell::new(free_slots),
@@ -658,6 +708,16 @@ impl FilePersistentRandomAccessMemory {
         }
     }
 
+    /// Generates the swap file path based on the given base path.
+    fn get_swap_file_path(path: &str) -> String {
+        format!("{}.swap.fpram", path)
+    }
+
+    /// Generates the persistent file path based on the given base path.
+    fn get_persistent_file_path(path: &str) -> String {
+        format!("{}.fpram", path)
+    }
+
     /// Returns statistics about the cache as a formatted string.
     /// 
     /// Returns:
@@ -670,6 +730,79 @@ impl FilePersistentRandomAccessMemory {
     pub fn get_current_page_index(&self) -> Option<usize> {
         self.current_page_index.borrow().clone()
     }
+
+    /// Persists the swap file to disk.
+    fn persist_swap_file(&self) -> Result<(), Error> {
+        let swap_file_path = Self::get_swap_file_path(&self.path);
+        let persistent_file_path = Self::get_persistent_file_path(&self.path);
+
+        let swap_file = std::path::Path::new(&swap_file_path);
+        let persistent_file = std::path::Path::new(&persistent_file_path);
+
+        // Swap the files atomically -> the swap file has been fully written at this point
+        // so we can just rename it to the persistent file.
+
+        // Swap procedure:
+        // Warning: This may leave temporary files on disk if the process crashes during the swap.
+
+        // First move the current persistent file to a temporary location
+        std::fs::rename(persistent_file, format!("{}.tmp", persistent_file_path))
+            .map_err(Error::SwapFileError)?;
+        // Then move the swap file to the persistent file location
+        std::fs::rename(swap_file, persistent_file)
+            .map_err(Error::SwapFileError)?;
+        // Finally move the temporary file to the swap file location
+        std::fs::rename(format!("{}.tmp", persistent_file_path), swap_file)
+            .map_err(Error::SwapFileError)?;
+
+        // Reopen the swap file and persistent file handles after the swap
+        let mut new_swap_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&swap_file_path)
+            .map_err(Error::FileOpenError)?;
+
+        let mut new_persistent_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&persistent_file_path)
+            .map_err(Error::FileOpenError)?;
+
+        // The swap file is at this point stale, as it has been swapped with the persistent file.
+        // We need to write the recorded dirty pages back to the new swap file.
+        let mut dirty_pages = self.dirty_swaped_pages.borrow_mut();
+        let mut current_cursor: u64 = 0;
+
+        for dirty_page_index in dirty_pages.iter() {
+            let offset = self.get_page_offset_in_file(*dirty_page_index);
+            // Seek to the page offset in the new swap file
+            if offset != current_cursor {
+                new_swap_file.seek(std::io::SeekFrom::Start(offset)).map_err(Error::SwapFileError)?;
+                current_cursor = offset;
+            }
+            // Read the page data from the persistent file and write it to the new swap file
+            let mut page_data = vec![0; self.page_size];
+            new_persistent_file.read_exact(&mut page_data).map_err(Error::FileReadError)?;
+            new_swap_file.write_all(&page_data).map_err(Error::FileWriteError)?;
+            current_cursor += self.page_size as u64;
+        }
+
+        // To ensure the files are persisted to disk, we need to flush and sync them
+        new_swap_file.flush().map_err(|_| Error::FlushError)?;
+        new_persistent_file.flush().map_err(|_| Error::FlushError)?;
+
+        new_swap_file.sync_all().map_err(|_| Error::FlushError)?;
+        new_persistent_file.sync_all().map_err(|_| Error::FlushError)?;
+
+        // Update the file handles
+        self.swap_file.replace(new_swap_file);
+        self.persistent_file.replace(new_persistent_file);
+
+        // Now that both are in sync, we can clear the dirty pages set
+        dirty_pages.clear(); 
+
+        Ok(())
+    }   
 
     /// Reserves memory of the specified length from the free slots.
     /// 
@@ -884,7 +1017,7 @@ impl FilePersistentRandomAccessMemory {
     /// - Result indicating success or failure.
     fn load_page(&self, page_index: usize) -> Result<(), Error> {
         let page_offset = self.get_page_offset_in_file(page_index);
-        let mut file = self.file.borrow_mut();
+        let mut file = self.swap_file.borrow_mut();
         let mut current_cursor_position = self.current_cursor_position.borrow_mut();
 
         // Seek to the start of the page if not already there
@@ -911,8 +1044,11 @@ impl FilePersistentRandomAccessMemory {
     /// Returns:
     /// - Result indicating success or failure.
     fn flush_page(&self, page_index: usize, page: &Vec<u8>) -> Result<(), Error> {
-        let mut file = self.file.borrow_mut();
+        let mut file = self.swap_file.borrow_mut();
         let mut current_cursor_position = self.current_cursor_position.borrow_mut();
+
+        // Mark the page as dirty in the dirty pages set
+        self.dirty_swaped_pages.borrow_mut().insert(page_index);
 
         // Caclulate the offset in the file for the page
         let page_offset = self.get_page_offset_in_file(page_index);
