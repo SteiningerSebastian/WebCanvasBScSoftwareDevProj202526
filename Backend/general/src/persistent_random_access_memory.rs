@@ -397,12 +397,10 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
     /// This function allocates 'len' bytes in persistent memory and returns a Pointer to that location.
     /// The Runtime Complexity is O(n) where n is the number of free slots, as it may need to search through the free slots.
     /// 
-    /// TODO: Future optimizations could include maintaining a more efficient data structure for free slots to reduce allocation time.
-    /// 
     /// Warning: Don't leak the returned Pointer as it will cause memory leaks!
     /// Also the free list is not persisted across restarts. On restart all memory is considered unused. 
     /// This is not an issue for static allocations as they are managed seperately.
-    ///           
+    /// 
     /// Parameters:
     /// - len: The length of space to allocate.
     /// 
