@@ -1344,7 +1344,6 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         trace!("Committing transaction for get-and-add operation on key: {}", key);
         transaction.commit()?;
 
-
         Ok(old_value.to_string())
     }
 
