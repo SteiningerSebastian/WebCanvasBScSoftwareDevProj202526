@@ -13,3 +13,5 @@ reqwest = { version = "0.12.24", default-features = false, features = ["rustls-t
 tokio = "1.48.0"
 regex = "1.12.2"
 lazy-regex = "3.4.2"
+actix-ws = "0.3.0"
+serde_json = "1.0.145"
