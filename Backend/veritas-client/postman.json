@@ -1,0 +1,175 @@
+{
+  "info": {
+    "name": "Veritas Client API Tests",
+    "description": "Integration tests for Veritas distributed key-value store",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "test_key",
+      "value": "postman_test_key",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Set Variable",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "\"test_value_123\""
+        },
+        "url": {
+          "raw": "{{base_url}}/set/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["set", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Variable (Linearizable)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/get/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["get", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Variable (Eventual)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/get_eventual/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["get_eventual", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Peek Variable",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/peek/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["peek", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Append to Variable",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "\"_appended\""
+        },
+        "url": {
+          "raw": "{{base_url}}/append/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["append", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Replace in Variable",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "3;oldnew"
+        },
+        "url": {
+          "raw": "{{base_url}}/replace/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["replace", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Compare and Set (Success)",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "8;expectedupdated"
+        },
+        "url": {
+          "raw": "{{base_url}}/compare_set/{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["compare_set", "{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get and Add Counter",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/get_add/counter_{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["get_add", "counter_{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Set JSON Object",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\":\"John\",\"age\":30,\"city\":\"New York\"}"
+        },
+        "url": {
+          "raw": "{{base_url}}/set/json_{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["set", "json_{{test_key}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Set JSON Array",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "[1,2,3,4,5]"
+        },
+        "url": {
+          "raw": "{{base_url}}/set/array_{{test_key}}",
+          "host": ["{{base_url}}"],
+          "path": ["set", "array_{{test_key}}"]
+        }
+      },
+      "response": []
+    }
+  ]
+}
