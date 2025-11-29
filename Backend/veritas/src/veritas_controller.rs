@@ -2,8 +2,10 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, ResponseE
 use general::{concurrent_file_key_value_store::{self, ConcurrentKeyValueStore}, dns::{self, DNSLookup}};
 use regex::Regex;
 use reqwest::Client;
+// NOTE: For scratch build without OpenSSL set in Cargo.toml:
+// reqwest = { version = "0.12", default-features = false, features = ["rustls-tls","json"] }
 use serde_json::Value;
-use tokio::{task::JoinSet};
+use tokio::{task::JoinSet, sync::{Semaphore}};
 use tracing::{debug, error, info, trace, warn};
 use std::{collections::HashMap, fmt::Display, sync::{Mutex, RwLock, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::Duration};
 use lazy_regex::{Lazy, lazy_regex};
@@ -26,6 +28,7 @@ pub enum Error {
     UnexpectedSettingValueError,
     WebSocketHandshakeError(actix_web::Error),
     JSONParseError(serde_json::Error),
+    SemaphoreAcquireError,
 }
 
 impl ResponseError for Error {
@@ -59,6 +62,7 @@ impl Display for Error {
             Error::UnexpectedSettingValueError => write!(f, "SettingValueError: Error setting value"),
             Error::WebSocketHandshakeError(e) => write!(f, "WebSocketHandshakeError: WebSocket handshake error: {}", e),
             Error::JSONParseError(e) => write!(f, "JSONParseError: JSON parse error: {}", e),
+            Error::SemaphoreAcquireError => write!(f, "SemaphoreAcquireError: Failed to acquire semaphore permit."),
         }
     }
 }
@@ -121,6 +125,7 @@ pub struct AppState<F> where F: ConcurrentKeyValueStore + Clone + Send + Sync + 
     node_tokens: Vec<String>,
     dns_lookup: dns::DNSLookup,
     listeneres: Mutex<HashMap<String, Vec<Listener>>>,
+    sync_followers_semaphore:  Semaphore,
 }
 
 pub struct VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + Sync + 'static {
@@ -155,6 +160,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 node_tokens: node_tokens,
                 dns_lookup: dns::DNSLookup::new(dns_ttl),
                 listeneres: Mutex::new(HashMap::new()),
+                sync_followers_semaphore: Semaphore::new(1), // Block certain operation using async operations
             }),
         }
     }
@@ -172,6 +178,9 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// let updated_time = controller.update_time(42).unwrap();
     /// ```
     fn update_time(new_time: u64, time: &AtomicU64, kv_store: &dyn ConcurrentKeyValueStore) ->  Result<u64, Error> {
+        // We have to do a read-modify-write cycle here - the transaction ensures atomicity
+        // This code segment is single-threaded and synchronously blocks the entire web server thread. 
+        // Keep it to the absolute minimum execution time.
         {
             let mut transaction = kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
 
@@ -550,7 +559,6 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         trace!("Tick handler called with time: {}", time);
 
-
         // Ignore the result - if it fails we assume the time is not critical
         let _ = Self::update_time(time + 1, &data.time, &data.kv_store);
 
@@ -753,7 +761,9 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         let (time_str, _) = value.split_once(";").unwrap_or(("0", ""));
         let new_time = time_str.parse::<u64>().map_err(Error::ParseIntError)?;
 
-        {
+        // This code segment is single-threaded and synchronously blocks the entire web server thread. 
+        // Keep it to the absolute minimum execution time.
+        { 
             let mut transaction = kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
 
             let current_value = transaction.get(key);
@@ -802,9 +812,6 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         // Set the time;value in the local key-value store to be fetched later
         Self::set_if_newer(key, time_value, &data.kv_store)?;
 
-        // Before the transaction ends, notify the listeners of the change
-        Self::call_listeners(key, &value, data.clone());
-
         trace!("Set key: {} to value: {} from leader ID: {}", key, value, sender_id);
 
         Ok(true)
@@ -852,6 +859,46 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             warn!("Failed to set key: {} to value: {} from leader ID: {}", key, value, sender_id);
             return Err(Error::UnexpectedSettingValueError);
         }
+        Ok(())
+    }
+
+    /// Handle the notify request to inform listeners about a key-value change.
+    /// 
+    /// Parameters:
+    /// - req: HttpRequest containing the notify request
+    /// - data: Shared application state
+    /// - bytes: The body of the incoming request
+    /// 
+    /// Returns:
+    /// - Result<String, Error>: The new value associated with the requested key
+    /// 
+    /// WARNING: The state update stream is lossy (notifications may be dropped) but maintains strict temporal integrity. 
+    /// While the set of notifications is non-exhaustive, the sequence is guaranteed to be strictly monotonic, 
+    /// ensuring that the observer never receives a stale or out-of-order historical version of the data.
+    async fn http_handle_notify(req: HttpRequest, data: web::Data<AppState<F>>, bytes: web::Bytes) -> Result<(), Error> {
+        // We only accept set requests from the current leader node
+        // Others must be rejected and sent to the correct leader by the caller
+        let sender: String = req.match_info().get("sender")
+            .unwrap_or("")
+            .to_string();
+
+        let sender_id = sender.parse::<usize>().unwrap_or(usize::MAX);
+        trace!("Notify by leader handler called from sender ID: {}", sender_id);
+        if sender_id != data.leader_id.load(Ordering::SeqCst) {
+            warn!("Received notify value changed from non-leader sender ID: {}. Current leader ID: {}", sender_id, data.leader_id.load(Ordering::SeqCst));
+            return Err(Error::UnauthorizedSetError);
+        }
+
+        let key: String = req.match_info().get("key")
+            .unwrap_or("")
+            .to_string();
+
+        let value = String::from_utf8(bytes.to_vec()).unwrap_or("".to_string());
+
+        trace!("Notify handler called with key: {} and value: {}", key, value);
+
+        Self::call_listeners(&key, &value, data.clone());
+
         Ok(())
     }
 
@@ -904,6 +951,41 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         Ok(true)
     }
 
+    /// Broadcast the variable changed to all follower nodes using best effort.
+    ///
+    /// Parameters:
+    /// - key: The key to set in the key-value store
+    /// - value: The value to set in the key-value store
+    /// - data: Shared application state
+    /// 
+    /// Returns:
+    /// - Result<bool, Error>: True if the operation was successful, otherwise an error
+    /// 
+    /// # Examples
+    /// ```ignore
+    /// let success = controller.broadcast_notify_to_followers("my_key", "my_value", data).await?;
+    /// ```
+    async fn broadcast_notify_to_followers(key: &str, value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
+        trace!("Broadcasting notify for key: {} with value: {} to followers.", key, value);
+
+        let join_set = Self::broadcast_and_collect_responses(
+            data.id, 
+            &format!("/changed/{}/{}", data.id, key), 
+            &data.node_tokens, 
+            &data.dns_lookup, 
+            Duration::from_millis(CLUSTER_TIMEOUT_MS),
+            reqwest::Method::PUT,
+            Some(value.to_string())
+        ).await;
+
+        // No need to wait for the responses - best effort
+        tokio::spawn(async move {
+            let _ = join_set.join_all().await;
+        });
+
+        Ok(true)
+    }
+
     /// Handle the set request when this node is the leader.
     /// 
     /// Parameters:
@@ -921,38 +1003,62 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     pub async fn set_for_leader(key: &str, time_value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
         debug!("Set handler called with key: {} and value: {}", key, time_value);
 
-        let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
-        trace!("Beginning transaction for set operation on key: {}", key);
-        
-        // Prepend the current time to the value for versioning
-        let value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), time_value);
+        let sync_permit_future;
+        let value;
 
-        trace!("Setting key: {} to value: {} in local store.", key, value);
+        // This code segment is single-threaded and synchronously blocks the entire web server thread. 
+        // Keep it to the absolute minimum execution time.
+        {
+            let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
+            trace!("Beginning transaction for set operation on key: {}", key);
+            
+            // Prepend the current time to the value for versioning
+            value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), time_value);
 
-        // Set the value in the local key-value store first do gurantee linearizability when reading from leader.
-        transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+            trace!("Setting key: {} to value: {} in local store.", key, value);
 
-        trace!("Updated key: {} to value: {} in local store.", key, value);
+            // Set the value in the local key-value store first do gurantee linearizability when reading from leader.
+            transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
 
-        // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
-        transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
+            trace!("Updated key: {} to value: {} in local store.", key, value);
 
-        trace!("Updated VERITAS_TIME_KEY to value: {} in local store.", data.time.load(Ordering::SeqCst).to_string());
+            // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
+            transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
 
-        trace!("Committing transaction for set operation on key: {}", key);
+            trace!("Updated VERITAS_TIME_KEY to value: {} in local store.", data.time.load(Ordering::SeqCst).to_string());
+
+            trace!("Committing transaction for set operation on key: {}", key);
+
+            // aquire the semaphore before commit to keep the order of operations lineralizable
+            sync_permit_future = data.sync_followers_semaphore.acquire();
+
+            // Commit the transaction
+            transaction.commit().map_err(Error::TransactionCommitError)?;
+        } // transaction is closed / droped here so it is no longer used. (commit actually consumes the transaction, so this is just for clarity)
+
+        // wait for permit to be granted - this may take a bit
+        let _permit = sync_permit_future.await;
+        // if we fail to aquire the permit, stop here.
+        if let Err(e) = _permit {
+            warn!("Failed to acquire semaphore permit for syncing followers: {}", e);
+            return Err(Error::SemaphoreAcquireError);
+        }
+        let _permit = _permit.unwrap();
+
+        trace!("Broadcast the update to all followers.");
 
         let res = Self::broadcast_set_to_followers(key, &value, data.clone()).await?;
         if  res == false{
             warn!("Failed to broadcast set request for key: {} to followers.", key);
-            return Ok(false); // Only commit the new value if the set was possible 
+            return Ok(false); // Only notify about the new value if the set was possible -> read ensures quorum is reached before returning new value. 
         }
 
         // Before the transaction ends, notify the listeners of the change
         // The websocket does gurantee total order of messages so lineraliziability is preserved
         Self::call_listeners(key, &value, data.clone());
 
-        // Commit the transaction
-        transaction.commit().map_err(Error::TransactionCommitError)?;
+        // Broadcast notify to all flollowers
+        let _ = Self::broadcast_notify_to_followers(key, &time_value, data.clone()).await;
 
         Ok(true)
     }
@@ -998,53 +1104,74 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     async fn append_for_leader(key: &str, value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
         debug!("Append handler called with key: {} and value: {}", key, value);
 
-        let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
-        trace!("Beginning transaction for append operation on key: {}", key);
-        
-        // Get the current value
-        let current_value = transaction.get(key).unwrap_or("".to_string());
+        let sync_permit_future;
+        let commit_value: String;
+        let new_value: String;
+        {
+            // From here on out we are single threaded - the whole webserver waits for this to complete.
+            let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
+            trace!("Beginning transaction for append operation on key: {}", key);
+            
+            // Get the current value
+            let current_value = transaction.get(key).unwrap_or("".to_string());
 
-        // split of the time prefix
-        let current_value = 
-        if let Some((_, v)) = current_value.split_once(";") {
-            v.to_string()
-        } else {
-            current_value
-        };
+            // split of the time prefix
+            let current_value = 
+            if let Some((_, v)) = current_value.split_once(";") {
+                v.to_string()
+            } else {
+                current_value
+            };
 
-        // Append the new value to the current value
-        let new_value = if current_value.is_empty() {
-            value.to_string()
-        } else {
-            format!("{}{}", current_value, value)
-        };
+            // Append the new value to the current value
+            new_value = if current_value.is_empty() {
+                value.to_string()
+            } else {
+                format!("{}{}", current_value, value)
+            };
 
-        trace!("Appending value: {} to key: {} in local store. New value: {}", value, key, new_value);
+            trace!("Appending value: {} to key: {} in local store. New value: {}", value, key, new_value);
 
-        // Add the time prefix
-        let value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
+            // Add the time prefix
+            commit_value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
 
-        // Set the new appended value in the local key-value store first to guarantee linearizability when reading from leader.
-        transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+            // Set the new appended value in the local key-value store first to guarantee linearizability when reading from leader.
+            transaction.set(&key, &commit_value).map_err(Error::FileKeyValueStoreError)?;
 
-        trace!("Updated key: {} to new appended value: {} in local store.", key, value);
+            trace!("Updated key: {} to new appended value: {} in local store.", key, commit_value);
 
-        // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
-        transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
+            // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
+            transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
 
-        trace!("Committing transaction for append operation on key: {}", key);
+            trace!("Aquireing the semaphore to ensure temporal safty for operations.");
+            sync_permit_future = data.sync_followers_semaphore.acquire();
 
-        let res = Self::broadcast_set_to_followers(key, &value, data.clone()).await?;
+            trace!("Committing transaction for append operation on key: {}", key);
+
+            // Commit the transaction
+            transaction.commit().map_err(Error::TransactionCommitError)?;
+        } // transaction is closed / droped here so it is no longer used. (commit actually consumes the transaction, so this is just for clarity)
+
+        // wait for permit to be granted - this may take a bit
+        let _permit = sync_permit_future.await;
+        // if we fail to aquire the permit, stop here.
+        if let Err(e) = _permit {
+            warn!("Failed to acquire semaphore permit for syncing followers: {}", e);
+            return Err(Error::SemaphoreAcquireError);
+        }
+        let _permit = _permit.unwrap();
+
+        let res = Self::broadcast_set_to_followers(key, &commit_value, data.clone()).await?;
         if  res == false{
             warn!("Failed to broadcast set request for key: {} to followers.", key);
-            return Ok(false); // Only commit the new value if the set was possible 
+            return Ok(false); // Only notify about the new value if the set was possible -> read ensures quorum is reached before returning new value.
         }
 
         // Before the transaction ends, notify the listeners of the change
-        Self::call_listeners(key, &value, data.clone());
+        Self::call_listeners(key, &commit_value, data.clone());
 
-        // Commit the transaction
-        transaction.commit().map_err(Error::TransactionCommitError)?;
+        // Broadcast notify to all flollowers
+        let _ = Self::broadcast_notify_to_followers(key, &new_value, data.clone()).await;
 
         Ok(true)
     }
@@ -1092,55 +1219,70 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     async fn replace_for_leader(key: &str, old_value: &str, new_value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
         debug!("Replace handler called with key: {}, old_value: {}, new_value: {}", key, old_value, new_value);
 
-        let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
-        trace!("Beginning transaction for replace operation on key: {}", key);
-        
-        // Get the current value
-        let current_value = transaction.get(key).unwrap_or("".to_string());
+        let sync_permit_future;
+        let value: String;
+        let mut new_value: String = new_value.to_string();
+        {
+            // From here on out we are single threaded - the whole webserver waits for this to complete.
+            let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
+            trace!("Beginning transaction for replace operation on key: {}", key);
+            
+            // Get the current value
+            let current_value = transaction.get(key).unwrap_or("".to_string());
 
-        // split of the time prefix
-        let current_value = 
-        if let Some((_, v)) = current_value.split_once(";") {
-            v.to_string()
-        } else {
-            current_value
-        };
+            // split of the time prefix
+            let current_value = 
+            if let Some((_, v)) = current_value.split_once(";") {
+                v.to_string()
+            } else {
+                current_value
+            };
 
-        // Replace the given old_value with new_value in the current value
-        let new_value = current_value.replace(old_value, new_value);
-        
-        trace!("Replacing value: {} to key: {} in local store. New value: {}", old_value, key, new_value);
+            // Replace the given old_value with new_value in the current value
+            new_value = current_value.replace(old_value, &new_value);
+            
+            trace!("Replacing value: {} to key: {} in local store. New value: {}", old_value, key, new_value);
 
-        // Add the time prefix
-        let value: String = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
+            // Add the time prefix
+            value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
 
-        // Set the new appended value in the local key-value store first to guarantee linearizability when reading from leader.
-        transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+            // Set the new appended value in the local key-value store first to guarantee linearizability when reading from leader.
+            transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
 
-        trace!("Updated key: {} to new replaced value: {} in local store.", key, value);
+            trace!("Updated key: {} to new replaced value: {} in local store.", key, value);
 
-        // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
-        transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
+            // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
+            transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
 
-        trace!("Committing transaction for replace operation on key: {}", key);
+            trace!("Aquireing the semaphore to ensure temporal safty for operations.");
+            sync_permit_future = data.sync_followers_semaphore.acquire();
 
-        let res = Self::broadcast_set_to_followers(key, &value, data.clone()).await?;
-        if  res == false {
-            warn!("Failed to broadcast set request for key: {} to followers.", key);
-            return Ok(false); // Only commit the new value if the set was possible 
+            trace!("Committing transaction for replace operation on key: {}", key);
+            
+            // Commit the transaction
+            transaction.commit().map_err(Error::TransactionCommitError)?;
+        }// transaction is closed / droped here so it is no longer used. (commit actually consumes the transaction, so this is just for clarity)
+
+        // wait for permit to be granted - this may take a bit
+        let _permit = sync_permit_future.await;
+        // if we fail to aquire the permit, stop here.
+        if let Err(e) = _permit {
+            warn!("Failed to acquire semaphore permit for syncing followers: {}", e);
+            return Err(Error::SemaphoreAcquireError);
         }
+        let _permit = _permit.unwrap();
 
         let res = Self::broadcast_set_to_followers(key, &value, data.clone()).await?;
         if  res == false {
             warn!("Failed to broadcast set request for key: {} to followers.", key);
-            return Ok(false); // Only commit the new value if the set was possible 
+            return Ok(false); // Only notify about the new value if the set was possible -> read ensures quorum is reached before returning new value
         }
 
         // Before the transaction ends, notify the listeners of the change
         Self::call_listeners(key, &value, data.clone());
 
-        // Commit the transaction
-        transaction.commit().map_err(Error::TransactionCommitError)?;
+        // Broadcast notify to all flollowers
+        let _ = Self::broadcast_notify_to_followers(key, &new_value, data.clone()).await;
 
         Ok(true)
     }
@@ -1197,40 +1339,60 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         // We have to do a read-modify-write cycle here - the transaction ensures atomicity
 
-        let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
-        trace!("Beginning transaction for compare-and-set operation on key: {}", key);
-        
-        // Get the current value
-        let current_value = transaction.get(key).unwrap_or("".to_string());
+        let sync_permit_future;
+        let value: String;
+        {
+            // From here on out we are single threaded - the whole webserver waits for this to complete.
+            let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
+            trace!("Beginning transaction for compare-and-set operation on key: {}", key);
+            
+            // Get the current value
+            let current_value = transaction.get(key).unwrap_or("".to_string());
 
-        // split of the time prefix
-        let current_value = 
-        if let Some((_, v)) = current_value.split_once(";") {
-            v.to_string()
-        } else {
-            current_value
-        };
+            // split of the time prefix
+            let current_value = 
+            if let Some((_, v)) = current_value.split_once(";") {
+                v.to_string()
+            } else {
+                current_value
+            };
 
-        // Check if the current value matches the expected value
-        if current_value != expected_value {
-            warn!("Current value: {} does not match expected value: {} for key: {}", current_value, expected_value, key);
-            return Ok(false); // Do not update if the current value does not match the expected value
-            // Transaction ends with the life of transaction variable
+            // Check if the current value matches the expected value
+            if current_value != expected_value {
+                warn!("Current value: {} does not match expected value: {} for key: {}", current_value, expected_value, key);
+                return Ok(false); // Do not update if the current value does not match the expected value
+                // Transaction ends with the life of transaction variable
+            }
+
+            // Add the time prefix
+            value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
+
+            // Set the new value in the local key-value store first to guarantee linearizability when reading from leader.
+            transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
+
+            trace!("Updated key: {} to new value: {} in local store.", key, value);
+
+            // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
+            transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
+
+            trace!("Aquireing the semaphore to ensure temporal safty for operations.");
+            sync_permit_future = data.sync_followers_semaphore.acquire();
+
+            trace!("Committing transaction for compare-and-set operation on key: {}", key);
+            
+            // Commit the transaction
+            transaction.commit()?;
+        } // transaction is closed / droped here so it is no longer used. (commit actually consumes the transaction, so this is just for clarity)
+            
+        // wait for permit to be granted - this may take a bit
+        let _permit = sync_permit_future.await;
+        // if we fail to aquire the permit, stop here.
+        if let Err(e) = _permit {
+            warn!("Failed to acquire semaphore permit for syncing followers: {}", e);
+            return Err(Error::SemaphoreAcquireError);
         }
+        let _permit = _permit.unwrap();
 
-        // Add the time prefix
-        let value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
-
-        // Set the new value in the local key-value store first to guarantee linearizability when reading from leader.
-        transaction.set(&key, &value).map_err(Error::FileKeyValueStoreError)?;
-
-        trace!("Updated key: {} to new value: {} in local store.", key, value);
-
-        // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
-        transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
-
-        trace!("Committing transaction for compare-and-set operation on key: {}", key);
-        
         let res = Self::broadcast_set_to_followers(key, &value, data.clone()).await?;
         if  res == false {
             warn!("Failed to broadcast set request for key: {} to followers.", key);
@@ -1240,8 +1402,8 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         // Before the transaction ends, notify the listeners of the change
         Self::call_listeners(key, &value, data.clone());
 
-        // Commit the transaction
-        transaction.commit()?;
+        // Broadcast notify to all flollowers
+        let _ = Self::broadcast_notify_to_followers(key, &new_value, data.clone()).await;
 
         Ok(true)
     }
@@ -1303,35 +1465,57 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         let current_value = Self::get_for_leader(key, data.clone()).await?;
         Self::set_if_newer(key, &current_value, &data.kv_store)?;
 
-        let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
-        trace!("Beginning transaction for get-and-add operation on key: {}", key);
+        let sync_permit_future;
+        let value: String;
+        let old_value: i64;
+        let new_value: i64;
+        {
+            // From here on out we are single threaded - the whole webserver waits for this to complete.
+            let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
+            trace!("Beginning transaction for get-and-add operation on key: {}", key);
 
-        // Get the current value
-        let current_value = transaction.get(key).unwrap_or("0".to_string());
+            // Get the current value
+            let current_value = transaction.get(key).unwrap_or("0".to_string());
 
-        // remove any time prefix if present
-        let current_value = 
-        if let Some((_, v)) = current_value.split_once(";") {
-            v.to_string()
-        } else {
-            current_value
-        };
+            // remove any time prefix if present
+            let current_value = 
+            if let Some((_, v)) = current_value.split_once(";") {
+                v.to_string()
+            } else {
+                current_value
+            };
 
-        let old_value = current_value.parse::<i64>().map_err(Error::ParseIntError)?;
+            old_value = current_value.parse::<i64>().map_err(Error::ParseIntError)?;
 
-        // Increment the value
-        let new_value = old_value + 1;
+            // Increment the value
+            new_value = old_value + 1;
 
-        trace!("Incrementing value: {} to key: {} in local store. New value: {}", old_value, key, new_value);
-        // Add the time prefix
-        let value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
+            trace!("Incrementing value: {} to key: {} in local store. New value: {}", old_value, key, new_value);
+            // Add the time prefix
+            value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), new_value);
 
-        // Set the new value in the local key-value store first to guarantee linearizability when reading from leader.
-        transaction.set(key, &value).map_err(Error::FileKeyValueStoreError)?;
+            // Set the new value in the local key-value store first to guarantee linearizability when reading from leader.
+            transaction.set(key, &value).map_err(Error::FileKeyValueStoreError)?;
 
-        // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
-        transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
-        
+            // Update the stored time in the kv_store as well to persist the time and prevent regression on restart
+            transaction.set(VERITAS_TIME_KEY, &data.time.load(Ordering::SeqCst).to_string()).map_err(Error::FileKeyValueStoreError)?;
+            
+            trace!("Aquireing the semaphore to ensure temporal safty for operations.");
+            sync_permit_future = data.sync_followers_semaphore.acquire();
+
+            trace!("Committing transaction for get-and-add operation on key: {}", key);
+            transaction.commit()?;
+        }
+
+        // wait for permit to be granted - this may take a bit
+        let _permit = sync_permit_future.await;
+        // if we fail to aquire the permit, stop here.
+        if let Err(e) = _permit {
+            warn!("Failed to acquire semaphore permit for syncing followers: {}", e);
+            return Err(Error::SemaphoreAcquireError);
+        }
+        let _permit = _permit.unwrap();
+
         let res = Self::broadcast_set_to_followers(key, &value, data.clone()).await?;
         if  res == false {
             warn!("Failed to broadcast set request for key: {} to followers.", key);
@@ -1341,8 +1525,8 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         // Before the transaction ends, notify the listeners of the change
         Self::call_listeners(key, &value, data.clone());
 
-        trace!("Committing transaction for get-and-add operation on key: {}", key);
-        transaction.commit()?;
+        // Broadcast notify to all flollowers
+        let _ = Self::broadcast_notify_to_followers(key, &new_value.to_string(), data.clone()).await;
 
         Ok(old_value.to_string())
     }
@@ -1531,40 +1715,58 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         let state = *(&data).state.read().map_err(|_|Error::LockPoisonedError)?;
         
         if state == State::Running && data.leader_id.load(Ordering::SeqCst) == data.id {
+            let path = &req.path().to_string();
             // Hey, it's me, the leader
-            trace!("Handling request as leader. {}", req.path());
+            trace!("Handling request as leader. {}", path);
             
+            let rsp;
+
             // Handle the request locally - as we are the leader
-            if GET_REGEX.is_match(req.path()) {
-                trace!("Handling GET request as leader. {}", req.path());
-                return Self::http_handle_get_for_leader(req, data).await;
-            } else if SET_REGEX.is_match(req.path()) {
-                trace!("Handling SET request as leader. {}", req.path());
-                return Self::http_handle_set_for_leader(req, data, bytes).await
+            if GET_REGEX.is_match(path) {
+                trace!("Handling GET request as leader. {}", path);
+                rsp = Self::http_handle_get_for_leader(req, data).await;
+            } else if SET_REGEX.is_match(path) {
+                trace!("Handling SET request as leader. {}", path);
+                rsp = Self::http_handle_set_for_leader(req, data, bytes).await
                     .map(|r| if r { "True" } else { "False" }.to_string());
-            }else if APPEND_REGEX.is_match(req.path()) {
-                trace!("Handling APPEND request as leader. {}", req.path());
+            }else if APPEND_REGEX.is_match(path) {
+                trace!("Handling APPEND request as leader. {}", path);
                 // Set the new appended value
-                return Self::http_handle_append_for_leader(req, data, bytes).await
+                rsp = Self::http_handle_append_for_leader(req, data, bytes).await
                     .map(|r| if r { "True" } else { "False" }.to_string());
-            } else if REPLACE_REGEX.is_match(req.path()) {
-                trace!("Handling REPLACE request as leader. {}", req.path());
+            } else if REPLACE_REGEX.is_match(path) {
+                trace!("Handling REPLACE request as leader. {}", path);
                 // Set the new replaced value
-                return Self::http_handle_replace_for_leader(req, data, bytes).await
+                rsp = Self::http_handle_replace_for_leader(req, data, bytes).await
                     .map(|r| if r { "True" } else { "False" }.to_string());
-            } else if COMPARE_SET_REGEX.is_match(req.path()) {
-                trace!("Handling COMPARE_SET request as leader. {}", req.path());
-                return Self::http_handle_compare_set_for_leader(req, data, bytes).await
+            } else if COMPARE_SET_REGEX.is_match(path) {
+                trace!("Handling COMPARE_SET request as leader. {}", path);
+                rsp = Self::http_handle_compare_set_for_leader(req, data, bytes).await
                     .map(|r| if r { "True" } else { "False" }.to_string());
-            } else if GET_ADD_REGEX.is_match(req.path()) {
-                trace!("Handling GET_ADD request as leader. {}", req.path());
-                return Self::http_handle_get_add_for_leader(req, data).await;
+            } else if GET_ADD_REGEX.is_match(path) {
+                trace!("Handling GET_ADD request as leader. {}", path);
+                rsp = Self::http_handle_get_add_for_leader(req, data).await;
             } else {
-                warn!("Unhandled path: {}", req.path());
-                Ok("UNHANDLED".to_string())
+                warn!("Unhandled path: {}", path);
+                rsp = Ok("UNHANDLED".to_string());
             }
+
+            if let Ok(rsp_str) = &rsp {
+                trace!("Handled request as leader. {} Response: {}", path, rsp_str);
+                Ok(HttpResponse::Ok().content_type(ContentType::plaintext()).body(rsp_str.clone()))
+            } else {
+                let err = rsp.err();
+                warn!("Error handling request as leader. {} Error: {:?}", path, &err);
+                Err(err.unwrap())
+            }   
         } else {
             let leader_id = data.leader_id.load(Ordering::SeqCst);
+
+            // Avoid indexing with usize::MAX (used as "no leader" sentinel) which causes the panic seen in logs.
+            if leader_id >= data.node_tokens.len() {
+                debug!("No leader available (leader_id {}). Cannot forward request: {}", leader_id, req.path());
+                return Err(Error::QuorumNotReachedError);
+            }
 
             debug!("Forwarding request to leader {}.", leader_id);
 
@@ -1601,7 +1803,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
             // Send the request and await the response (response timeout is 3 second - local network)
             let request = request_builder
-                .timeout(Duration::from_secs(3))
+                .timeout(Duration::from_millis(CLUSTER_TIMEOUT_MS))
                 .send()
                 .await
                 .map_err(Error::ForwardRequestError)?;
@@ -1610,7 +1812,12 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             let body = request.text().await.map_err(Error::ForwardRequestError)?;
 
             trace!("Forwarded request to leader returned status: {}", status);
-            Ok(body)
+
+            // Make sure to propagate the correct error / status code
+            if !status.is_success() {
+                return Ok(HttpResponse::InternalServerError().content_type(ContentType::plaintext()).body(body));
+            }
+            Ok(HttpResponse::Ok().content_type(ContentType::plaintext()).body(body))
         }
     }
 
@@ -1778,6 +1985,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 .route("/vote/{sender}", web::get().to(VeritasController::<F>::vote))
                 .route("/election_won/{leader}", web::get().to(VeritasController::<F>::election_won))
                 .route("/force_set/{sender}/{key}", web::put().to(VeritasController::<F>::http_handle_set_by_leader))
+                .route("/changed/{sender}/{key}", web::put().to(VeritasController::<F>::http_handle_notify))
                 .route("/peek/{key}", web::get().to(VeritasController::<F>::http_handle_peek))
                 .route("/get_eventual/{key}", web::get().to(VeritasController::<F>::http_handle_get_eventual))
                 // These requests must be handled by the leader to ensure linearizability

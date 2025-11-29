@@ -9,7 +9,7 @@ general = { path = "../general"}
 tracing = "0.1.41"
 actix-web = "4.11.0"
 tracing-subscriber = "0.3.20"
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls","json"] }
 tokio = "1.48.0"
 regex = "1.12.2"
 lazy-regex = "3.4.2"
