@@ -14,3 +14,7 @@ tempfile = "3"
 [[bench]]
 name = "fpram"
 harness = false
+
+[[bench]]
+name = "wal"
+harness = false
