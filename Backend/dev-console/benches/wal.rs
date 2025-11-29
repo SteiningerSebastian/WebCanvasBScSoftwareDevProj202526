@@ -11,9 +11,9 @@ const LRU_PARDON: usize = 16;
 #[derive(Clone, Copy)]
 struct Small(u64);
 #[derive(Clone, Copy)]
-struct Medium { a: u64, b: u64, c: u64, d: u64 }
+struct Medium { a: u64, _b: u64, _c: u64, _d: u64 }
 #[derive(Clone, Copy)]
-struct Large { buf: [u8; 128] }
+struct Large { _buf: [u8; 128] }
 
 fn align_to_page(len: usize) -> usize { ((len + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE }
 
@@ -59,7 +59,7 @@ fn bench_wal_append(c: &mut Criterion) {
 				},
 				|(dir, mut wal)| {
 					let _keep = dir;
-					for i in 0..cap { let entry = Medium { a: i as u64, b: 2, c: 3, d: 4 }; let _ = wal.append(&entry); }
+					for i in 0..cap { let entry = Medium { a: i as u64, _b: 2, _c: 3, _d: 4 }; let _ = wal.append(&entry); }
 					black_box(&mut wal);
 				},
 				BatchSize::SmallInput,
@@ -76,7 +76,7 @@ fn bench_wal_append(c: &mut Criterion) {
 				},
 				|(dir, mut wal)| {
 					let _keep = dir;
-					let entry = Large { buf: [7u8; 128] }; // reuse same entry
+					let entry = Large { _buf: [7u8; 128] }; // reuse same entry
 					for _ in 0..cap { let _ = wal.append(&entry); }
 					black_box(&mut wal);
 				},
@@ -152,7 +152,7 @@ fn bench_wal_peak(c: &mut Criterion) {
 				let dir = tempfile::tempdir().unwrap();
 				let path = dir.path().join("wal_peak.pram").to_string_lossy().to_string();
 				let mut wal = make_wal::<Medium>(CAP, &path);
-				for i in 0..CAP { let entry = Medium { a: i as u64, b: 1, c: 2, d: 3 }; let _ = wal.append(&entry); }
+				for i in 0..CAP { let entry = Medium { a: i as u64, _b: 1, _c: 2, _d: 3 }; let _ = wal.append(&entry); }
 				(dir, wal)
 			},
 			|(dir, mut wal)| {
