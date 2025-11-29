@@ -40,6 +40,49 @@ pub trait WriteAheadLog<T> where T: Sized {
     fn pop(&mut self) -> Result<T, Error>;
 }
 
+pub struct ConcurrentPRAMWriteAheadLog<T> where T: Sized{
+    wla: std::sync::Arc<std::sync::Mutex<PRAMWriteAheadLog<T>>>,
+}
+
+impl<T> ConcurrentPRAMWriteAheadLog<T> where T: Sized {
+    pub fn new(pram: std::rc::Rc<dyn PersistentRandomAccessMemory>, size: usize) -> Self {
+        ConcurrentPRAMWriteAheadLog { 
+            wla: std::sync::Arc::new(std::sync::Mutex::new(PRAMWriteAheadLog::new(pram, size))),
+        }
+    }
+}
+
+/// Implement WriteAheadLog for ConcurrentPRAMWriteAheadLog by locking the internal mutex.
+impl<T> WriteAheadLog<T> for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
+    fn append(&mut self, entry: &T) -> Result<(), Error> {
+        let mut wla = self.wla.lock().unwrap();
+        wla.append(entry)
+    }
+
+    fn commit(&mut self) -> Result<(), Error> {
+        let mut wla = self.wla.lock().unwrap();
+        wla.commit()
+    }
+
+    fn peak(&mut self) -> Result<T, Error> {
+        let mut wla = self.wla.lock().unwrap();
+        wla.peak()
+    }
+
+    fn pop(&mut self) -> Result<T, Error> {
+        let mut wla = self.wla.lock().unwrap();
+        wla.pop()
+    }
+}
+
+impl Clone for ConcurrentPRAMWriteAheadLog<()> {
+    fn clone(&self) -> Self {
+        ConcurrentPRAMWriteAheadLog {
+            wla: std::sync::Arc::clone(&self.wla),
+        }
+    }
+}
+
 pub struct PRAMWriteAheadLog<T> where T: Sized{
     // Internal state and fields for the PRAMWriteAheadLog
     pram: std::rc::Rc<dyn PersistentRandomAccessMemory>,
