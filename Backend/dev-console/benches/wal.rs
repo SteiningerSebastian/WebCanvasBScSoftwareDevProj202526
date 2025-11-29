@@ -9,7 +9,7 @@ const LRU_HISTORY_LENGTH: usize = 3;
 const LRU_PARDON: usize = 16;
 
 #[derive(Clone, Copy)]
-struct Small(u64);
+struct Small{ _a: u64 }
 #[derive(Clone, Copy)]
 struct Medium { a: u64, _b: u64, _c: u64, _d: u64 }
 #[derive(Clone, Copy)]
@@ -42,7 +42,7 @@ fn bench_wal_append(c: &mut Criterion) {
 				},
 				|(dir, mut wal)| {
 					let _keep = dir;
-					for i in 0..cap { let _ = wal.append(&Small(i as u64)); }
+					for _ in 0..cap { let _ = wal.append(&Small { _a: 0 }); }
 					black_box(&mut wal);
 				},
 				BatchSize::SmallInput,
@@ -103,7 +103,7 @@ fn bench_wal_append_commit(c: &mut Criterion) {
 			},
 			|(dir, mut wal)| {
 				let _keep = dir;
-				for i in 0..CAP { let _ = wal.append(&Small(i as u64)); if (i & 63) == 63 { let _ = wal.commit(); } }
+				for i in 0..CAP { let _ = wal.append(&Small { _a: 0 }); if (i & 63) == 63 { let _ = wal.commit(); } }
 				black_box(&mut wal);
 			},
 			BatchSize::SmallInput,
@@ -124,7 +124,7 @@ fn bench_wal_pop(c: &mut Criterion) {
 					let dir = tempfile::tempdir().unwrap();
 					let path = dir.path().join("wal_pop.pram").to_string_lossy().to_string();
 					let mut wal = make_wal::<Small>(cap, &path);
-					for i in 0..cap { let _ = wal.append(&Small(i as u64)); }
+					for _ in 0..cap { let _ = wal.append(&Small { _a: 0 }); }
 					(dir, wal)
 				},
 				|(dir, mut wal)| {
