@@ -1485,7 +1485,15 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 current_value
             };
 
-            old_value = current_value.parse::<i64>().map_err(Error::ParseIntError)?;
+            let parsed_value = current_value.parse::<i64>();
+            old_value = if let Ok(val) = parsed_value {
+                val
+            } else if current_value.is_empty() {
+                0
+            } else {
+                warn!("Current value for key: {} is not a valid integer: {}", key, current_value);
+                return Err(Error::ParseIntError(parsed_value.err().unwrap()));
+            };
 
             // Increment the value
             new_value = old_value + 1;

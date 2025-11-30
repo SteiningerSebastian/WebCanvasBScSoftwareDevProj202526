@@ -1,0 +1,58 @@
+syntax = "proto3";
+package noredb;
+
+service Database {
+    // Definition of the service goes here
+
+    // Sets a data entry in the database
+    rpc Set(Data) returns (Commit) {}
+    
+    // Forcefully sets a data entry in the database, overriding any existing entry or grave stone
+    rpc ForceSet(Data) returns (Commit) {}
+
+    // Removes a data entry from the database by placing a grave stone
+    // and returns the replaced data if it existed
+    rpc Remove(GraveStone) returns (DataResponse) {}
+    
+    // Retrieves a data entry from the database by key
+    rpc Get(DataRequest) returns (DataResponse) {}
+}
+
+message Data {
+    int32 index = 1;  // The index of the transaction log
+    int32 key = 2;  // The key for the data entry
+    bytes timestamp = 3; // The timestamp of the data entry
+    bytes value = 4; // The value of the data entry
+}
+
+message DataRequest {
+    int32 index = 1; // The index of the transaction
+    int32 key = 2;  // The key for the data entry
+}
+
+message DataResponse {
+    int32 index = 1; // The index of the transaction
+    int32 key = 2;  // The key for the data entry
+    bytes value = 3; // The value of the data entry
+}
+
+message GraveStone {
+    int32 index = 1; // The index of the transaction
+    bytes timestamp = 2; // The timestamp of the data entry
+    int32 key = 3;  // The key for the data entry
+}
+
+message Commit {
+    int32 index = 1; // The index of the transaction
+
+    // 0b0000 = pending,
+    // 0b0001 = success,
+    // 0b0010 = failure, 
+    // 0b0011 = unknown,
+    // 0b0100 = aborted,
+    // 0b0110 = rolled back
+    // 0b1000 = grave digged - no longer responsible for this entry
+    // 0b1110 = grave stoned - not responsible for this entry
+    // 0b1001 = grave stone removed - responsible for this entry again
+    int32 status = 2; 
+}
