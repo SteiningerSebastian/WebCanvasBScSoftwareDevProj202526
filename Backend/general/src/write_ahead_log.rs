@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::persistent_random_access_memory::{self, PersistentRandomAccessMemory, Pointer};
 
 #[derive(Debug)]
@@ -38,18 +40,33 @@ pub trait WriteAheadLog<T> where T: Sized {
     /// Returns:
     /// - `Result<Vec<u8>, Error>`: Ok containing the popped log entry if successful, Err otherwise.
     fn pop(&mut self) -> Result<T, Error>;
+
+    /// Creates an iterator over the write-ahead log entries.
+    /// 
+    /// Parameters:
+    /// - `reverse`: A boolean indicating whether to iterate in reverse order.
+    /// 
+    /// Returns:
+    /// - `WALIterator<'_, T>`: An iterator over the log entries.
+    fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized;
 }
 
 pub struct ConcurrentPRAMWriteAheadLog<T> where T: Sized{
-    wla: std::sync::Arc<std::sync::Mutex<PRAMWriteAheadLog<T>>>,
+    wla: Arc<Mutex<PRAMWriteAheadLog<T>>>,
 }
 
 impl<T> ConcurrentPRAMWriteAheadLog<T> where T: Sized {
     pub fn new(pram: std::rc::Rc<dyn PersistentRandomAccessMemory>, size: usize) -> Self {
         ConcurrentPRAMWriteAheadLog { 
-            wla: std::sync::Arc::new(std::sync::Mutex::new(PRAMWriteAheadLog::new(pram, size))),
+            wla: Arc::new(Mutex::new(PRAMWriteAheadLog::new(pram, size))),
         }
     }
+}
+
+pub struct ConcurrentWALIterator<T> where T: Sized {
+    wal: Arc<Mutex<PRAMWriteAheadLog<T>>>,
+    current_index: u64,
+    reverse: bool,
 }
 
 /// Implement WriteAheadLog for ConcurrentPRAMWriteAheadLog by locking the internal mutex.
@@ -73,9 +90,78 @@ impl<T> WriteAheadLog<T> for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
         let mut wla = self.wla.lock().unwrap();
         wla.pop()
     }
+
+    fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
+        let wla = self.wla.lock().unwrap();
+
+        let mut head: u64 = *wla.head.deref().unwrap();
+        let tail: u64 = *wla.tail.deref().unwrap();
+
+        // Adjust head for iteration (Point to last valid entry)
+        if head == 0 {
+            head = wla.size as u64 -1;
+        }else {
+            head -= 1; // -1 as head points to next free slot
+        }
+
+        Box::new(ConcurrentWALIterator {
+            wal: Arc::clone(&self.wla),
+            current_index: if reverse { head } else { tail },
+            reverse,
+        })
+    }
 }
 
-impl Clone for ConcurrentPRAMWriteAheadLog<()> {
+impl<T> Iterator for ConcurrentWALIterator<T> where T: Sized {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut wal = self.wal.lock().unwrap();
+
+        // Head and tail are on the same page (statically allocated), so unsafe deref is safe here (no page swap can occur and within the same page)
+        let tail = *wal.tail.unsafe_deref::<u64>().unwrap().unwrap();
+        let mut head = *wal.head.deref::<u64>().unwrap(); // As we need to NOT modify the head here, deref as safe. (Modifying head won't affect pram state)
+
+        // Adjust head for iteration
+        if head == 0 {
+            head = wal.size as u64 -1;
+        }else {
+            head -= 1; // -1 as head points to next free slot
+        }
+
+        // Check bounds - Return None if current_index is out of [tail, head] (circularly)
+        if head > tail {
+            if self.current_index < tail || self.current_index > head {
+                return None;
+            }
+        } else if tail > head {
+            if self.current_index < tail && self.current_index > head {
+                return None;
+            }
+        }
+
+        let item: T = *wal.data.deref_at::<T>(self.current_index as usize).ok()?;
+
+        // Direction in which to iterate
+        if self.reverse {
+            // Move backwards
+            self.current_index = if self.current_index == 0 {
+                wal.size as u64 - 1 
+            } else {
+                self.current_index - 1
+            };
+
+            Some(item)
+        } else {
+            // Move forwards
+            self.current_index = (self.current_index + 1) % wal.size as u64;
+
+            Some(item)
+        }  
+    }
+}
+
+impl<T> Clone for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
     fn clone(&self) -> Self {
         ConcurrentPRAMWriteAheadLog {
             wla: std::sync::Arc::clone(&self.wla),
@@ -98,6 +184,12 @@ pub struct PRAMWriteAheadLog<T> where T: Sized{
 static HEAD_OFFSET: u64 = 0;
 static TAIL_OFFSET: u64 = 8;
 static DATA_OFFSET: u64 = 16;
+
+struct WALIterator<'a, T> where T: Sized {
+    wal: &'a mut PRAMWriteAheadLog<T>,
+    reverse: bool,
+    current_index: u64,
+}
 
 impl<T> PRAMWriteAheadLog<T> where T: Sized {
     pub fn new(pram: std::rc::Rc<dyn PersistentRandomAccessMemory>, size: usize) -> Self {
@@ -132,6 +224,9 @@ impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
         // It is known that this is not None as we allocated the head pointer statically in new()
         let head_index = self.head.unsafe_deref_mut::<u64>().map_err(|_| Error::AppendFailed)?.unwrap();
         
+        // Store previous head index before updating
+        let prev_head_index = *head_index;
+
         // Update head index and length
         *head_index = (*head_index + 1) % self.size as u64;
 
@@ -139,7 +234,7 @@ impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
         // So we do this after updating the head index
 
         // Write the entry at the head position
-        self.data.at::<T>(*head_index as usize).write(entry).map_err(|_| Error::AppendFailed)?;
+        self.data.at::<T>(prev_head_index as usize).write(entry).map_err(|_| Error::AppendFailed)?;
 
         // END UNSAFE block
 
@@ -182,6 +277,77 @@ impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
         self.length -= 1;
         
         Ok(*entry)
+    }
+
+    fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
+        let mut head: u64 = *self.head.deref().unwrap();
+        let tail: u64 = *self.tail.deref().unwrap();
+
+        // Adjust head for iteration (Point to last valid entry)
+        if head == 0 {
+            head = self.size as u64 -1;
+        }else {
+            head -= 1; // -1 as head points to next free slot
+        }
+
+        Box::new(WALIterator {
+            wal: self,
+            reverse,
+            current_index: if reverse { head } else { tail }
+        })
+    }
+}
+
+impl<T> Iterator for WALIterator<'_, T> where T: Sized {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Begin UNSAFE block
+
+        // Head and tail are on the same page (statically allocated), so unsafe deref is safe here (no page swap can occur and within the same page)
+        let tail = *self.wal.tail.unsafe_deref::<u64>().unwrap().unwrap();
+        let mut head = *self.wal.head.deref::<u64>().unwrap(); // As we need to NOT modify the head here, deref as safe. (Modifying head won't affect pram state)
+
+        // Adjust head for iteration
+        if head == 0 {
+            head = self.wal.size as u64 -1;
+        }else {
+            head -= 1; // -1 as head points to next free slot
+        }
+
+        // Check bounds - Return None if current_index is out of [tail, head] (circularly)
+        if head > tail {
+            if self.current_index < tail || self.current_index > head {
+                return None;
+            }
+        } else if tail > head {
+            if self.current_index < tail && self.current_index > head {
+                return None;
+            }
+        }
+        // END UNSAFE block
+
+        let item: T = *self.wal.data.deref_at::<T>(self.current_index as usize).ok()?;
+
+        // Direction in which to iterate
+        if self.reverse {
+            // Move backwards (pfram will swap in pages as needed, so reverse reading the data will still sequentially access the disk 
+            // but not as efficiently as seeking to the start of the previous page and reading forward takes one seek per page instead of just reading the next page)
+            // Iterating the WAL and concurrently appending to it will decrease the effective cache size as we need to keep swaping pages in and out more frequently.
+            self.current_index = if self.current_index == 0 {
+                self.wal.size as u64 - 1 
+            } else {
+                self.current_index - 1
+            };
+
+            Some(item)
+        } else {
+            // Move forwards
+            self.current_index = (self.current_index + 1) % self.wal.size as u64;
+
+            Some(item)
+        }    
+
     }
 }
 
@@ -327,5 +493,57 @@ mod tests {
         wal_large.append(&Large { arr: [9u8; 32] }).unwrap();
         assert!(matches!(wal_large.append(&Large { arr: [8u8; 32] }), Err(Error::OutOfMemory)));
     }
-}
 
+    // Helper to construct Concurrent WAL with generic T and given size using Rc for Weak pointer expectations.
+    fn new_concurrent_wal<T: Sized>(size: usize) -> ConcurrentPRAMWriteAheadLog<T> {
+        let data_bytes = size * std::mem::size_of::<T>();
+        let total = (DATA_OFFSET as usize) + data_bytes;
+        let pram = InMemoryPRAM::new(total);
+        ConcurrentPRAMWriteAheadLog::new(pram as Rc<dyn PersistentRandomAccessMemory>, size)
+    }
+
+    #[test]
+    fn test_pram_iterator_forward_and_reverse() {
+        let mut wal = new_wal::<Small>(5);
+        wal.append(&Small(1)).unwrap();
+        wal.append(&Small(2)).unwrap();
+        wal.append(&Small(3)).unwrap();
+        wal.pop().unwrap(); // Pop one to test iterator bounds
+        wal.pop().unwrap();
+        wal.append(&Small(4)).unwrap();
+        wal.append(&Small(5)).unwrap();
+
+        // Use the internal length to know how many items to take (avoids infinite iteration issues)
+        let len = wal.length;
+
+        let items_forward: Vec<Small> = wal.iter(false).take(len).collect();
+        assert_eq!(items_forward, vec![Small(3), Small(4), Small(5)]);
+
+        // Reverse iteration should yield reversed order
+        let items_reverse: Vec<Small> = wal.iter(true).take(len).collect();
+        assert_eq!(items_reverse, vec![Small(5), Small(4), Small(3)]);
+    }
+
+    #[test]
+    fn test_concurrent_wal_iterator_forward_and_reverse() {
+        let mut cwal = new_concurrent_wal::<Small>(6);
+        cwal.append(&Small(1)).unwrap();
+        cwal.append(&Small(2)).unwrap();
+        cwal.append(&Small(3)).unwrap();
+        cwal.pop().unwrap(); // Pop one to test iterator bounds
+        cwal.pop().unwrap();
+        cwal.append(&Small(4)).unwrap();
+        cwal.append(&Small(5)).unwrap();
+
+        // read length under lock
+        let len = cwal.wla.lock().unwrap().length;
+
+        // Forward iteration via concurrent WAL
+        let items_forward: Vec<Small> = cwal.iter(false).take(len).collect();
+        assert_eq!(items_forward, vec![Small(3), Small(4), Small(5)]);
+
+        // Reverse iteration via concurrent WAL
+        let items_reverse: Vec<Small> = cwal.iter(true).take(len).collect();
+        assert_eq!(items_reverse, vec![Small(5), Small(4), Small(3)]);
+    }
+}
