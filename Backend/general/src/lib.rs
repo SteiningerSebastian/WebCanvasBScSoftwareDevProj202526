@@ -4,6 +4,7 @@ pub mod dns;
 pub mod thread_pool;
 pub mod persistent_random_access_memory;
 pub mod write_ahead_log;
+pub mod pram_btree_index;
 
 mod page_cache;
 

@@ -12,6 +12,7 @@ tonic = "*"
 prost = "0.14"
 tonic-prost = "*"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+local-ip-address = "0.6.5"
 
 [build-dependencies]
 tonic-prost-build = "*"

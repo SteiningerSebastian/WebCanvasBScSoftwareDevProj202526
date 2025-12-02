@@ -64,6 +64,21 @@ impl Pointer {
         Self { pointer, memory }
     }
 
+    /// Creates a Pointer from a given address and memory manager.
+    /// 
+    /// Parameters:
+    /// - pointer: The memory address as a u64.
+    /// - memory: A reference-counted pointer to a PersistentRandomAccessMemory instance.
+    /// 
+    /// Returns:
+    /// - A new Pointer instance.
+    /// 
+    /// Warning: The memory manager must outlive the Pointer instance to avoid dangling references.
+    /// Also this will not allocate new memory (mark space as used) to allocate new use salloc on the memory.
+    pub fn from_address(pointer: u64, memory: Rc<dyn PersistentRandomAccessMemory>) -> Self {
+        Self { pointer, memory: Rc::downgrade(&memory) }
+    }
+
     /// Dereferences the pointer to get a reference to the value of type T.
     /// This only works if T is stored within the same page, it will return None otherwise.
     ///

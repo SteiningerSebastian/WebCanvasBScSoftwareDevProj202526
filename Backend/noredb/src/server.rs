@@ -1,3 +1,5 @@
+use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
+use general::write_ahead_log::ConcurrentPRAMWriteAheadLog;
 use noredb::database_server::{Database};
 use noredb::{Data, DataRequest, DataResponse, GraveStone, Commit};
 
@@ -5,8 +7,18 @@ pub mod noredb {
     tonic::include_proto!("noredb");
 }
 
-#[derive(Debug, Default)]
-pub struct MyDatabase {}
+pub struct MyDatabase {
+    config : ConcurrentFileKeyValueStore,
+    // write_ahead_log: ConcurrentPRAMWriteAheadLog<>
+}
+
+impl MyDatabase {
+    pub fn new(config: ConcurrentFileKeyValueStore) -> Self {
+        MyDatabase {
+            config,
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Database for MyDatabase {
