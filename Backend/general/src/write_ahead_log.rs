@@ -195,11 +195,11 @@ impl<T> PRAMWriteAheadLog<T> where T: Sized {
     pub fn new(pram: std::rc::Rc<dyn PersistentRandomAccessMemory>, size: usize) -> Self {
         // Allocate space for head and tail pointers
         // Assuming head and tail are stored at the beginning of the allocated space
-        let head = pram.salloc(HEAD_OFFSET, std::mem::size_of::<u64>()).unwrap();
-        let tail = pram.salloc(TAIL_OFFSET, std::mem::size_of::<u64>()).unwrap();
+        let head = pram.smalloc(HEAD_OFFSET, std::mem::size_of::<u64>()).unwrap();
+        let tail = pram.smalloc(TAIL_OFFSET, std::mem::size_of::<u64>()).unwrap();
         
         // Allocate the data array, an array of T with the given size
-        let data = pram.salloc(DATA_OFFSET, size * std::mem::size_of::<T>()).unwrap();
+        let data = pram.smalloc(DATA_OFFSET, size * std::mem::size_of::<T>()).unwrap();
         PRAMWriteAheadLog { 
             pram,
             size,
@@ -374,7 +374,7 @@ mod tests {
 
     impl PersistentRandomAccessMemory for InMemoryPRAM {
         fn malloc(&self, _len: usize) -> Result<Pointer, persistent_random_access_memory::Error> { Err(persistent_random_access_memory::Error::OutOfMemoryError) }
-        fn salloc(&self, pointer: u64, len: usize) -> Result<Pointer, persistent_random_access_memory::Error> {
+        fn smalloc(&self, pointer: u64, len: usize) -> Result<Pointer, persistent_random_access_memory::Error> {
             self.ensure(pointer as usize + len);
             Ok(Pointer::new(pointer, self.me.clone() as Weak<dyn PersistentRandomAccessMemory>))
         }

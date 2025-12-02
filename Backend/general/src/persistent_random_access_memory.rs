@@ -282,7 +282,7 @@ pub trait PersistentRandomAccessMemory {
     /// 
     /// Returns:
     /// - Result containing Pointer on success or Error on failure.
-    fn salloc(&self, pointer: u64, len: usize) -> Result<Pointer, Error>;
+    fn smalloc(&self, pointer: u64, len: usize) -> Result<Pointer, Error>;
 
     /// Frees the space allocated for the value in persistent memory
     /// pointed to by the given Pointer.
@@ -392,7 +392,7 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
     /// 
     /// Returns:
     /// - Result containing Pointer on success or Error on failure.
-    fn salloc(&self, pointer: u64, len: usize) -> Result<Pointer, Error> {
+    fn smalloc(&self, pointer: u64, len: usize) -> Result<Pointer, Error> {
         {
             let malloc_called = self.malloc_called.borrow();
             if *malloc_called {

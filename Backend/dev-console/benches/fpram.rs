@@ -84,7 +84,7 @@ fn bench_salloc(c: &mut Criterion) {
                 let _keep_dir = dir;
                 for i in 0..OPS_PER_SAMPLE {
                     let pointer = (i * SALLOC_SIZE) as u64;
-                    let _ = fpram.salloc(pointer, SALLOC_SIZE).expect("salloc");
+                    let _ = fpram.smalloc(pointer, SALLOC_SIZE).expect("salloc");
                     // p.write(&0u64).expect("write"); // optional write to touch page
                 }
                 black_box(());

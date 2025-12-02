@@ -98,7 +98,7 @@ pub struct BTreeIndexPRAM {
 impl BTreeIndexPRAM {
     pub fn new(pram: Rc<dyn PersistentRandomAccessMemory>) -> Self {
         // Allocate root node in PRAM
-        let mut root = pram.salloc(ROOT_NODE_ADDRESS, std::mem::size_of::<BTreeNode>()).unwrap();
+        let mut root = pram.smalloc(ROOT_NODE_ADDRESS, std::mem::size_of::<BTreeNode>()).unwrap();
 
         let node = root.deref::<BTreeNode>().unwrap();
 
@@ -742,7 +742,7 @@ impl BTreeIndex for BTreeIndexPRAM {
 mod tests {
     use super::*;
     use crate::persistent_random_access_memory::FilePersistentRandomAccessMemory;
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Instant};
 
     fn temp_path(name: &str) -> String {
         let mut p = PathBuf::from(std::env::temp_dir());
@@ -850,20 +850,26 @@ mod tests {
         // Deterministic pseudo-random without external crates
         let mut seed: u64 = 0xDEADBEEFCAFEBABE;
         let mut keys = Vec::new();
-        for _ in 0..16_384 {
+
+        // Stopwatch
+        let start = Instant::now();
+        for _ in 0..131_072 {
             // xorshift64*
             seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-            let k = (seed % 4096) as u64;
+            let k = (seed % 16_384) as u64;
             let v = seed ^ 0xA5A5A5A5A5A5A5A5;
             idx.set(k, &v).unwrap();
             keys.push((k, v));
         }
+        println!("Inserted 131072 entries in {:?}", start.elapsed());
 
+        let start = Instant::now();
         // Verify latest values for each key
         use std::collections::HashMap;
         let mut last: HashMap<u64, u64> = HashMap::new();
         for (k, v) in keys { last.insert(k, v); }
         for (k, v) in last { assert_eq!(idx.get(k).unwrap(), v); }
+        println!("Verified 131072 entries in {:?}", start.elapsed());
     }
 }
 

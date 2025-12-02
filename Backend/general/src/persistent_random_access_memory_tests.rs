@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn test_salloc_basic() {
         let memory = create_test_memory();
-        let result = memory.salloc(0, 128);
+        let result = memory.smalloc(0, 128);
         assert!(result.is_ok());
         cleanup_test_files();
     }
@@ -63,7 +63,7 @@ mod tests {
     fn test_salloc_after_malloc_panics() {
         let memory = create_test_memory();
         let _ = memory.malloc(64);
-        let _ = memory.salloc(0, 128);
+        let _ = memory.smalloc(0, 128);
         cleanup_test_files();
     }
 
@@ -180,7 +180,7 @@ mod tests {
         
         // Allocate near page boundary
         let page_size = PAGE_SIZE;
-        let ptr = memory.salloc((page_size - 4) as u64, 8).unwrap();
+        let ptr = memory.smalloc((page_size - 4) as u64, 8).unwrap();
         
         let mut ptr_mut = ptr;
         let value: u64 = 0xFEDCBA9876543210;
@@ -226,7 +226,7 @@ mod tests {
         
         // Allocate near page boundary so u64 spans pages
         let page_size = PAGE_SIZE;
-        let mut ptr = memory.salloc((page_size - 4) as u64, 8).unwrap();
+        let mut ptr = memory.smalloc((page_size - 4) as u64, 8).unwrap();
         
         let value: u64 = 0xDEADBEEF;
         ptr.write(&value).unwrap();
@@ -276,16 +276,16 @@ mod tests {
         let memory = create_test_memory();
         
         // Create fragmented free space
-        let ptr1 = memory.salloc(0,100).unwrap();
-        let ptr2 = memory.salloc(100, 100).unwrap();
-        let ptr3 = memory.salloc(200, 100).unwrap();
+        let ptr1 = memory.smalloc(0,100).unwrap();
+        let ptr2 = memory.smalloc(100, 100).unwrap();
+        let ptr3 = memory.smalloc(200, 100).unwrap();
         
         memory.free(ptr1, 100).unwrap();
         memory.free(ptr3, 100).unwrap();
         memory.free(ptr2, 100).unwrap();
         
         // Static allocation spanning freed regions
-        let result = memory.salloc(0, 300);
+        let result = memory.smalloc(0, 300);
         assert!(result.is_ok());
         
         cleanup_test_files();
@@ -296,10 +296,10 @@ mod tests {
     fn test_reserve_exact_panics_on_overlap() {
         let memory = create_test_memory();
         
-        let _ptr1 = memory.salloc(0,100).unwrap();
+        let _ptr1 = memory.smalloc(0,100).unwrap();
         
         // Try to allocate overlapping memory
-        let _ = memory.salloc(50, 100);
+        let _ = memory.smalloc(50, 100);
         
         cleanup_test_files();
     }
@@ -337,12 +337,12 @@ mod tests {
         let memory = create_test_memory();
         
         // Write to page 0
-        let mut ptr1 = memory.salloc(0, 8).unwrap();
+        let mut ptr1 = memory.smalloc(0, 8).unwrap();
         let val1: u64 = 0xAAAA;
         ptr1.write(&val1).unwrap();
         
         // Write to page 2 (forces page swap)
-        let mut ptr2 = memory.salloc(8192, 8).unwrap();
+        let mut ptr2 = memory.smalloc(8192, 8).unwrap();
         let val2: u64 = 0xBBBB;
         ptr2.write(&val2).unwrap();
         
@@ -358,9 +358,9 @@ mod tests {
         let memory = create_test_memory();
         
         // Write to multiple pages
-        let mut ptr1 = memory.salloc(0, 8).unwrap();
-        let mut ptr2 = memory.salloc(4096, 8).unwrap();
-        let mut ptr3 = memory.salloc(8192, 8).unwrap();
+        let mut ptr1 = memory.smalloc(0, 8).unwrap();
+        let mut ptr2 = memory.smalloc(4096, 8).unwrap();
+        let mut ptr3 = memory.smalloc(8192, 8).unwrap();
         
         ptr1.write(&1u64).unwrap();
         ptr2.write(&2u64).unwrap();
@@ -452,10 +452,10 @@ mod tests {
         let memory = create_test_memory();
 
         let page_size = PAGE_SIZE as u64;
-        let mut p0 = memory.salloc(0, 8).unwrap();
-        let mut p1 = memory.salloc(page_size, 8).unwrap();
-        let mut p2 = memory.salloc(page_size * 2, 8).unwrap();
-        let mut p3 = memory.salloc(page_size * 3, 8).unwrap();
+        let mut p0 = memory.smalloc(0, 8).unwrap();
+        let mut p1 = memory.smalloc(page_size, 8).unwrap();
+        let mut p2 = memory.smalloc(page_size * 2, 8).unwrap();
+        let mut p3 = memory.smalloc(page_size * 3, 8).unwrap();
 
         let mut vals = [
             0x1111_1111_1111_1111u64,
@@ -502,7 +502,7 @@ mod tests {
         
         // Write to all pages
         for page in 0..4 {
-            let mut ptr = memory.salloc(page * page_size, 8).unwrap();
+            let mut ptr = memory.smalloc(page * page_size, 8).unwrap();
             let value = (page + 1) as u64 * 0x1111_1111_1111_1111u64;
             ptr.write(&value).unwrap();
             memory.free(ptr, 8).unwrap(); // Free after writing so someone else can allocate.
@@ -511,7 +511,7 @@ mod tests {
         // Read all pages in sequence multiple times
         for _ in 0..10 {
             for page in 0..4 {
-                let ptr = memory.salloc(page * page_size, 8).unwrap();
+                let ptr = memory.smalloc(page * page_size, 8).unwrap();
                 let expected = (page + 1) as u64 * 0x1111_1111_1111_1111u64;
                 assert_eq!(*ptr.deref::<u64>().unwrap(), expected);
                 memory.free(ptr, 8).unwrap(); // Free after reading so someone else can allocate.
@@ -527,7 +527,7 @@ mod tests {
         let page_size =  PAGE_SIZE as u64;
         
         // Test write at exact page boundary
-        let mut ptr = memory.salloc(page_size, 16).unwrap();
+        let mut ptr = memory.smalloc(page_size, 16).unwrap();
         let data = [0x12u8, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
                     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         ptr.write_exact(&data).unwrap();
@@ -577,7 +577,7 @@ mod tests {
         // Write to more pages than cache can hold (cache holds 2 pages)
         let mut ptrs = Vec::new();
         for page in 0..4 {
-            let mut ptr = memory.salloc(page * page_size, 8).unwrap();
+            let mut ptr = memory.smalloc(page * page_size, 8).unwrap();
             let value = 0xAAAA_0000_0000_0000u64 | page;
             ptr.write(&value).unwrap();
             ptrs.push((ptr, value));
@@ -597,8 +597,8 @@ mod tests {
         let memory = create_test_memory();
         let page_size =  PAGE_SIZE as u64;
         
-        let mut p0 = memory.salloc(0, 8).unwrap();
-        let mut p1 = memory.salloc(page_size * 3, 8).unwrap();
+        let mut p0 = memory.smalloc(0, 8).unwrap();
+        let mut p1 = memory.smalloc(page_size * 3, 8).unwrap();
         
         p0.write(&0xAAAAu64).unwrap();
         p1.write(&0xBBBBu64).unwrap();
@@ -725,10 +725,10 @@ mod tests {
         let page_size =  PAGE_SIZE as u64;
 
         // Place four u64s on distinct pages
-        let mut p0 = memory.salloc(0, 8).unwrap();
-        let mut p1 = memory.salloc(page_size-1, 8).unwrap();
-        let mut p2 = memory.salloc(page_size * 2 -2, 8).unwrap();
-        let mut p3 = memory.salloc(page_size * 3 -3, 8).unwrap();
+        let mut p0 = memory.smalloc(0, 8).unwrap();
+        let mut p1 = memory.smalloc(page_size-1, 8).unwrap();
+        let mut p2 = memory.smalloc(page_size * 2 -2, 8).unwrap();
+        let mut p3 = memory.smalloc(page_size * 3 -3, 8).unwrap();
 
         let vals_a = [
             0xAAAA_AAAA_AAAA_AAAAu64,
@@ -770,10 +770,10 @@ mod tests {
 
         // Reopen and verify second set of values survived
         let memory2 = FilePersistentRandomAccessMemory::new(TEST_SIZE, TEST_PATH, PAGE_SIZE, 16, 2, 1);
-        let p0r = memory2.salloc(0, 8).unwrap();
-        let p1r = memory2.salloc(page_size -1, 8).unwrap();
-        let p2r = memory2.salloc(page_size * 2 -2, 8).unwrap();
-        let p3r = memory2.salloc(page_size * 3 -3, 8).unwrap();
+        let p0r = memory2.smalloc(0, 8).unwrap();
+        let p1r = memory2.smalloc(page_size -1, 8).unwrap();
+        let p2r = memory2.smalloc(page_size * 2 -2, 8).unwrap();
+        let p3r = memory2.smalloc(page_size * 3 -3, 8).unwrap();
 
         assert_eq!(*p0r.deref::<u64>().unwrap(), vals_b[0]);
         assert_eq!(*p1r.deref::<u64>().unwrap(), vals_b[1]);
@@ -788,7 +788,7 @@ mod tests {
         let memory = create_test_memory();
 
         // Reserve the whole space so we can freely read/write by absolute offsets
-        let _guard = memory.salloc(0, TEST_SIZE).unwrap();
+        let _guard = memory.smalloc(0, TEST_SIZE).unwrap();
 
         // Use a set of u64 positions spread across the address space
         let count = (TEST_SIZE / 8).min(1024); // cap work

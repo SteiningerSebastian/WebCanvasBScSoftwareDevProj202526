@@ -13,7 +13,7 @@ fn main() {
 
     // --- Static allocation (salloc) example ---
     // Reserve an absolute offset (100) and write a value there
-    let mut sp = fpram.salloc(100, size_of::<u64>()).expect("salloc u64");
+    let mut sp = fpram.smalloc(100, size_of::<u64>()).expect("salloc u64");
     sp.write(&0x1234u64).expect("write salloc");
     let sread: Box<u64> = sp.deref().expect("deref salloc");
     println!("salloc@100 -> read {}", *sread);
