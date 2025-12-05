@@ -370,7 +370,10 @@ pub struct FilePersistentRandomAccessMemory {
     current_cursor_position: RefCell<u64>,
     current_page_index: RefCell<Option<usize>>,
 
-    free_slots: RefCell<Vec<(u64, usize)>>,
+    // TODO Warning this is not persisted across restarts! (dynamic allocation not fully supported!!!) 
+    // Also very naive free slot management and no deframentation, all allocations are pinned, performance is bad and only keept in memory, SIZE!!!
+    free_slots: RefCell<Vec<(u64, usize)>>, 
+    
     malloc_called: RefCell<bool>,
     me: Weak<FilePersistentRandomAccessMemory>,
 
@@ -1035,12 +1038,12 @@ impl FilePersistentRandomAccessMemory {
 
         // Seek to the start of the page if not already there
         if page_offset != *current_cursor_position {
-            file.seek(std::io::SeekFrom::Start(page_offset)).map_err(|_| Error::ReadError)?;
+            file.seek(std::io::SeekFrom::Start(page_offset)).map_err(Error::FileReadError)?;
             *current_cursor_position = page_offset;
         }
 
         // Read the page into the cached page buffer
-        file.read_exact(&mut self.cached_page.borrow_mut()).map_err(|_| Error::ReadError)?;
+        file.read_exact(&mut self.cached_page.borrow_mut()).map_err(Error::FileReadError)?;
         // Update the cursor position (Sequential read will be faster as we don't need to seek again)
         *current_cursor_position += self.page_size as u64;
         

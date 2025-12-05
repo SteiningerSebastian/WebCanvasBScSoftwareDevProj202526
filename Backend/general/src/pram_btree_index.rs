@@ -61,8 +61,8 @@ pub trait BTreeIndex {
     fn persist(&self) -> Result<(), Error>;
 }
 
-// The order of the B-tree (maximum number of children per node)
-const BTREE_ORDER: usize = 1000; // Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
+// The order of the B-tree (maximum number of children per node) Should be odd for simplicity.
+const BTREE_ORDER: usize = 5; // Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
 const ROOT_NODE_ADDRESS: u64 = 0; // Address of the root node in PRAM
 
 #[repr(C)] // Keep the order of values in memory
@@ -76,6 +76,21 @@ struct BTreeNode {
 
     // 3. Smallest alignment: bool (1 byte)
     is_leaf: bool, 
+}
+
+// A struct containing an additional chlidren thats loaded in memory from the pram for debugging etc.
+struct BTreeMemCopyNode {
+    // 1. Largest alignment: u64 (8 bytes)
+    keys: [u64; BTREE_ORDER - 1], 
+    values: [u64; BTREE_ORDER], 
+    
+    // 2. Next largest alignment: usize (8 bytes on 64-bit)
+    length: usize, 
+
+    // 3. Smallest alignment: bool (1 byte)
+    is_leaf: bool,
+
+    _children: Vec<BTreeMemCopyNode>,
 }
 
 impl Clone for BTreeNode {
@@ -147,13 +162,8 @@ impl BTreeIndexPRAM {
             Ok((*node_ptr).clone()) // return the leaf node pointer
         }else {
             // find the child pointer to follow
-            let correct_index = node.keys.as_slice()[0..node.length].iter().position(|e| *e >= key);
-                        
-            let index = if correct_index.is_none() {
-                node.length
-            } else {
-                correct_index.unwrap()
-            };
+            // Last element is used to point to any elements greater than the last key.
+            let index = node.keys.as_slice()[0..node.length-1].iter().position(|e| *e >= key).unwrap_or(BTREE_ORDER-1);        
 
             let mut child_ptr = Pointer::from_address(node.values[index],self.pram.clone());
             self.find_leaf_node(key, &mut child_ptr)
@@ -172,30 +182,31 @@ impl BTreeIndexPRAM {
     /// - `Ok(None)` if no split was needed.
     fn insert_or_update_recursive(&mut self, key: u64, value: &u64, node_ptr: &mut Pointer) -> Result<Option<(u64, Pointer)>, Error> {
         let mut node = node_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+        
         if node.is_leaf {
+            // Search for the correct position to insert the new key
+            let index = node.keys.as_slice()[0..node.length].iter().position(|e| *e >= key);
+
+            // If key already exists, update the value
+            if let Some(index) = index {
+                if node.keys[index] == key { // key exist and mode is not insert!
+                    node.values[index] = *value;
+
+                    // Write back the updated node
+                    node_ptr.write(&(*node)).map_err(Error::UnspecifiedMemoryError)?;
+
+                    return Ok(None); // No split needed
+                }
+            }
+
+            // This may be none for the root is leaf node as before any splits we expect a compltly blank array, in this case insert in order.
+            let index = index.unwrap_or(node.length);
+
             // Check if there is space in the node
             if node.length < BTREE_ORDER - 1 {
-                // Search for the correct position to insert the new key
-                let insert_index = node.keys.as_slice()[0..node.length].iter().position(|e| *e >= key);
-                
-                // If key already exists, update the value
-                if let Some(idx) = insert_index {
-                    if node.keys[idx] == key {
-                        node.values[idx] = *value;
-
-                        // Write back the updated node
-                        node_ptr.write(&(*node)).map_err(Error::UnspecifiedMemoryError)?;
-
-                        return Ok(None); // No split needed
-                    }
-                }
-
                 // Shift keys and values to make space for the new key-value pair
-                let index = insert_index.unwrap_or(node.length);
-                for i in (index..=node.length).rev() {
-                    if i < node.length {
-                        node.keys[i + 1] = node.keys[i];
-                    }
+                for i in (index..node.length).rev() {
+                    node.keys[i + 1] = node.keys[i];
                     node.values[i + 1] = node.values[i];
                 }
 
@@ -227,8 +238,9 @@ impl BTreeIndexPRAM {
                     new_node.values[i] = node.values[i];
                 }
                 new_node.length = median_index + 1; // new_node gets the first half including median
+                new_node.values[BTREE_ORDER - 1] = node_ptr.pointer; // Point to the next - in order - leaf, the original node (faster to traverse leaves)
 
-                // Shift keys and values in the original node to left.
+                // Shift keys and values in the original node to the left. No need to shift the pointer pointing to the next leaf as this pointer is always at the last index.
                 for i in median_index+1..node.length {
                     node.keys[i-median_index-1] = node.keys[i];
                     node.values[i-median_index-1] = node.values[i];
@@ -238,28 +250,19 @@ impl BTreeIndexPRAM {
                 // Now actually add the value to the correct node
                 if key > median_key {
                     // Insert into the original node
-                    let insert_index = node.keys[0..node.length].iter().position(|e| *e >= key);
-                    let index = insert_index.unwrap_or(node.length);
+                    let insert_index = index - median_index - 1; 
 
-                    for i in (index..=node.length).rev() {
-                        if i < node.length {
-                            node.keys[i + 1] = node.keys[i];
-                        }
+                    for i in (insert_index..node.length).rev() {
+                        node.keys[i + 1] = node.keys[i]; // Don't need to shif the pointer that points to the next leaf as it is always at the rightmost position by definition.
                         node.values[i + 1] = node.values[i];
                     }
 
-                    node.keys[index] = key;
-                    node.values[index] = *value;
+                    node.keys[insert_index] = key;
+                    node.values[insert_index] = *value;
                     node.length += 1;
                 } else {
-                    // Insert into the new node
-                    let insert_index = new_node.keys.as_slice()[0..new_node.length].iter().position(|e| *e >= key);
-                    let index = insert_index.unwrap_or(new_node.length);
-
-                    for i in (index..=new_node.length).rev() {
-                        if i < new_node.length {
-                            new_node.keys[i + 1] = new_node.keys[i];
-                        }
+                    for i in (index..new_node.length).rev() {
+                        new_node.keys[i + 1] = new_node.keys[i]; // Don't need to shif the pointer that points to the next leaf as it is always at the rightmost position by definition.
                         new_node.values[i + 1] = new_node.values[i];
                     }
 
@@ -278,25 +281,42 @@ impl BTreeIndexPRAM {
             }
         } else {
             // find the child pointer to follow
-            let correct_index = node.keys.as_slice()[0..node.length].iter().position(|e| *e >= key);
-            let index = if correct_index.is_none() {
-                node.length
-            } else {
-                correct_index.unwrap()
-            };
+            // Last element is used to point to any elements greater than the last key.
+            let mut index = node.keys.as_slice()[0..node.length-1].iter().position(|e| *e >= key).unwrap_or(BTREE_ORDER-1); 
 
             let mut child_ptr = Pointer::from_address(node.values[index],self.pram.clone());
 
             let split_result = self.insert_or_update_recursive(key, value, &mut child_ptr)?;
+
+            // If we needed to search the rightmost elements of the tree, wee need to actually - for insert - handle it like it would have been just the next element.
+            if index == BTREE_ORDER -1 {
+                index = node.length - 1;
+            }
             
-            if let Some((marker, new_child_ptr)) = split_result {
+            // The marker must be inserted at the index position. The recursive call returns the left half of the split leaf so, the new left leaf. So we have to move index... to right
+            // and insert the new element with the marker at the index position.
+            if let Some((marker, new_child_ptr)) = split_result {               
+                // update the pointer to the next node of the node previous -> pointing past the inserted
+                if index > 0{
+                    let mut left_sibling_ptr = Pointer::from_address(node.values[index - 1], self.pram.clone());
+                    let mut left_sibling = left_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+
+                    if left_sibling.is_leaf {
+                        // Update the pointer to the next node
+                        left_sibling.values[BTREE_ORDER - 1] = new_child_ptr.pointer;
+
+                        // Write back the updated left sibling
+                        left_sibling_ptr.write(left_sibling.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
+                    }
+                }
+
                 // Need to insert median_key and new_child_ptr into this node
-                if node.length < BTREE_ORDER - 1 {
+                if node.length < BTREE_ORDER { // Here we may actually use the last value as we are an internal node and can have BTREE_ORDER children
                     // Shift keys and values to make space for the new key-value pair
-                    for i in (index..=node.length).rev() {
-                        if i < node.length {
-                            node.keys[i + 1] = node.keys[i];
-                        }
+                    for i in (index..node.length-1).rev() {
+                        // Here as it is not a leaf the last pointer actually points to all elements bigger thatn the current. But we don't need to shift it as it is, by definion,
+                        // the last element in the array.
+                        node.keys[i + 1] = node.keys[i];
                         node.values[i + 1] = node.values[i];
                     }
 
@@ -322,50 +342,48 @@ impl BTreeIndexPRAM {
                     };
 
                     // Move first half of keys and values to new node
-                    for i in 0..=median_index {
+                    for i in 0..median_index {
                         new_node.keys[i] = node.keys[i];
                         new_node.values[i] = node.values[i];
                     }
+
+                    // As the median index is included, it becomes the next implicit key
+                    new_node.values[BTREE_ORDER - 1] = node.values[median_index]; // Move the child pointer associated with the median key to the new node
+
                     new_node.length = median_index + 1; // new_node gets the first half including median
 
                     // Shift keys and values in the original node to left.
-                    for i in median_index+1..=node.length {
-                        if i < node.length {
-                            node.keys[i-median_index-1] = node.keys[i];
-                        }
-                        node.values[i-median_index-1] = node.values[i];
+                    for i in median_index+1..node.length-1 {
+                        node.keys[i-median_index-1] = node.keys[i]; 
+                        node.values[i-median_index-1] = node.values[i]; // don't need to shift the last value as it stays there, the implicit pointer is always at the last position.
                     }
-                    node.length = node.length - median_index - 1; // node = right half 
+                    node.length = node.length - (median_index + 1); // node = right half 
 
                     // Now actually add the median key and new child pointer to the correct node
                     if marker > median_key {
-                        let insert_index = node.keys[0..node.length].iter().position(|e| *e >= marker);
-                        let index = insert_index.unwrap_or(node.length);
+                        // As we handle the right side here we do know that no key can be grater than last element in the original node.
+                        let insert_index = index - median_index - 1; // as we are in the right node now we have to adjust the index
 
                         // Insert into the original node
-                        for i in (index..=node.length).rev() {
-                            if i < node.length {
-                                node.keys[i + 1] = node.keys[i];
-                            }
-                            node.values[i + 1] = node.values[i];
+                        for i in (insert_index..node.length-1).rev() {
+                            node.keys[i + 1] = node.keys[i];
+                            node.values[i + 1] = node.values[i]; // Don't need to move the last pointer, the inserted marker is always smaller than the last key.
                         }
 
-                        node.keys[index] = marker;
-                        node.values[index] = new_child_ptr.pointer;
+                        node.keys[insert_index] = marker;
+                        node.values[insert_index] = new_child_ptr.pointer;
 
                         node.length += 1;
                     } else {
-                        let insert_index = new_node.keys[0..new_node.length].iter().position(|e| *e >= marker);
-                        let index = insert_index.unwrap_or(new_node.length);
-
                         // Insert into the new node
-                        for i in (index..=new_node.length).rev() {
-                            if i < new_node.length {
-                                new_node.keys[i + 1] = new_node.keys[i];
-                            }
-                            new_node.values[i + 1] = new_node.values[i];
+                        for i in (index..new_node.length-1).rev() {
+                            new_node.keys[i + 1] = new_node.keys[i];
+                            new_node.values[i + 1] = new_node.values[i]; // Don't need to move the last pointer, the inserted marker is always smaller than the last key.
                         }
-                        new_node.keys[index] = marker;
+                        if index < BTREE_ORDER -1 {
+                            new_node.keys[index] = marker;
+                        }
+                        
                         new_node.values[index] = new_child_ptr.pointer;
                         new_node.length += 1;
                     }
@@ -404,11 +422,11 @@ impl BTreeIndexPRAM {
                 is_leaf: false,
                 keys: [0; BTREE_ORDER - 1],
                 values: [0; BTREE_ORDER],
-                length: 1,
+                length: 2,
             };
             new_root.keys[0] = median_key;
             new_root.values[0] = new_node_ptr.pointer;
-            new_root.values[1] = new_child_ptr.pointer;
+            new_root.values[BTREE_ORDER-1] = new_child_ptr.pointer; // For any elements greater than the available keys, search the last position of the array.
 
             // Write the root node
             new_child_ptr.write(root.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
@@ -423,22 +441,34 @@ impl BTreeIndexPRAM {
     /// Borrows a key from the left sibling of the given node.
     ///
     /// Parameters:
-    /// - `node_ptr`: The pointer to the node that needs to borrow a key.
-    /// - `parent_ptr`: The pointer to the parent node.
+    /// - 'node': The node that needs to borrow a key.
+    /// - `parent_node`: The parent node of the node to borrow from.
     /// - `node_index`: The index of the node in the parent's children array.
     /// 
     /// Returns:
     /// - `Ok(true)` if a key was successfully borrowed.
     /// - `Ok(false)` if borrowing was not possible.
-    fn try_borrow_left_sibling(&mut self, node_ptr: &mut Pointer, parent_ptr: &mut Pointer, node_index: usize) -> Result<bool, Error> {
-        let mut node = node_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-        let mut parent_node = parent_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+    fn try_borrow_left_sibling(&mut self, node: &mut Box<BTreeNode>, parent_node: &mut Box<BTreeNode>, node_index: usize) -> Result<bool, Error> {
+        if node_index == 0 {
+            return Ok(false); // No left sibling, can't borrow from non-existent sibling
+        }
+
+        // Because we have defined the last elemtn to point to the leaf contianing all
+        // values larger than any key in the current node, we need to calculate the left
+        // node for this case individually.
+        let left_node_index = if node_index == BTREE_ORDER-1 {
+            parent_node.length - 2 
+        } else { 
+            node_index - 1 
+        };
 
         // Try left sibling
-        let mut left_sibling_ptr = Pointer::from_address(parent_node.values[node_index - 1], self.pram.clone());
+        let mut left_sibling_ptr = Pointer::from_address(parent_node.values[left_node_index], self.pram.clone());
         let mut left_sibling = left_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
 
-        if left_sibling.length > BTREE_ORDER/2 {
+        // The +1 is because we need to leave enough keeys in the sibling and with integer division e.g. 5/2 == 2 this could be true for len=3
+        // Which would then lead to underflow in the sibling.
+        if left_sibling.length >= BTREE_ORDER/2 + 1 {
             // Borrow from left sibling
             // Shift keys and values in current node to right
             for i in (0..node.length).rev() {
@@ -446,21 +476,34 @@ impl BTreeIndexPRAM {
                 node.values[i + 1] = node.values[i];
             }
 
-            // Move key from left_sibling to current node
-            node.keys[0] = left_sibling.keys[left_sibling.length - 1]; // the most left key from the left sibling
-            node.values[0] = left_sibling.values[left_sibling.length - 1]; // and its associated value
-
             node.length += 1;
-            left_sibling.length -= 1;
 
-            // Update parent key
-            parent_node.keys[node_index - 1] = left_sibling.keys[left_sibling.length - 1]; // the last key in the new left sibling
+            if node.is_leaf {
+                // Move key from left_sibling to current node
+                node.keys[0] = left_sibling.keys[left_sibling.length - 1]; // the most left key from the left sibling
+                node.values[0] = left_sibling.values[left_sibling.length - 1]; // and its associated value
+            
+                // if we are a leaf node, its enough to just decreas the length as this will effectively remove the last key and value.
+                left_sibling.length -= 1;
+
+                // Update parent key for left sibling
+                parent_node.keys[left_node_index] = left_sibling.keys[left_sibling.length - 1]; // the last key in the new left sibling.
+            } else { // But if we are a internal node we have borrowed the last key, the one without a value.
+                node.keys[0] = parent_node.keys[node_index - 1]; // the separator key from the parent
+                node.values[0] = left_sibling.values[BTREE_ORDER - 1]; // the most right pointer from the left sibling
+
+                // Move the last seperator key and value to end of node.
+                left_sibling.length -= 1;
+                left_sibling.values[BTREE_ORDER - 1] = left_sibling.values[left_sibling.length]; // Move the last pointer to the end position.
+                // No need to move the key, it becomes stale after removing the length.
+
+                // Update parent key
+                parent_node.keys[left_node_index] = left_sibling.keys[left_sibling.length-2]; // the last previous key in the left sibling
+            }
+        
 
             // Write back updated nodes
             left_sibling_ptr.write(left_sibling.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-            node_ptr.write(node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-            parent_ptr.write(parent_node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-
             return Ok(true); // Placeholder return value
         }else{
             return Ok(false);
@@ -470,43 +513,70 @@ impl BTreeIndexPRAM {
     /// Borrows a key from the right sibling of the given node.
     /// 
     /// Parameters:
-    /// - `node_ptr`: The pointer to the node that needs to borrow a key.
-    /// - `parent_ptr`: The pointer to the parent node.
+    /// - 'node': The node that needs to borrow a key.
+    /// - `parent_node`: The parent node of the node to borrow from.
     /// - `node_index`: The index of the node in the parent's children array.
     /// 
     /// Returns:
     /// - `Ok(true)` if a key was successfully borrowed.
     /// - `Ok(false)` if borrowing was not possible.
-    fn try_borrow_right_sibling(&mut self, node_ptr: &mut Pointer, parent_ptr: &mut Pointer, node_index: usize) -> Result<bool, Error> {
-        // Try right sibling
-        let mut node = node_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-        let mut parent_node = parent_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+    fn try_borrow_right_sibling(&mut self, node: &mut Box<BTreeNode>, parent_node: &mut Box<BTreeNode>, node_index: usize) -> Result<bool, Error> {
+        if node_index + 1 >= BTREE_ORDER {
+            return Ok(false); // No right sibling
+        }
 
-        let mut right_sibling_ptr = Pointer::from_address(parent_node.values[node_index + 1], self.pram.clone());
+        let right_sibling_index = if node_index + 2 >= parent_node.length {
+            BTREE_ORDER - 1
+        } else {
+            node_index + 1
+        };
+
+        // Try right sibling
+        let mut right_sibling_ptr = Pointer::from_address(parent_node.values[right_sibling_index], self.pram.clone());
         let mut right_sibling = right_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
 
-        if right_sibling.length > BTREE_ORDER/2 {
-            // Borrow from right sibling
-            // Move key from right_sibling to current node
-            node.keys[node.length] = right_sibling.keys[0]; // the most left key from the right sibling
-            node.values[node.length] = right_sibling.values[0]; // and its associated value
+        // The +1 is because we need to leave enough keeys in the sibling and with integer division e.g. 5/2 == 2 this could be true for len=3
+        // Which would then lead to underflow in the sibling.
+        if right_sibling.length >= BTREE_ORDER/2 + 1 {  
+            if node.is_leaf {                                  
+                // Borrow from right sibling
+                // Move key from right_sibling to current node
+                let new_key = right_sibling.keys[0];
+                node.keys[node.length] = new_key; // the most left key from the right sibling
+                node.values[node.length] = right_sibling.values[0]; // and its associated value
 
-            node.length += 1;
+                // Update parent key
+                parent_node.keys[node_index] = new_key; // the last key in the current node
 
-            // Shift keys and values in right sibling to left
-            for i in 0..right_sibling.length-1 {
-                right_sibling.keys[i] = right_sibling.keys[i + 1];
-                right_sibling.values[i] = right_sibling.values[i + 1];
+                node.length += 1;
+
+                // Shift keys and values in right sibling to left
+                for i in 0..right_sibling.length-1 {
+                    right_sibling.keys[i] = right_sibling.keys[i + 1];
+                    right_sibling.values[i] = right_sibling.values[i + 1];
+                }
+                right_sibling.length -= 1;
+            }else {
+                // Move the last pointer of the current node to the end of the current list.
+                node.values[node.length] = node.values[BTREE_ORDER - 1];
+                node.keys[node.length] = parent_node.keys[node_index]; // the separator key from the parent
+
+                // Now take from the right sibling the first entry and move it to the end - update parent key
+                node.values[BTREE_ORDER -1] = right_sibling.values[0]; // the most left pointer from the right sibling
+                parent_node.keys[node_index] = right_sibling.keys[0]; // the most left key from the right sibling
+
+                node.length += 1;
+                right_sibling.length -= 1;
+
+                // Now move the right sibling entries to the left - except for the last value it can stay there
+                for i in 0..right_sibling.length-1 {
+                    right_sibling.keys[i] = right_sibling.keys[i + 1];
+                    right_sibling.values[i] = right_sibling.values[i + 1];
+                }
             }
-            right_sibling.length -= 1;
-
-            // Update parent key
-            parent_node.keys[node_index] = right_sibling.keys[0]; // the first key in the new right sibling
-
+            
             // Write back updated nodes
             right_sibling_ptr.write(right_sibling.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-            node_ptr.write(node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-            parent_ptr.write(parent_node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
 
             return Ok(true); // Placeholder return value
         }else{
@@ -515,93 +585,84 @@ impl BTreeIndexPRAM {
     }
 
     /// Merges the given node with its left sibling.
-    /// 
-    /// Parameters:
-    /// - `node_ptr`: The pointer to the node to merge.
-    /// - `parent_ptr`: The pointer to the parent node.
-    /// - `node_index`: The index of the node in the parent's children array.
-    /// 
-    /// Returns:
-    /// - `Ok(())` if the merge was successful.
-    /// - `Err(Error)` if there was an error during the operation.
-    fn merge_left_sibling(&mut self, node_ptr: &mut Pointer, parent_ptr: &mut Pointer, node_index: usize) -> Result<(), Error> {
-        let node = node_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-        let mut parent_node = parent_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-
-        let mut left_sibling_ptr = Pointer::from_address(parent_node.values[node_index - 1], self.pram.clone());
-        let mut left_sibling = left_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-
-        // Move all keys and values from current node to left sibling
-        for i in 0..node.length {
-            left_sibling.keys[left_sibling.length + i] = node.keys[i];
-            left_sibling.values[left_sibling.length + i] = node.values[i];
-        }
-        left_sibling.length += node.length;
-
-        // Update parent key
-        parent_node.keys[node_index - 1] = left_sibling.keys[left_sibling.length - 1]; // the last key in the new left sibling
-
-        // Remove the key and pointer from the parent
-        for i in node_index..parent_node.length {
-            parent_node.keys[i] = parent_node.keys[i + 1];
-            parent_node.values[i] = parent_node.values[i + 1];
-        }
-        parent_node.length -= 1;
-
-        // Write back updated nodes
-        left_sibling_ptr.write(left_sibling.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-        parent_ptr.write(parent_node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-
-        // Free the memory of the current node
-        self.pram.free(node_ptr.clone(),  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
-
-        return Ok(()); // Placeholder return value
-    }
-
-    /// Merges the given node with its right sibling.
     ///
     /// Parameters:
-    /// - `node_ptr`: The pointer to the node to merge.
-    /// - `parent_ptr`: The pointer to the parent node.
+    /// - 'node': The node to merge.
+    /// - `parent_node`: The parent node of the node to merge.
     /// - `node_index`: The index of the node in the parent's children array.
     /// 
     /// Returns:
-    /// - `Ok(())` if the merge was successful.
+    /// - `Ok(bool)` if the merge was successful. True if merged, false if not.
     /// - `Err(Error)` if there was an error during the operation.
-    fn merge_right_sibling(&mut self, node_ptr: &mut Pointer, parent_ptr: &mut Pointer, node_index: usize) -> Result<(), Error> {
-        let mut node = node_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-        let mut parent_node = parent_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-
-        let right_sibling_ptr = Pointer::from_address(parent_node.values[node_index + 1], self.pram.clone());
-        let right_sibling = right_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
-
-        // Move all keys and values from right sibling to current node
-        for i in 0..right_sibling.length {
-            node.keys[node.length + i] = right_sibling.keys[i];
-            node.values[node.length + i] = right_sibling.values[i];
+    fn merge_left_sibling(&mut self, node: &mut Box<BTreeNode>, parent_node: &mut Box<BTreeNode>, node_index: usize) -> Result<bool, Error> {
+        if node_index == 0 {
+            return Ok(false); // No left sibling
         }
-        node.length += right_sibling.length;
 
-        // Update parent key
-        parent_node.keys[node_index] = node.keys[node.length - 1]; // the last key in the current node
+        let left_sibling_index = if node_index == BTREE_ORDER-1 {
+            parent_node.length - 2 
+        } else { 
+            node_index - 1 
+        };
 
-        // Remove the key and pointer from the parent
-        for i in node_index+1..parent_node.length {
+        let left_sibling_ptr = Pointer::from_address(parent_node.values[left_sibling_index], self.pram.clone());
+        let left_sibling = left_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+        
+        if node.is_leaf{
+            if left_sibling.length + node.length > BTREE_ORDER - 1 {
+                return Ok(false); // Can't merge, would exceed max capacity
+            }
+
+            // Make space for the items of the left sibling - move items in node to the right
+            for i in (0..node.length).rev() {
+                node.keys[i + left_sibling.length] = node.keys[i];
+                node.values[i + left_sibling.length] = node.values[i];
+            }
+
+            // Move items from left sibling to node
+            for i in 0..left_sibling.length {
+                node.keys[i] = left_sibling.keys[i];
+                node.values[i] = left_sibling.values[i];
+            }
+        }else{
+            // If they fit together
+            if left_sibling.length + node.length > BTREE_ORDER {
+                return Ok(false); // Can't merge, would exceed max capacity
+            }
+            
+            // Make space for the items of the left sibling - move items in node to the right
+            for i in (0..node.length-1).rev() {
+                node.keys[i + left_sibling.length] = node.keys[i];
+                node.values[i + left_sibling.length] = node.values[i];
+            }
+            
+            // Move items from left sibling to node
+            for i in 0..left_sibling.length-1 {
+                node.keys[i] = left_sibling.keys[i];
+                node.values[i] = left_sibling.values[i];
+            }
+
+            // For the last element of the left node, we need to look up the key in the parent
+            node.values[left_sibling.length-1] = left_sibling.values[left_sibling.length-1];
+            node.keys[left_sibling.length-1] = parent_node.keys[left_sibling_index]; // the separator key from the parent
+        }
+
+        // Update parent node - remove the pointer to the left sibling. Can't be the last, because its the left sibling.
+        for i in node_index-1..parent_node.length-2 {
             parent_node.keys[i] = parent_node.keys[i + 1];
             parent_node.values[i] = parent_node.values[i + 1];
-        }
+        }  
+
         parent_node.length -= 1;
 
-        // Write back updated nodes
-        node_ptr.write(node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-        parent_ptr.write(parent_node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
+        node.length += left_sibling.length;
 
         // Free the memory of the right sibling
-        self.pram.free(right_sibling_ptr.clone(),  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
+        self.pram.free(left_sibling_ptr.clone(),  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
 
-        return Ok(()); // Placeholder return value
+        return Ok(true); // Placeholder return value
     }
-
+    
     /// Recursive helper function to remove a key-value pair.
     /// 
     /// Parameters:
@@ -611,8 +672,7 @@ impl BTreeIndexPRAM {
     /// - `Ok(value)` where `value` is the removed value if the operation was
     /// successful.
     /// - `Err(Error)` if there was an error during the operation.
-    fn remove_recursive(&mut self, key: u64, node_ptr: &mut Pointer, parent: Option<&mut Pointer>, node_index: Option<usize>) -> Result<u64, Error> {
-        let mut node = node_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+    fn remove_recursive(&mut self, key: u64, node: &mut Box<BTreeNode>, parent: Option<&mut Box<BTreeNode>>, node_index: Option<usize>) -> Result<u64, Error> {
         if node.is_leaf {
             // Search for the key to remove
             let key_index = node.keys.as_slice()[0..node.length].iter().position(|e| *e == key);
@@ -630,69 +690,72 @@ impl BTreeIndexPRAM {
             node.length -= 1;
 
             // Implementation for removing a key-value pair from a leaf node
-            // Check if there is enough keys to remove without underflow or if it's the root
-            if node.length >= BTREE_ORDER/2 || parent.is_none() { 
-                // Write back the updated node
-                node_ptr.write(node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
-                return Ok(value);
-            } else { // Need to handle underflow
+            // Check if we need to handle the overflow
+            if node.length < BTREE_ORDER/2 && parent.is_some() { 
                 // Either borrow from sibling or merge with sibling
-                // We can unwrap here because we checked for parent being None above
-                let parent_ptr = parent.unwrap();
+                // We can unwrap here because we checked for parent being None above.
+                let parent = parent.unwrap();
                 let node_index = node_index.unwrap();
 
-                let merge_right = !self.try_borrow_right_sibling(node_ptr, parent_ptr, node_index)?;
-                let merge_left = !self.try_borrow_left_sibling(node_ptr, parent_ptr, node_index)?;
+                if !self.try_borrow_right_sibling(node, parent, node_index)? { // Successfully borrowed from right sibling
+                    if !self.try_borrow_left_sibling(node, parent, node_index)? { // Successfully borrowed from left sibling
+                        // If neither sibling can lend a key, we need to handle underflow by merging nodes, this may lead to a underflow in the parent node which must be handled
 
-                // If neither sibling can lend a key, we need to handle underflow by merging nodes, this may lead to a underflow in the parent node which must be handled
-
-                // Check if we can merge with the left sibling.
-                if merge_left {
-                    self.merge_left_sibling(node_ptr, parent_ptr, node_index)?;
-                    return Ok(value);
-                } else if merge_right { // Merge with right sibling
-                    self.merge_right_sibling(node_ptr, parent_ptr, node_index)?;
-                    return Ok(value);
-                }
-
-                // If we get here the parent broke its gurantees.
-                panic!("Underflow in internal nodes not expected here - should be handled by caller!");
+                        // Check if we can merge with the left sibling.
+                        if !self.merge_left_sibling(node, parent, node_index)? {
+                            // just get the left sibling and try to merge with it as node.
+                            let mut right_sibling_ptr = Pointer::from_address(parent.values[node_index + 1], self.pram.clone());
+                            let right_sibling = right_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+                            self.merge_left_sibling(&mut right_sibling.clone(), parent, node_index + 1)?;
+                            right_sibling_ptr.write(right_sibling.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
+                        }
+                        // can't merge with left, no need to check right as we already tried to borrow from both sides.
+                    }
+                };
             }
-        }else {
-            let correct_index = node.keys.as_slice()[0..node.length].iter().position(|e| *e >= key);
+
+            return Ok(value);
+        } else {
+            let correct_index = node.keys.as_slice()[0..node.length-1].iter().position(|e| *e >= key);
             let index = if correct_index.is_none() {
-                node.length
+                BTREE_ORDER -1
             } else {
                 correct_index.unwrap()
             };
 
             let mut child_ptr = Pointer::from_address(node.values[index],self.pram.clone());
+            let mut child = child_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
 
             // Recur into child node
-            let result  = self.remove_recursive(key, &mut child_ptr, Some(node_ptr), Some(index))?;
+            let result  = self.remove_recursive(key, &mut child, Some(node), Some(index))?;
+
+            // Write back the updated child node
+            child_ptr.write(child.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
 
             if node.length < BTREE_ORDER / 2 {
                 // Handle underflow in internal nodes if needed
                 // This part is left unimplemented for brevity
-                let parent_ptr = parent.unwrap();
+                let parent = parent.unwrap();
                 let node_index = node_index.unwrap();
 
-                let merge_right = !self.try_borrow_right_sibling(node_ptr, parent_ptr, node_index)?;
-                let merge_left = !self.try_borrow_left_sibling(node_ptr, parent_ptr, node_index)?;
+                if !self.try_borrow_right_sibling(node, parent, node_index)? { // Successfully borrowed from right sibling
+                    if !self.try_borrow_left_sibling(node, parent, node_index)? { // Successfully borrowed from left sibling
+                        // If neither sibling can lend a key, we need to handle underflow by merging nodes, this may lead to a underflow in the parent node which must be handled
 
-                // If neither sibling can lend a key, we need to handle underflow by merging nodes, this may lead to a underflow in the parent node which must be handled
-
-                // Check if we can merge with the left sibling.
-                if merge_left {
-                    self.merge_left_sibling(node_ptr, parent_ptr, node_index)?;
-                    return Ok(result);
-                } else if merge_right { // Merge with right sibling
-                    self.merge_right_sibling(node_ptr, parent_ptr, node_index)?;
-                    return Ok(result);
-                }
+                        // Check if we can merge with the left sibling.
+                        if !self.merge_left_sibling(node, parent, node_index)? {
+                            // just get the left sibling and try to merge with it.
+                            let mut right_sibling_ptr = Pointer::from_address(parent.values[node_index + 1], self.pram.clone());
+                            let right_sibling = right_sibling_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+                            self.merge_left_sibling(&mut right_sibling.clone(), parent, node_index + 1)?;
+                            right_sibling_ptr.write(right_sibling.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
+                        }
+                        // can't merge with left, no need to check right as we already tried to borrow from both sides.
+                    }
+                };
             }
 
-            Ok(result)
+            return Ok(result);
         }
     }
 
@@ -705,7 +768,82 @@ impl BTreeIndexPRAM {
     /// - `Ok(value)` where `value` is the removed value if the operation was successful.
     /// - `Err(Error)` if there was an error during the operation.
     fn remove(&mut self, key: u64) -> Result<u64, Error> {
-        self.remove_recursive(key, &mut self.root.clone(), None, None)
+        let mut root = self.root.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+        let res = self.remove_recursive(key, &mut root, None, None)?;
+        self.root.write(root.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
+        Ok(res)
+    }
+
+    /// Recursive helper function to create an in-memory copy of the B-tree.
+    /// 
+    /// Parameters:
+    /// - `node`: The current node being processed.
+    fn _reslove_recursive(&mut self, node: &mut BTreeMemCopyNode) {
+        if node.is_leaf {
+            return;
+        }
+        for i in 0..node.length {
+            let child_i = if i +1 == node.length{
+                (BTREE_ORDER -1) as usize
+            } else { i };
+
+            let child_ptr = Pointer::from_address(node.values[child_i], self.pram.clone());
+            let child_node = child_ptr.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError).unwrap();
+
+            let mut mem_child_node = BTreeMemCopyNode {
+                is_leaf: child_node.is_leaf,
+                keys: child_node.keys,
+                values: child_node.values,
+                length: child_node.length,
+                _children: Vec::new(),
+            };
+
+            self._reslove_recursive(&mut mem_child_node);
+
+            node._children.push(mem_child_node);
+        }
+        
+    }
+
+    /// For Debugging, creates an in-memory copy of the entire B-tree.
+    /// 
+    /// Returns:
+    /// - `BTreeMemCopyNode`: The root of the in-memory B-tree copy for debugging.
+    fn _get_mem_copy(&mut self) -> BTreeMemCopyNode {
+        let root = self.root.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError).unwrap();
+
+        let mut mem_root = BTreeMemCopyNode {
+            is_leaf: root.is_leaf,
+            keys: root.keys,
+            values: root.values,
+            length: root.length,
+            _children: Vec::new(), // This should be populated with children if needed
+        };
+
+        self._reslove_recursive(&mut mem_root);
+        
+        mem_root
+    }
+
+    fn _print_to_string(&mut self) -> String {
+        let root = self._get_mem_copy();
+
+        fn print_node(node: &BTreeMemCopyNode, depth: usize, output: &mut String) {
+            let indent = if node.is_leaf { "  ".repeat(depth) } else { "  ".repeat(depth) };
+            output.push_str(&format!("{}{{ Node (is_leaf: {}, length: {})", indent, node.is_leaf, node.length));
+            output.push_str(&format!(" Keys: {:?}", &node.keys));
+            output.push_str(&format!(" Values: {:?} }}\n", &node.values));
+
+            if !node.is_leaf {
+                for child in node._children.iter() {
+                    print_node(&child, depth + 1, output);
+                }
+            }
+        }
+
+        let mut output = String::new();
+        print_node(&root, 0, &mut output);
+        output
     }
 }
 
@@ -750,20 +888,20 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
-    fn make_pram() -> Rc<dyn PersistentRandomAccessMemory> {
+    fn make_pram(id: &str) -> Rc<dyn PersistentRandomAccessMemory> {
         // 4 MiB total, 4 KiB pages, moderate LRU settings
-        let path = temp_path("pram_test");
-        FilePersistentRandomAccessMemory::new(4 * 1024 * 1024, &path, 16 * 1024, 256, 8, 2)
+        let path = temp_path(&format!("pram_test{}", id));
+        FilePersistentRandomAccessMemory::new(4 * 1024 * 1024, &path, 4 * 1024, 16, 4, 2)
     }
 
-    fn new_index() -> BTreeIndexPRAM {
-        let pram = make_pram();
+    fn new_index(id: &str) -> BTreeIndexPRAM {
+        let pram = make_pram(id);
         BTreeIndexPRAM::new(pram)
     }
 
     #[test]
     fn set_and_get_single_key() {
-        let mut idx = new_index();
+        let mut idx = new_index("set_and_get_single_key");
         let key = 42u64;
         let val = 777u64;
         idx.set(key, &val).expect("set should succeed");
@@ -773,7 +911,7 @@ mod tests {
 
     #[test]
     fn update_existing_key() {
-        let mut idx = new_index();
+        let mut idx = new_index("update_existing_key");
         let key = 10u64;
         idx.set(key, &1).unwrap();
         idx.set(key, &2).unwrap();
@@ -782,7 +920,7 @@ mod tests {
 
     #[test]
     fn missing_key_returns_error() {
-        let idx = new_index();
+        let idx = new_index("missing_key_returns_error");
         match idx.get(999) { 
             Err(Error::KeyNotFound) => {},
             other => panic!("expected KeyNotFound, got {:?}", other),
@@ -791,9 +929,9 @@ mod tests {
 
     #[test]
     fn many_inserts_cause_splits_and_remain_searchable() {
-        let mut idx = new_index();
+        let mut idx = new_index("many_inserts_cause_splits_and_remain_searchable");
         // Insert more than BTREE_ORDER to force splits
-        let count = BTREE_ORDER as u64 + 100; // exceed order
+        let count = BTREE_ORDER as u64 * 32; // exceed order
         for k in 0..count {
             let v = k * 3;
             idx.set(k, &v).unwrap();
@@ -809,7 +947,7 @@ mod tests {
 
     #[test]
     fn remove_existing_key() {
-        let mut idx = new_index();
+        let mut idx = new_index("remove_existing_key");
         for k in 0..100u64 { idx.set(k, &k).unwrap(); }
         idx.remove(50).unwrap();
         match idx.get(50) {
@@ -823,37 +961,39 @@ mod tests {
 
     #[test]
     fn remove_underflow_borrow_or_merge_paths() {
-        let mut idx = new_index();
+        let mut idx = new_index("remove_underflow_borrow_or_merge_paths");
         // Construct distribution to potentially trigger borrow/merge.
         // Insert enough keys to fill multiple nodes, then remove many to cause underflow.
-        let total = (BTREE_ORDER as u64) * 3;
+        let total = (BTREE_ORDER as u64) * 32 + 100;
         for k in 0..total { idx.set(k, &k).unwrap(); }
+
         // Remove alternating keys to stress sibling logic
-        for k in (0..total).step_by(2) {
-            idx.remove(k).unwrap();
+        for r in (0..total).step_by(2) {
+            idx.remove(r).unwrap();
         }
         // Remaining odd keys should still be present
-        for k in (1..total).step_by(2) {
-            assert_eq!(idx.get(k).unwrap(), k);
+        for g in (1..total).step_by(2) {
+            assert_eq!(idx.get(g).unwrap(), g);
+            assert!(idx.get(g - 1).is_err());
         }
     }
-
+ 
     #[test]
     fn persist_does_not_panic() {
-        let idx = new_index();
+        let idx = new_index("persist_does_not_panic");
         idx.persist().expect("persist should succeed");
     }
 
     #[test]
     fn stress_randomized_small_range() {
-        let mut idx = new_index();
+        let mut idx = new_index("stress_randomized_small_range");
         // Deterministic pseudo-random without external crates
         let mut seed: u64 = 0xDEADBEEFCAFEBABE;
         let mut keys = Vec::new();
 
         // Stopwatch
-        let start = Instant::now();
-        for _ in 0..131_072 {
+        let start: Instant = Instant::now();
+        for _ in 0..100_000 {
             // xorshift64*
             seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
             let k = (seed % 16_384) as u64;
@@ -861,7 +1001,19 @@ mod tests {
             idx.set(k, &v).unwrap();
             keys.push((k, v));
         }
-        println!("Inserted 131072 entries in {:?}", start.elapsed());
+        println!("BTree {}", idx._print_to_string());
+
+        // xorshift64*
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let k = (seed % 16_384) as u64;
+        println!("Getting key {}", k);
+        let v = seed ^ 0xA5A5A5A5A5A5A5A5;
+        idx.set(k, &v).unwrap();
+        keys.push((k, v));
+        
+        println!("BTree Inserted key {} \n {}", k ,idx._print_to_string());
+
+        println!("Inserted 100k entries in {:?}", start.elapsed());
 
         let start = Instant::now();
         // Verify latest values for each key
@@ -869,7 +1021,7 @@ mod tests {
         let mut last: HashMap<u64, u64> = HashMap::new();
         for (k, v) in keys { last.insert(k, v); }
         for (k, v) in last { assert_eq!(idx.get(k).unwrap(), v); }
-        println!("Verified 131072 entries in {:?}", start.elapsed());
+        println!("Verified 100k entries in {:?}", start.elapsed());
     }
 }
 
