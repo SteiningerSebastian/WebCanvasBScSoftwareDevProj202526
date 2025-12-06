@@ -195,13 +195,13 @@ impl LruKCache {
     /// 
     /// Returns:
     /// - `Option<&mut Slot>`: Some(&mut Slot) if found, None otherwise
-    pub fn fetch_page(&mut self, page_index: usize) -> Option<Vec<u8>> {
+    pub fn fetch_page(&mut self, page_index: usize) -> Option<(Vec<u8>, bool)> {
         if let Some(&slot_id) = self.page_map.get(&page_index) {
             // Touch the slot to update its history and score
             self.touch(slot_id);
             let slot = self.slots[slot_id].as_mut();
             if let Some(s) = slot {
-                return s.data.take(); // return the data and remove it from the slot
+                return s.data.take().map(|data| (data, s.dirty)); // return the data and remove it from the slot
                 // Note: Caller must put it back after use using store_page, else data will be lost.
             }
         }

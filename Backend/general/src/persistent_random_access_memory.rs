@@ -1098,11 +1098,11 @@ impl FilePersistentRandomAccessMemory {
         // Case 1: Page is in cache
         if cache.contains_page(page_index) {
             // Can not return null as we made sure the page exists above
-            let cache_data = cache.fetch_page(page_index).unwrap();
+            let (cache_data, dirty) = cache.fetch_page(page_index).unwrap();
+            let was_dirty = *self.cached_page_dirty.borrow();
             let old_page = self.cached_page.replace(cache_data);
             
             if let Some(old_index) = *self.current_page_index.borrow() {
-                let was_dirty = *self.cached_page_dirty.borrow();
                 // Store the current cached page back into the cache
                 let evicted = cache.store_page(old_index, old_page, was_dirty)
                                                 .map_err(Error::CacheStoreError)?;
@@ -1120,7 +1120,7 @@ impl FilePersistentRandomAccessMemory {
             }
 
             *self.current_page_index.borrow_mut() = Some(page_index);
-            self.cached_page_dirty.replace(false);
+            self.cached_page_dirty.replace(dirty);
             return Ok(());
         }
 
