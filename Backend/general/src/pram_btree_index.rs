@@ -629,7 +629,7 @@ impl BTreeIndexPRAM {
         let note_ptr = Pointer::from_address(parent_node.values[node_index], self.pram.clone());
 
         // Free the memory of the right sibling
-        self.pram.free(note_ptr,  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
+        //TODO self.pram.free(note_ptr,  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
 
         return Ok(true); // Placeholder return value
     }
@@ -720,7 +720,7 @@ impl BTreeIndexPRAM {
         Self::merge_right_sibling_inner(node, &right_sibling, parent_node, node_index, right_sibling_index)?;
 
         // Free the memory of the right sibling
-        self.pram.free(right_sibling_ptr.clone(),  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
+        // TODO self.pram.free(right_sibling_ptr.clone(),  std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
 
         return Ok(true); // Placeholder return value
     }
@@ -950,20 +950,25 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
-    fn make_pram(id: &str) -> Rc<dyn PersistentRandomAccessMemory> {
-        // 4 MiB total, 4 KiB pages, moderate LRU settings
-        let path = temp_path(&format!("pram_test{}", id));
-        FilePersistentRandomAccessMemory::new(16 * 1024 * 1024, &path, 4 * 1024, 64, 2, 8)
+    fn make_pram(id: &str, mock: bool) -> Rc<dyn PersistentRandomAccessMemory> {
+        if mock {
+            // 4 MiB total, 4 KiB pages, moderate LRU settings
+            crate::mock_persistent_random_access_memory::MockPRAM::new()
+        } else {
+            // 4 MiB total, 4 KiB pages, moderate LRU settings
+            let path = temp_path(&format!("pram_test{}", id));
+            FilePersistentRandomAccessMemory::new(16 * 1024 * 1024, &path, 4 * 1024, 64, 2, 8)
+        }
     }
 
-    fn new_index(id: &str) -> BTreeIndexPRAM {
-        let pram = make_pram(id);
+    fn new_index(id: &str, mock: bool) -> BTreeIndexPRAM {
+        let pram = make_pram(id, mock);
         BTreeIndexPRAM::new(pram)
     }
 
     #[test]
     fn set_and_get_single_key() {
-        let mut idx = new_index("set_and_get_single_key");
+        let mut idx = new_index("set_and_get_single_key", true);
         let key = 42u64;
         let val = 777u64;
         idx.set(key, val).expect("set should succeed");
@@ -973,7 +978,7 @@ mod tests {
 
     #[test]
     fn update_existing_key() {
-        let mut idx = new_index("update_existing_key");
+        let mut idx = new_index("update_existing_key", true);
         let key = 10u64;
         idx.set(key, 1).unwrap();
         idx.set(key, 2).unwrap();
@@ -982,7 +987,7 @@ mod tests {
 
     #[test]
     fn missing_key_returns_error() {
-        let idx = new_index("missing_key_returns_error");
+        let idx = new_index("missing_key_returns_error", true);
         match idx.get(999) { 
             Err(Error::KeyNotFound) => {},
             other => panic!("expected KeyNotFound, got {:?}", other),
@@ -991,7 +996,7 @@ mod tests {
 
     #[test]
     fn many_inserts_cause_splits_and_remain_searchable() {
-        let mut idx = new_index("many_inserts_cause_splits_and_remain_searchable");
+        let mut idx = new_index("many_inserts_cause_splits_and_remain_searchable", true);
         // Insert more than BTREE_ORDER to force splits
         let count = BTREE_ORDER as u64 * 32; // exceed order
         for k in 0..count {
@@ -1009,12 +1014,12 @@ mod tests {
 
     #[test]
     fn remove_existing_key() {
-        let mut idx = new_index("remove_existing_key");
+        let mut idx = new_index("remove_existing_key", true);
         for k in 0..100u64 { idx.set(k, k).unwrap(); }
         idx.remove(50).unwrap();
         match idx.get(50) {
             Err(Error::KeyNotFound) => {},
-            _ => panic!("expected KeyNotFound after remove"),
+            e => panic!("expected KeyNotFound after remove {}", e.unwrap_err()),
         }
         // Ensure neighbors still readable
         assert_eq!(idx.get(49).unwrap(), 49);
@@ -1023,18 +1028,15 @@ mod tests {
 
     #[test]
     fn remove_underflow_borrow_or_merge_paths() {
-        let mut idx = new_index("remove_underflow_borrow_or_merge_paths");
+        let mut idx = new_index("remove_underflow_borrow_or_merge_paths", true);
         // Construct distribution to potentially trigger borrow/merge.
         // Insert enough keys to fill multiple nodes, then remove many to cause underflow.
         let total = (BTREE_ORDER as u64)*16+100;
         for k in 0..total { idx.set(k, k).unwrap(); }
 
-        println!("{}", idx.print_to_string());
-
         // Remove alternating keys to stress sibling logic
         for r in (0..total).step_by(2) {
             idx.remove(r).unwrap();
-            println!("{}", idx.print_to_string());
         }
         // Remaining odd keys should still be present
         for g in (1..total).step_by(2) {
@@ -1045,13 +1047,13 @@ mod tests {
  
     #[test]
     fn persist_does_not_panic() {
-        let idx = new_index("persist_does_not_panic");
+        let idx = new_index("persist_does_not_panic", true);
         idx.persist().expect("persist should succeed");
     }
 
     #[test]
     fn stress_randomized_small_range() {
-        let mut idx = new_index("stress_randomized_small_range");
+        let mut idx = new_index("stress_randomized_small_range", true);
         // Deterministic pseudo-random without external crates
         let mut seed: u64 = 0xDEADBEEFCAFEBABE;
         let mut keys = Vec::new();
@@ -1077,5 +1079,111 @@ mod tests {
         for (k, v) in keys { last.insert(k, v); }
         for (k, v) in last { assert_eq!(idx.get(k).unwrap(), v); }
         println!("Verified 100k entries in {:?}", start.elapsed());
+    }
+
+    /// Deterministic pseudo-random generator (xorshift64*).
+    fn xorshift64(mut s: u64) -> u64 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    }
+
+    /// Reusable helper: generate a random B+ tree with mixed insert/update/delete operations.
+    /// Returns the built index and a map of expected final key->value pairs.
+    ///
+    /// Parameters:
+    /// - seed: deterministic seed for PRNG
+    /// - ops: number of total operations to perform
+    /// - key_range: keys are in [0, key_range)
+    /// - delete_rate: approximate probability (0..=100) to delete on a step
+    /// - update_rate: approximate probability (0..=100) to update on a step (if key exists)
+    fn generate_random_tree(
+        seed: u64,
+        ops: usize,
+        key_range: u64,
+        delete_rate: u32,
+        update_rate: u32,
+        mock:bool,
+    ) -> (super::BTreeIndexPRAM, std::collections::HashMap<u64, u64>) {
+        let mut idx = new_index("generate_random_tree", mock);
+        use std::collections::HashMap;
+        let mut expected: HashMap<u64, u64> = HashMap::new();
+        let mut s = seed;
+
+        for _ in 0..ops {
+            s = xorshift64(s);
+            let k = (s % key_range) as u64;
+            let v = s ^ 0xC3C3C3C3C3C3C3C3;
+
+            let roll = (s & 0xFFFF) as u32 % 100;
+
+            if roll < delete_rate {
+                // attempt delete
+                if expected.remove(&k).is_some() {
+                    let res = idx.remove(k);
+                    if let Err(e) = res {
+                        println!("Error during delete: {:?}", e);
+                        println!("Current tree state:\n{}", idx.print_to_string());
+                        panic!("Expected successful delete for key {}, got error {:?}", k, e);
+                    }
+                } else {
+                    // deleting non-existing is allowed but should error; ignore result
+                    assert!(idx.remove(k).is_err());
+                }
+            } else if roll < delete_rate + update_rate {
+                // update if exists, else insert
+                expected.insert(k, v);
+                idx.set(k, v).unwrap();
+            } else {
+                // insert new value (acts as upsert)
+                expected.insert(k, v);
+                idx.set(k, v).unwrap();
+            }
+        }
+
+        (idx, expected)
+    }
+
+    #[test]
+    fn randomized_mixed_insert_update_delete_reusable() {
+        let seed: u64 = 0x0123_4567_89AB_CDEF;
+        let ops: usize = 100_000;
+        let key_range: u64 = 10_000;
+        let delete_rate: u32 = 20; // 20%
+        let update_rate: u32 = 30; // 30%
+
+        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, true);
+
+        // Verify all expected keys exist with latest values
+        for (k, v) in expected.iter() {
+            assert_eq!(idx.get(*k).unwrap(), *v);
+        }
+
+        // Spot-check a few keys outside expected should error (probabilistic)
+        for probe in [key_range + 1, key_range + 2, key_range + 3] {
+            assert!(idx.get(probe).is_err());
+        }
+    }
+
+    #[test]
+    fn integration_test_pram(){
+        let seed: u64 = 0x0123_4567_89AB_CDEF;
+        let ops: usize = 100_000;
+        let key_range: u64 = 10_000;
+        let delete_rate: u32 = 20; // 20%
+        let update_rate: u32 = 30; // 30%
+
+        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, false);
+
+        // Verify all expected keys exist with latest values
+        for (k, v) in expected.iter() {
+            assert_eq!(idx.get(*k).unwrap(), *v);
+        }
+
+        // Spot-check a few keys outside expected should error (probabilistic)
+        for probe in [key_range + 1, key_range + 2, key_range + 3] {
+            assert!(idx.get(probe).is_err());
+        }
     }
 }

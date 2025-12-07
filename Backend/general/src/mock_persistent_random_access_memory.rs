@@ -47,7 +47,7 @@ impl PersistentRandomAccessMemory for MockPRAM {
 
     #[allow(unused_variables)]
     fn free(&self, pointer: crate::persistent_random_access_memory::Pointer, len: usize) -> Result<(), crate::persistent_random_access_memory::Error> {
-        //self.map.borrow_mut().remove(&pointer.pointer);
+        self.map.borrow_mut().remove(&pointer.pointer);
         Ok(())
     }
 
