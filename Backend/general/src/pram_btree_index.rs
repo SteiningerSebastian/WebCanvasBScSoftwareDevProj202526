@@ -1,4 +1,4 @@
-use std::{fmt::Display, rc::Rc, u64};
+use std::{fmt::Display, rc::Rc, sync::Mutex, sync::Arc, u64};
 
 use crate::persistent_random_access_memory::{Error as PRAMError, PersistentRandomAccessMemory, Pointer};
 
@@ -62,7 +62,7 @@ pub trait BTreeIndex {
 }
 
 // The order of the B-tree (maximum number of children per node) Should be odd for simplicity.
-const BTREE_ORDER: usize = 5; // TODO 1000 - Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
+const BTREE_ORDER: usize = 1000; // 1000 - Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
 const ROOT_NODE_ADDRESS: u64 = 0; // Address of the root node in PRAM
 
 #[repr(C)] // Keep the order of values in memory
@@ -106,6 +106,81 @@ impl Clone for BTreeNode {
     }
 }
 impl Copy for BTreeNode {}
+
+pub struct ConcurrentBTreeIndexPRAM {
+    tree: Arc<Mutex<BTreeIndexPRAM>>,
+}
+
+impl BTreeIndex for ConcurrentBTreeIndexPRAM {
+    fn set(&mut self, key: u64, value: u64) -> Result<(), Error> {
+        let mut tree = self.tree.lock().unwrap();
+        tree.insert_or_update(key, value)
+    }
+
+    fn get(&self, key: u64) -> Result<u64, Error> {
+        let tree = self.tree.lock().unwrap();
+        tree.get(key)
+    }
+
+    fn remove(&mut self, key: u64) -> Result<(), Error> {
+        let mut tree = self.tree.lock().unwrap();
+        tree.remove(key)?;
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), Error> {
+        let tree = self.tree.lock().unwrap();
+        tree.pram.persist().map_err(Error::PersistenceError)
+    }
+}
+
+impl Clone for ConcurrentBTreeIndexPRAM {
+    fn clone(&self) -> Self {
+        ConcurrentBTreeIndexPRAM {
+            tree: Arc::clone(&self.tree),
+        }
+    }
+}
+
+pub struct ConcurrentIterator<'a> {
+    _guard: std::sync::MutexGuard<'a, BTreeIndexPRAM>,
+    iter: Box<dyn Iterator<Item = (u64, u64)> + 'a>,
+}
+
+impl<'a> Iterator for ConcurrentIterator<'a>
+{
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
+impl ConcurrentBTreeIndexPRAM {
+    pub fn new(pram: Rc<dyn PersistentRandomAccessMemory>) -> Self {
+        let tree = BTreeIndexPRAM::new(pram);
+        ConcurrentBTreeIndexPRAM {
+            tree: Arc::new(Mutex::new(tree)),
+        }
+    }
+
+    /// Creates an iterator over the B-tree index.
+    /// 
+    /// Returns:
+    /// - `Ok(ConcurrentIterator)` if the operation was successful.
+    /// - `Err(Error)` if there was an error during the operation.
+    /// 
+    /// Warning: The iterator holds a lock on the B-tree index for its lifetime.
+    pub fn iter(&'_ self) -> Result<ConcurrentIterator<'_>, Error> {
+        let tree = self.tree.lock().unwrap();
+        let iter = tree.iter()?;
+        Ok(ConcurrentIterator {
+            _guard: tree,
+            iter: Box::new(iter),
+        })
+    }
+}
+
 
 pub struct BTreeIndexPRAM {
     pram: Rc<dyn PersistentRandomAccessMemory>,
@@ -1030,9 +1105,9 @@ mod tests {
         }
     }
 
-    fn new_index(id: &str, mock: bool) -> BTreeIndexPRAM {
+    fn new_index(id: &str, mock: bool) -> ConcurrentBTreeIndexPRAM {
         let pram = make_pram(id, mock);
-        BTreeIndexPRAM::new(pram)
+        ConcurrentBTreeIndexPRAM::new(pram)
     }
 
     #[test]
@@ -1174,8 +1249,9 @@ mod tests {
         delete_rate: u32,
         update_rate: u32,
         mock:bool,
-    ) -> (super::BTreeIndexPRAM, std::collections::HashMap<u64, u64>) {
-        let mut idx = new_index("generate_random_tree", mock);
+        id: &str,
+    ) -> (super::ConcurrentBTreeIndexPRAM, std::collections::HashMap<u64, u64>) {
+        let mut idx = new_index(&format!("generate_random_tree_{}", id), mock);
         use std::collections::HashMap;
         let mut expected: HashMap<u64, u64> = HashMap::new();
         let mut s = seed;
@@ -1193,7 +1269,6 @@ mod tests {
                     let res = idx.remove(k);
                     if let Err(e) = res {
                         println!("Error during delete: {:?}", e);
-                        println!("Current tree state:\n{}", idx.print_to_string());
                         panic!("Expected successful delete for key {}, got error {:?}", k, e);
                     }
                 } else {
@@ -1222,7 +1297,7 @@ mod tests {
         let delete_rate: u32 = 20; // 20%
         let update_rate: u32 = 30; // 30%
 
-        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, true);
+        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, true, "randomized_mixed_insert_update_delete_reusable");
 
         // Verify all expected keys exist with latest values
         for (k, v) in expected.iter() {
@@ -1243,7 +1318,7 @@ mod tests {
         let delete_rate: u32 = 20; // 20%
         let update_rate: u32 = 30; // 30%
 
-        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, false);
+        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, false, "integration_test_pram");
 
         // Verify all expected keys exist with latest values
         for (k, v) in expected.iter() {
@@ -1264,7 +1339,7 @@ mod tests {
         let delete_rate: u32 = 20; // 20%
         let update_rate: u32 = 30; // 30%
 
-        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, false);
+        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, false, "iter_test");
 
         println!("Expected length: {}", expected.len());
         println!("Index length: {}", idx.iter().unwrap().count());
