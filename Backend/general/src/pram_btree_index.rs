@@ -62,7 +62,7 @@ pub trait BTreeIndex {
 }
 
 // The order of the B-tree (maximum number of children per node) Should be odd for simplicity.
-const BTREE_ORDER: usize = 1000; // 1000 Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
+const BTREE_ORDER: usize = 5; // TODO 1000 - Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
 const ROOT_NODE_ADDRESS: u64 = 0; // Address of the root node in PRAM
 
 #[repr(C)] // Keep the order of values in memory
@@ -944,6 +944,69 @@ impl BTreeIndex for BTreeIndexPRAM {
     }
 }
 
+pub struct BTreeIndexPRAMIterator {
+    current_node: BTreeNode,
+    current_node_ptr: Pointer,
+    current_pos: u64,
+    pram: Rc<dyn PersistentRandomAccessMemory>,
+}
+
+impl Iterator for BTreeIndexPRAMIterator {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_pos < self.current_node.length as u64 {
+            let key = self.current_node.keys[self.current_pos as usize];
+            let value = self.current_node.values[self.current_pos as usize];
+            self.current_pos += 1;
+            Some((key, value))
+        } else {
+            // Move to next leaf node
+            let next_leaf_ptr = Pointer::from_address(self.current_node.values[BTREE_ORDER - 1], self.pram.clone());
+
+            let next_node = next_leaf_ptr.deref::<BTreeNode>().ok()?;
+            if next_node.length == 0 {
+                return None; // No more elements
+            }
+
+            self.current_node = *next_node;
+            self.current_node_ptr = next_leaf_ptr;
+            self.current_pos = 0;
+
+            // If we reach the root again then we are done.
+            if self.current_node.is_leaf == false {
+                return None; 
+            }
+
+            // Now return the first element of the new leaf
+            let key = self.current_node.keys[self.current_pos as usize];
+            let value = self.current_node.values[self.current_pos as usize];
+            self.current_pos += 1;
+            Some((key, value))
+        }
+    }
+}
+
+impl BTreeIndexPRAM {
+    /// Creates an iterator over the B-tree index.
+    /// 
+    /// Returns:
+    /// - `BTreeIndexPRAMIterator`: An iterator over the key-value pairs in the B-tree.
+    fn iter(&self) -> Result<BTreeIndexPRAMIterator, Error> {
+        // Start at leftmost node.
+        let first = self.find_leaf_node(0, &mut self.root.clone())?;
+
+        let first_node = first.deref::<BTreeNode>().map_err(Error::UnspecifiedMemoryError)?;
+        
+        Ok(BTreeIndexPRAMIterator {
+            current_node: *first_node,
+            current_node_ptr: first,
+            current_pos: 0,
+            pram: self.pram.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1190,6 +1253,28 @@ mod tests {
         // Spot-check a few keys outside expected should error (probabilistic)
         for probe in [key_range + 1, key_range + 2, key_range + 3] {
             assert!(idx.get(probe).is_err());
+        }
+    }
+
+    #[test]
+    fn iter_test(){
+        let seed: u64 = 0x0123_4567_89AB_CDEF;
+        let ops: usize = 100_000;
+        let key_range: u64 = 10_000;
+        let delete_rate: u32 = 20; // 20%
+        let update_rate: u32 = 30; // 30%
+
+        let (idx, expected) = generate_random_tree(seed, ops, key_range, delete_rate, update_rate, false);
+
+        println!("Expected length: {}", expected.len());
+        println!("Index length: {}", idx.iter().unwrap().count());
+        let mut last_key = 0;
+        for (k, v) in idx.iter().unwrap() {
+            assert_eq!(expected.get(&k).unwrap(), &v);
+
+            // Check ordering
+            assert!(k >= last_key);
+            last_key = k;
         }
     }
 }
