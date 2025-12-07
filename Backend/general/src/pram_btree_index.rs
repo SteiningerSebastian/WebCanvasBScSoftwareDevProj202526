@@ -992,7 +992,7 @@ impl BTreeIndexPRAM {
     /// 
     /// Returns:
     /// - `BTreeIndexPRAMIterator`: An iterator over the key-value pairs in the B-tree.
-    fn iter(&self) -> Result<BTreeIndexPRAMIterator, Error> {
+    pub fn iter(&self) -> Result<BTreeIndexPRAMIterator, Error> {
         // Start at leftmost node.
         let first = self.find_leaf_node(0, &mut self.root.clone())?;
 
