@@ -62,7 +62,7 @@ pub trait BTreeIndex {
 }
 
 // The order of the B-tree (maximum number of children per node) Should be odd for simplicity.
-const BTREE_ORDER: usize = 5; // 248 Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
+const BTREE_ORDER: usize = 1000; // 1000 Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
 const ROOT_NODE_ADDRESS: u64 = 0; // Address of the root node in PRAM
 
 #[repr(C)] // Keep the order of values in memory
@@ -797,7 +797,7 @@ impl BTreeIndexPRAM {
             
             child.pointer.write(child.node.as_ref()).map_err(Error::UnspecifiedMemoryError)?;
 
-            if node.node.length < BTREE_ORDER / 2 {
+            if node.node.length < BTREE_ORDER / 2 && parent.is_some() {
                 // Handle underflow in internal nodes if needed
                 // This part is left unimplemented for brevity
                 let parent = parent.unwrap();
@@ -963,7 +963,7 @@ mod tests {
         } else {
             // 4 MiB total, 4 KiB pages, moderate LRU settings
             let path = temp_path(&format!("pram_test{}", id));
-            FilePersistentRandomAccessMemory::new(16 * 1024 * 1024, &path, 4 * 1024, 64, 2, 8)
+            FilePersistentRandomAccessMemory::new(16 * 1024 * 1024, &path, 16 * 1024, 256, 3, 64)
         }
     }
 
