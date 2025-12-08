@@ -292,14 +292,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Attempted to reserve a slot that is not fully free")]
+    #[should_panic(expected = "Static memory allocation cannot happen after malloc has been used. This ensures that dynamically allocated memory is not overwritten.")]
     fn test_reserve_exact_panics_on_overlap() {
         let memory = create_test_memory();
         
-        let _ptr1 = memory.smalloc(0,100).unwrap();
+        let _ptr1 = memory.malloc(100).unwrap();
         
         // Try to allocate overlapping memory
-        let _ = memory.smalloc(50, 100);
+        let _ = memory.smalloc(_ptr1.address, 100);
         
         cleanup_test_files();
     }

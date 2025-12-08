@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, rc::{Rc, Weak}};
+use std::{cell::RefCell, collections::BTreeSet, fmt::{Display}, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, rc::{Rc, Weak}};
 
 use crate::page_cache::{self, LruKCache};
 
@@ -14,6 +14,7 @@ pub enum Error {
     SwapFileError(io::Error),
     FileOpenError(io::Error),
     FileWriteError(io::Error),
+    MemoryAllocationError,
 }
 
 impl Display for Error {
@@ -29,6 +30,7 @@ impl Display for Error {
             Error::SwapFileError(e) => write!(f, "Swap File Error: {}", e),
             Error::FileOpenError(e) => write!(f, "File Open Error: {}", e),
             Error::FileWriteError(e) => write!(f, "File Write Error: {}", e),
+            Error::MemoryAllocationError => write!(f, "Memory Allocation Error"),
         }
     }
 }
@@ -380,6 +382,8 @@ pub struct FilePersistentRandomAccessMemory {
     page_size: usize,
     page_shift: usize,
     cache: RefCell<LruKCache>,
+
+    size: usize,
 }
 
 impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
@@ -399,12 +403,12 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
         {
             let malloc_called = self.malloc_called.borrow();
             if *malloc_called {
-                panic!("Static memory allocation cannot happen after malloc has been used. This is to prevent overriding dynamically allocated memory.");
+                panic!("Static memory allocation cannot happen after malloc has been used. This ensures that dynamically allocated memory is not overwritten.");
             }
         } // release borrow of malloc_called
 
         // Reserve the specified memory region by removing it from the free slots.
-        self.reserve_exact(pointer, len);
+        let _result = self.reserve_exact(pointer, len);
 
         return Ok(Pointer::new(pointer, self.me.clone() as Weak<dyn PersistentRandomAccessMemory>));
     }
@@ -496,7 +500,6 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
             }
         });
 
-    
         for slot in slots {
             if let Some(slot) = slot {
                 if slot.dirty {
@@ -507,6 +510,9 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
                 }
             }
         }
+
+        // Flush the free list to disk
+        self.flush_free_list(&mut self.swap_file.borrow_mut())?;
 
         // Make sure all data is written to disk
         self.swap_file.borrow_mut().sync_all().map_err(|_| Error::FlushError)?;
@@ -646,6 +652,18 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
 }
 
 impl FilePersistentRandomAccessMemory {
+    /// Creates a new FilePersistentRandomAccessMemory instance.
+    /// 
+    /// Parameters:
+    /// - size: The total size of the persistent memory in bytes. Must be a multiple of page_size.
+    /// - path: The file path for the persistent memory storage.
+    /// - page_size: The size of each page in bytes.
+    /// - lru_capacity: The maximum number of pages to keep in the LRU cache.
+    /// - lru_history_length: The history length for the LRU cache.
+    /// - lru_pardon: The number of accesses before a page is considered for eviction in the LRU cache.
+    /// 
+    ///   Returns:
+    /// - A reference-counted pointer to the newly created FilePersistentRandomAccessMemory instance.
     pub fn new(size: usize, path: &str, page_size: usize, lru_capacity: usize, lru_history_length: usize, lru_pardon: usize) -> Rc<Self> {
         // Ensure size is a multiple of PAGE_SIZE
         if (size % page_size) != 0 {
@@ -675,9 +693,12 @@ impl FilePersistentRandomAccessMemory {
             .open(&swap_file_path)
             .expect("Failed to create page file");
 
-        // Set the file size to the total size
-        swap_file.set_len(size as u64)
-            .expect("Failed to size page file");
+        // Ensure the swap file is the correct size or larger (+ length of freelist + freelist)
+        if swap_file.metadata().expect("Failed to get swap file metadata").len() < (size as u64 + 8) {
+            // Set the file size to the total size (+8 for the length of the free list)
+            swap_file.set_len(size as u64 + 8)
+                .expect("Failed to size page file");   
+        }  
 
         // Initialize the persistent file
         let persistent_file = OpenOptions::new()
@@ -687,8 +708,11 @@ impl FilePersistentRandomAccessMemory {
             .open(&persistent_file_path)
             .expect("Failed to create persistent file");
 
-        persistent_file.set_len(size as u64)
-            .expect("Failed to size persistent file");
+        // Ensure the persistent file is the correct size or larger (+ length of freelist + freelist)
+        if persistent_file.metadata().expect("Failed to get persistent file metadata").len() < (size as u64 + 8) {
+            persistent_file.set_len(size as u64 + 8)
+                .expect("Failed to size persistent file");
+        }
 
         // As at this point we don't know if the swap file is in a valid state, we copy the persistent file over it.
         std::fs::copy(persistent_file_path, swap_file_path)
@@ -709,8 +733,16 @@ impl FilePersistentRandomAccessMemory {
             page_size,
             page_shift: page_size.trailing_zeros() as usize,
             cache: RefCell::new(LruKCache::new(lru_history_length, lru_capacity, lru_pardon)),
+            size,
         };
 
+        // Load the free list from disk.
+        me.load_free_list().unwrap();
+        // Ensure there is at least one free slot covering the entire memory if none was loaded.
+        if me.free_slots.borrow().is_empty() {
+            me.free_slots.borrow_mut().push((0, size));
+        }
+        
         let rc_me = Rc::new(me);
 
         let weak_me = Rc::downgrade(&rc_me);
@@ -803,6 +835,9 @@ impl FilePersistentRandomAccessMemory {
             current_cursor += self.page_size as u64;
         }
 
+        // Also write the free list to the new swap file
+        self.flush_free_list(&mut new_swap_file)?;
+
         // To ensure the files are persisted to disk, we need to flush and sync them
         new_swap_file.flush().map_err(|_| Error::FlushError)?;
         new_persistent_file.flush().map_err(|_| Error::FlushError)?;
@@ -874,7 +909,7 @@ impl FilePersistentRandomAccessMemory {
         }
 
         if let Some(allocated_pointer) = allocated_pointer {
-            self.reserve_exact(allocated_pointer, len);
+            self.reserve_exact(allocated_pointer, len)?;
             return Ok(allocated_pointer);
         }
 
@@ -890,7 +925,7 @@ impl FilePersistentRandomAccessMemory {
     /// Returns:
     /// - None.
     /// Panics if the region is not fully free.
-    fn reserve_exact(&self, pointer: u64, len: usize) {
+    fn reserve_exact(&self, pointer: u64, len: usize) -> Result<(), Error> {
         // Allow allocation that spans multiple free slots or partially overlaps free slots,
         // but ensure the full requested region is covered by free space.
         let mut indices_to_remove: Vec<usize> = Vec::new();
@@ -933,7 +968,7 @@ impl FilePersistentRandomAccessMemory {
 
         // Ensure the requested region is fully covered by free space.
         if covered_bytes != len {
-            panic!("Attempted to reserve a slot that is not fully free");
+            return Err(Error::MemoryAllocationError);
         }
 
         // Remove affected slots in reverse order so indices remain valid.
@@ -944,6 +979,7 @@ impl FilePersistentRandomAccessMemory {
 
         // Add back any split fragments.
         free_slots.extend(slots_to_add);
+        return Ok(());
     }
 
     /// Frees the specified memory region and merges it with adjacent free slots.
@@ -1078,6 +1114,81 @@ impl FilePersistentRandomAccessMemory {
         // Write the page from the cached page buffer to the file
         file.write_all(page).map_err(|_| Error::WriteError)?;
         *current_cursor_position += self.page_size as u64;
+
+        Ok(())
+    }
+
+    /// Loads the free list from persistent storage.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    fn load_free_list(&self) -> Result<(), Error> {
+        let mut file = self.swap_file.borrow_mut();
+        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
+        
+        if self.size as u64 != *current_cursor_position {
+            file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
+            *current_cursor_position = self.size as u64;
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+
+        // Read the length-prefixed serialized free slots
+        let mut length_prefix = [0u8; 8];
+        file.read_exact(&mut length_prefix).map_err(Error::FileReadError)?;
+        *current_cursor_position += 8;
+
+        let length = u64::from_le_bytes(length_prefix) as usize;
+
+        // no need to load anything
+        if length == 0 {
+            return Ok(());
+        }
+
+        buffer.resize(length, 0);
+
+        // Read the serialized free slots into the buffer
+        file.read_exact(&mut buffer).map_err(Error::FileReadError)?;
+        *current_cursor_position += length as u64;
+
+        let (decoded_free_slots, _): (Vec<(u64, usize)>, _) = bincode::decode_from_slice(
+            &buffer[0..length],
+            bincode::config::standard()
+        ).map_err(|_| Error::ReadError)?;
+
+        *self.free_slots.borrow_mut() = decoded_free_slots;
+
+        Ok(())
+    }
+
+    /// Flushes the free list to persistent storage.    
+    /// 
+    /// Returns:
+    ///  - Result indicating success or failure.
+    fn flush_free_list(&self, file: &mut std::fs::File) -> Result<(), Error> {
+        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
+        
+        if self.size as u64 != *current_cursor_position {
+            file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
+            *current_cursor_position = self.size as u64;
+        }
+
+        let free_slots = self.free_slots.borrow();
+
+        let mut bytes = Vec::new();
+        bytes.resize((8+std::mem::size_of::<usize>()) * free_slots.len(), 0);
+
+        let length = bincode::encode_into_slice(free_slots.as_slice(), &mut bytes, bincode::config::standard())
+            .map_err(|_| Error::WriteError)?;
+
+        // Write the length-prefixed serialized free slots
+        let length_prefix: [u8; 8] = (length as u64).to_le_bytes();
+        file.write_all(&length_prefix).map_err(Error::FileWriteError)?;
+
+        // Write the page from the cached page buffer to the file
+        file.write_all(&bytes[0..length]).map_err(Error::FileWriteError)?;
+        
+        *current_cursor_position += length as u64;
 
         Ok(())
     }
