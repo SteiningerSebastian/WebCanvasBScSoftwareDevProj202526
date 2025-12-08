@@ -1,27 +1,20 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, BatchSize, Criterion, Throughput, black_box};
-use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory, PersistentRandomAccessMemory};
+use general::persistent_random_access_memory::PersistentRandomAccessMemory;
 use general::pram_btree_index::{ConcurrentBTreeIndexPRAM, BTreeIndex};
-use std::rc::Rc;
+// no additional imports needed
 use std::time::Duration;
 
 const PAGE_SIZE: usize = 4*1024; // to fit the set b tree node size
-const LRU_CAPACITY: usize = 64;
-const LRU_HISTORY_LENGTH: usize = 3;
-const LRU_PARDON: usize = 16;
+// LRU-related constants removed for new PRAM API
 
 fn make_index(path: &str) -> ConcurrentBTreeIndexPRAM {
 	// Allocate a modest PRAM backing file (16 MiB) matching typical page size
-	let pram = FilePersistentRandomAccessMemory::new(
+	let pram = PersistentRandomAccessMemory::new(
 		16 * 1024 * 1024,
 		path,
 		PAGE_SIZE,
-		LRU_CAPACITY,
-		LRU_HISTORY_LENGTH,
-		LRU_PARDON,
 	);
-
-	let pram_rc: Rc<dyn PersistentRandomAccessMemory> = pram;
-	ConcurrentBTreeIndexPRAM::new(pram_rc)
+	ConcurrentBTreeIndexPRAM::new(pram)
 }
 
 fn bench_btree_insert(c: &mut Criterion) {

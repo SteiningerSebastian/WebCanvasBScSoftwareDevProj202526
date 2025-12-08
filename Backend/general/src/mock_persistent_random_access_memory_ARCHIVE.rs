@@ -30,7 +30,7 @@ impl MockPRAM {
     }
 }
 
-impl PersistentRandomAccessMemory for MockPRAM {
+impl PersistentRandomAccessMemoryTrait for MockPRAM {
     fn malloc(&self, len: usize) -> Result<crate::persistent_random_access_memory::Pointer, crate::persistent_random_access_memory::Error> {
         let my_addr = unsafe {
             ADDR += 1;

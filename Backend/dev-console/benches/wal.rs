@@ -1,12 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput, BatchSize, black_box};
-use general::persistent_random_access_memory::FilePersistentRandomAccessMemory;
+use general::persistent_random_access_memory::PersistentRandomAccessMemory;
 use general::write_ahead_log::{PRAMWriteAheadLog, WriteAheadLog};
 use std::time::Duration;
 
 const PAGE_SIZE: usize = 4096; // match other benches
-const LRU_CAPACITY: usize = 64;
-const LRU_HISTORY_LENGTH: usize = 3;
-const LRU_PARDON: usize = 16;
+// LRU parameters removed in new PRAM API
 
 #[derive(Clone, Copy)]
 struct Small{ _a: u64 }
@@ -22,7 +20,7 @@ fn make_wal<T: Sized>(entries: usize, path: &str) -> PRAMWriteAheadLog<T> {
 	let data_bytes = entries * std::mem::size_of::<T>();
 	let raw = 16 + data_bytes; // head+tail+data start
 	let mem_size = align_to_page(raw.max(PAGE_SIZE));
-	let fpram = FilePersistentRandomAccessMemory::new(mem_size, path, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+	let fpram = PersistentRandomAccessMemory::new(mem_size, path, PAGE_SIZE);
 	PRAMWriteAheadLog::new(fpram, entries)
 }
 

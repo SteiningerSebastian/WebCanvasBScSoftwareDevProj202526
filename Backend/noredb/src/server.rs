@@ -1,5 +1,4 @@
 use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
-// use general::write_ahead_log::ConcurrentPRAMWriteAheadLog;
 use noredb::database_server::{Database};
 use noredb::{Data, DataRequest, DataResponse, GraveStone, Commit};
 
@@ -9,13 +8,18 @@ pub mod noredb {
 
 pub struct MyDatabase {
     config : ConcurrentFileKeyValueStore,
-    // write_ahead_log: ConcurrentPRAMWriteAheadLog<>
-}
+    // write_ahead_log: ConcurrentPRAMWriteAheadLog<Vec<u8>>,
+    // btree_index: ConcurrentBTreeIndexPRAM,
+    // data_store: Arc<Mutex<PersistentRandomAccessMemory>>,
+        }
 
 impl MyDatabase {
-    pub fn new(config: ConcurrentFileKeyValueStore) -> Self {
+    pub fn new(config: ConcurrentFileKeyValueStore, ) -> Self {
         MyDatabase {
             config,
+            // write_ahead_log,
+            // btree_index,
+            // data_store,
         }
     }
 }

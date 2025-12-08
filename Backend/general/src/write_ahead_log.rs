@@ -56,7 +56,7 @@ pub struct ConcurrentPRAMWriteAheadLog<T> where T: Sized{
 }
 
 impl<T> ConcurrentPRAMWriteAheadLog<T> where T: Sized {
-    pub fn new(pram: std::rc::Rc<dyn PersistentRandomAccessMemory>, size: usize) -> Self {
+    pub fn new(pram: Arc<PersistentRandomAccessMemory>, size: usize) -> Self {
         ConcurrentPRAMWriteAheadLog { 
             wla: Arc::new(Mutex::new(PRAMWriteAheadLog::new(pram, size))),
         }
@@ -94,8 +94,8 @@ impl<T> WriteAheadLog<T> for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
     fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
         let wla = self.wla.lock().unwrap();
 
-        let mut head: u64 = *wla.head.deref().unwrap();
-        let tail: u64 = *wla.tail.deref().unwrap();
+        let mut head: u64 = wla.head.deref().unwrap();
+        let tail: u64 = wla.tail.deref().unwrap();
 
         // Adjust head for iteration (Point to last valid entry)
         if head == 0 {
@@ -116,11 +116,11 @@ impl<T> Iterator for ConcurrentWALIterator<T> where T: Sized {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut wal = self.wal.lock().unwrap();
+        let wal = self.wal.lock().unwrap();
 
-        // Head and tail are on the same page (statically allocated), so unsafe deref is safe here (no page swap can occur and within the same page)
-        let tail = *wal.tail.unsafe_deref::<u64>().unwrap().unwrap();
-        let mut head = *wal.head.deref::<u64>().unwrap(); // As we need to NOT modify the head here, deref as safe. (Modifying head won't affect pram state)
+        // Read head and tail indices
+        let tail = wal.tail.deref().ok()?;
+        let mut head = wal.head.deref().ok()?; // read current head
 
         // Adjust head for iteration
         if head == 0 {
@@ -140,7 +140,7 @@ impl<T> Iterator for ConcurrentWALIterator<T> where T: Sized {
             }
         }
 
-        let item: T = *wal.data.deref_at::<T>(self.current_index as usize).ok()?;
+        let item: T = wal.data.at(self.current_index as usize).deref().ok()?;
 
         // Direction in which to iterate
         if self.reverse {
@@ -171,12 +171,12 @@ impl<T> Clone for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
 
 pub struct PRAMWriteAheadLog<T> where T: Sized{
     // Internal state and fields for the PRAMWriteAheadLog
-    pram: std::rc::Rc<dyn PersistentRandomAccessMemory>,
+    pram: Arc<PersistentRandomAccessMemory>,
     size: usize,
     length: usize,
-    head: Pointer,
-    tail: Pointer,
-    data: Pointer,
+    head: Pointer<u64>,
+    tail: Pointer<u64>,
+    data: Pointer<T>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -192,14 +192,14 @@ struct WALIterator<'a, T> where T: Sized {
 }
 
 impl<T> PRAMWriteAheadLog<T> where T: Sized {
-    pub fn new(pram: std::rc::Rc<dyn PersistentRandomAccessMemory>, size: usize) -> Self {
+    pub fn new(pram: Arc<PersistentRandomAccessMemory>, size: usize) -> Self {
         // Allocate space for head and tail pointers
         // Assuming head and tail are stored at the beginning of the allocated space
-        let head = pram.smalloc(HEAD_OFFSET, std::mem::size_of::<u64>()).unwrap();
-        let tail = pram.smalloc(TAIL_OFFSET, std::mem::size_of::<u64>()).unwrap();
+        let head: Pointer<u64> = pram.smalloc::<u64>(HEAD_OFFSET, 8).unwrap();
+        let tail: Pointer<u64> = pram.smalloc::<u64>(TAIL_OFFSET, 8).unwrap();
         
         // Allocate the data array, an array of T with the given size
-        let data = pram.smalloc(DATA_OFFSET, size * std::mem::size_of::<T>()).unwrap();
+        let data = pram.smalloc::<T>(DATA_OFFSET, size * std::mem::size_of::<T>()).unwrap();
         PRAMWriteAheadLog { 
             pram,
             size,
@@ -219,24 +219,18 @@ impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
             return Err(Error::OutOfMemory);
         }
 
-        // UNSAFE block to dereference the head pointer
-
-        // It is known that this is not None as we allocated the head pointer statically in new()
-        let head_index = self.head.unsafe_deref_mut::<u64>().map_err(|_| Error::AppendFailed)?.unwrap();
-        
-        // Store previous head index before updating
-        let prev_head_index = *head_index;
-
+        // Read current head index
+        let current_head = self.head.deref().map_err(|_| Error::AppendFailed)?;
+        let prev_head_index = current_head;
+        let new_head = (current_head + 1) % self.size as u64;
         // Update head index and length
-        *head_index = (*head_index + 1) % self.size as u64;
+        self.head.set(&new_head).map_err(|_| Error::AppendFailed)?;
 
         // Here the page may be swapped out when we access the data pointer
         // So we do this after updating the head index
 
         // Write the entry at the head position
-        self.data.at::<T>(prev_head_index as usize).write(entry).map_err(|_| Error::AppendFailed)?;
-
-        // END UNSAFE block
+        self.data.at(prev_head_index as usize).set(entry).map_err(|_| Error::AppendFailed)?;
 
         self.length += 1;
 
@@ -252,11 +246,10 @@ impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
             return Err(Error::PeakFailed);
         }
 
-        // Need mutable here as we may need to swap pages in/out
-        let tail = self.tail.unsafe_deref::<u64>().map_err(|_| Error::AppendFailed)?.unwrap();
-
-        let entry = self.data.deref_at::<T>(*tail as usize).map_err(|_| Error::AppendFailed)?;
-        Ok(*entry)
+        // Read tail index
+        let tail = self.tail.deref().map_err(|_| Error::AppendFailed)?;
+        let entry = self.data.at(tail as usize).deref().map_err(|_| Error::AppendFailed)?;
+        Ok(entry)
     }
 
     fn pop(&mut self) -> Result<T, Error> {
@@ -265,23 +258,20 @@ impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
             return Err(Error::PopFailed);
         }
 
-        // UNSAFE block to dereference the tail pointer
-        let tail = self.tail.unsafe_deref_mut::<u64>().map_err(|_| Error::AppendFailed)?.unwrap();
-        *tail = (*tail + 1) % self.size as u64;
-        
-        // Here the page may be swapped out when we access the data pointer
-        // So we do this after updating the tail index
-        let entry = self.data.deref_at::<T>(*tail as usize).map_err(|_| Error::AppendFailed)?;
-        // END UNSAFE block
+        // Read tail, fetch entry, then advance tail
+        let tail_val = self.tail.deref().map_err(|_| Error::AppendFailed)?;
+        let entry = self.data.at(tail_val as usize).deref().map_err(|_| Error::AppendFailed)?;
+        let new_tail = (tail_val + 1) % self.size as u64;
+        self.tail.set(&new_tail).map_err(|_| Error::AppendFailed)?;
 
         self.length -= 1;
         
-        Ok(*entry)
+        Ok(entry)
     }
 
     fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
-        let mut head: u64 = *self.head.deref().unwrap();
-        let tail: u64 = *self.tail.deref().unwrap();
+        let mut head: u64 = self.head.deref().unwrap();
+        let tail: u64 = self.tail.deref().unwrap();
 
         // Adjust head for iteration (Point to last valid entry)
         if head == 0 {
@@ -302,11 +292,9 @@ impl<T> Iterator for WALIterator<'_, T> where T: Sized {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Begin UNSAFE block
-
-        // Head and tail are on the same page (statically allocated), so unsafe deref is safe here (no page swap can occur and within the same page)
-        let tail = *self.wal.tail.unsafe_deref::<u64>().unwrap().unwrap();
-        let mut head = *self.wal.head.deref::<u64>().unwrap(); // As we need to NOT modify the head here, deref as safe. (Modifying head won't affect pram state)
+        // Read indices
+        let tail = self.wal.tail.deref().ok()?;
+        let mut head = self.wal.head.deref().ok()?; // read current head
 
         // Adjust head for iteration
         if head == 0 {
@@ -325,9 +313,7 @@ impl<T> Iterator for WALIterator<'_, T> where T: Sized {
                 return None;
             }
         }
-        // END UNSAFE block
-
-        let item: T = *self.wal.data.deref_at::<T>(self.current_index as usize).ok()?;
+        let item: T = self.wal.data.at(self.current_index as usize).deref().ok()?;
 
         // Direction in which to iterate
         if self.reverse {
@@ -356,70 +342,18 @@ mod tests {
     use super::*;
 
     // Simple in-memory implementation of PersistentRandomAccessMemory for testing.
-    use std::cell::RefCell;
-    use std::rc::{Rc, Weak};
-
-    struct InMemoryPRAM {
-        mem: RefCell<Vec<u8>>,
-        me: Weak<InMemoryPRAM>,
-    }
-
-    impl InMemoryPRAM {
-        fn new(capacity: usize) -> Rc<Self> {
-            let rc = Rc::new_cyclic(|weak| InMemoryPRAM { mem: RefCell::new(vec![0u8; capacity]), me: weak.clone() });
-            rc
-        }
-        fn ensure(&self, end: usize) { let mut mem = self.mem.borrow_mut(); if end > mem.len() { mem.resize(end, 0); } }
-    }
-
-    impl PersistentRandomAccessMemory for InMemoryPRAM {
-        fn malloc(&self, _len: usize) -> Result<Pointer, persistent_random_access_memory::Error> { Err(persistent_random_access_memory::Error::OutOfMemoryError) }
-        fn smalloc(&self, pointer: u64, len: usize) -> Result<Pointer, persistent_random_access_memory::Error> {
-            self.ensure(pointer as usize + len);
-            Ok(Pointer::new(pointer, self.me.clone() as Weak<dyn PersistentRandomAccessMemory>))
-        }
-        fn free(&self, _pointer: Pointer, _len: usize) -> Result<(), persistent_random_access_memory::Error> { Ok(()) }
-        fn persist(&self) -> Result<(), persistent_random_access_memory::Error> { Ok(()) }
-        fn read(&self, pointer: u64, buf: &mut [u8]) -> Result<(), persistent_random_access_memory::Error> {
-            let mem = self.mem.borrow();
-            let start = pointer as usize; let end = start + buf.len();
-            if end > mem.len() { return Err(persistent_random_access_memory::Error::ReadError); }
-            buf.copy_from_slice(&mem[start..end]); Ok(())
-        }
-        fn unsafe_read(&self, pointer: u64, len: usize) -> Result<&[u8], persistent_random_access_memory::Error> {
-            let start = pointer as usize; let end = start + len;
-            {
-                let mem = self.mem.borrow();
-                if end > mem.len() { return Err(persistent_random_access_memory::Error::ReadError); }
-                let _base = mem.as_ptr();
-                // drop borrow before creating slice with static lifetime
-            }
-            unsafe { Ok(std::slice::from_raw_parts(self.mem.borrow().as_ptr().add(start), len)) }
-        }
-        fn unsafe_read_mut(&self, pointer: u64, len: usize) -> Result<&mut [u8], persistent_random_access_memory::Error> {
-            let start = pointer as usize; let end = start + len;
-            {
-                let mem = self.mem.borrow();
-                if end > mem.len() { return Err(persistent_random_access_memory::Error::ReadError); }
-            }
-            // Create mutable slice unsafely (test-only)
-            unsafe { Ok(std::slice::from_raw_parts_mut(self.mem.borrow_mut().as_ptr().add(start) as *mut u8, len)) }
-        }
-        fn write(&self, pointer: u64, buf: &[u8]) -> Result<(), persistent_random_access_memory::Error> {
-            let mut mem = self.mem.borrow_mut();
-            let start = pointer as usize; let end = start + buf.len();
-            if end > mem.len() { return Err(persistent_random_access_memory::Error::WriteError); }
-            mem[start..end].copy_from_slice(buf); Ok(())
-        }
-    }
+    // no additional imports needed
 
     // Helper to construct WAL with generic T and given size using Rc for Weak pointer expectations.
     fn new_wal<T: Sized>(size: usize) -> PRAMWriteAheadLog<T> {
         // Compute memory needed: head (8) + tail (8) + data
         let data_bytes = size * std::mem::size_of::<T>();
         let total = (DATA_OFFSET as usize) + data_bytes;
-        let pram = InMemoryPRAM::new(total);
-        let wal = PRAMWriteAheadLog::<T>::new(pram as Rc<dyn PersistentRandomAccessMemory>, size);
+        // Round up to page size (4096)
+        let page = 4096usize;
+        let alloc = ((total + page - 1) / page) * page;
+        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal.ignore", page);
+        let wal = PRAMWriteAheadLog::<T>::new(pram, size);
         wal
     }
 
@@ -498,8 +432,10 @@ mod tests {
     fn new_concurrent_wal<T: Sized>(size: usize) -> ConcurrentPRAMWriteAheadLog<T> {
         let data_bytes = size * std::mem::size_of::<T>();
         let total = (DATA_OFFSET as usize) + data_bytes;
-        let pram = InMemoryPRAM::new(total);
-        ConcurrentPRAMWriteAheadLog::new(pram as Rc<dyn PersistentRandomAccessMemory>, size)
+        let page = 4096usize;
+        let alloc = ((total + page - 1) / page) * page;
+        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal_concurrent.ignore", page);
+        ConcurrentPRAMWriteAheadLog::new(pram, size)
     }
 
     #[test]

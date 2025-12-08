@@ -1,11 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::time::Duration;
-use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory, PersistentRandomAccessMemory};
+use general::persistent_random_access_memory::PersistentRandomAccessMemory;
 
 const PAGE_SIZE: usize = 4096; // For benchmarks: 4KiB normally 64KiB
-const LRU_CAPACITY: usize = 64; // number of pages in LRU cache
-const LRU_HISTORY_LENGTH: usize = 3; // K value for LRU-K
-const LRU_PARDON: usize = 16; // pardon value for LRU-K
+// LRU-related constants removed for new API
 
 // Simple pseudo-random number generator for reproducible tests
 struct SimpleRandom {
@@ -37,21 +35,21 @@ fn bench_malloc_free(c: &mut Criterion) {
                     let dir = tempfile::tempdir().expect("tempdir");
                     let path = dir.path().join("f.ignore.pram");
                     let path_str = path.to_string_lossy().to_string();
-                    let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                    let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                     (dir, fpram, alloc_size)
                 },
                 |(dir, fpram, alloc_size)| {
                     let _keep_dir = dir; // ensure directory outlives fpram during this run
                     let mut ptrs = Vec::with_capacity(ALLOCS_PER_SAMPLE);
                     for _ in 0..ALLOCS_PER_SAMPLE {
-                        if let Ok(p) = fpram.malloc(alloc_size) {
+                        if let Ok(p) = fpram.malloc::<u8>(alloc_size) {
                             ptrs.push(p);
                         } else {
                             break;
                         }
                     }
                     for p in ptrs.into_iter().rev() {
-                        let _ = fpram.free(p, alloc_size);
+                        let _ = fpram.free(p.address, alloc_size);
                     }
                     black_box(());
                 },
@@ -77,14 +75,14 @@ fn bench_salloc(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                 (dir, fpram)
             },
             |(dir, fpram)| {
                 let _keep_dir = dir;
                 for i in 0..OPS_PER_SAMPLE {
                     let pointer = (i * SALLOC_SIZE) as u64;
-                    let _ = fpram.smalloc(pointer, SALLOC_SIZE).expect("salloc");
+                    let _ = fpram.smalloc::<u8>(pointer, SALLOC_SIZE).expect("salloc");
                     // p.write(&0u64).expect("write"); // optional write to touch page
                 }
                 black_box(());
@@ -111,10 +109,10 @@ fn bench_random_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
-                    let p = fpram.malloc(std::mem::size_of::<u64>()).expect("malloc");
+                    let p = fpram.malloc::<u64>(std::mem::size_of::<u64>()).expect("malloc");
                     ptrs.push(p);
                 }
                 (dir, fpram, ptrs)
@@ -125,7 +123,7 @@ fn bench_random_access(c: &mut Criterion) {
                 for _ in 0..OPS_PER_SAMPLE {
                     let idx = (rng.next() as usize) % ptrs.len();
                     let val: u64 = rng.next();
-                    ptrs[idx].write(&val).expect("write");
+                    ptrs[idx].set(&val).expect("write");
                 }
                 // keep fpram alive
                 black_box((&mut fpram, &mut ptrs));
@@ -141,12 +139,12 @@ fn bench_random_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
-                    let mut p = fpram.malloc(std::mem::size_of::<u64>()).expect("malloc");
+                    let mut p = fpram.malloc::<u64>(std::mem::size_of::<u64>()).expect("malloc");
                     // init to make sure pages exist
-                    p.write(&0u64).expect("init");
+                    p.set(&0u64).expect("init");
                     ptrs.push(p);
                 }
                 (dir, fpram, ptrs)
@@ -157,8 +155,8 @@ fn bench_random_access(c: &mut Criterion) {
                 let mut sum = 0u64;
                 for _ in 0..OPS_PER_SAMPLE {
                     let idx = (rng.next() as usize) % ptrs.len();
-                    let v: Box<u64> = ptrs[idx].deref().expect("read");
-                    sum = sum.wrapping_add(*v);
+                    let v: u64 = ptrs[idx].deref().expect("read");
+                    sum = sum.wrapping_add(v);
                 }
                 black_box(sum);
                 black_box(&mut fpram);
@@ -185,9 +183,9 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                 let array = fpram
-                    .malloc(ELEMENTS * std::mem::size_of::<u64>())
+                    .malloc::<u64>(ELEMENTS * std::mem::size_of::<u64>())
                     .expect("malloc array");
                 (dir, fpram, array)
             },
@@ -195,9 +193,9 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let _keep_dir = dir;
                 for i in 0..OPS_PER_SAMPLE {
                     let idx = i % ELEMENTS;
-                    let mut elem = array.at::<u64>(idx);
+                    let mut elem = array.at(idx);
                     let v = i as u64;
-                    elem.write(&v).expect("seq write");
+                    elem.set(&v).expect("seq write");
                 }
                 black_box(&mut fpram);
             },
@@ -212,12 +210,12 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                 let array = fpram
-                    .malloc(ELEMENTS * std::mem::size_of::<u64>())
+                    .malloc::<u64>(ELEMENTS * std::mem::size_of::<u64>())
                     .expect("malloc array");
                 for i in 0..OPS_PER_SAMPLE {
-                    array.at::<u64>(i % ELEMENTS).write(&0u64).expect("init");
+                    array.at(i % ELEMENTS).set(&0u64).expect("init");
                 }
                 (dir, fpram, array)
             },
@@ -226,8 +224,8 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let mut sum = 0u64;
                 for i in 0..OPS_PER_SAMPLE {
                     let idx = i % ELEMENTS;
-                    let v: Box<u64> = array.at::<u64>(idx).deref().expect("seq read");
-                    sum = sum.wrapping_add(*v);
+                    let v: u64 = array.at(idx).deref().expect("seq read");
+                    sum = sum.wrapping_add(v);
                 }
                 black_box(sum);
                 black_box(&mut fpram);
@@ -258,16 +256,16 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = FilePersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE, LRU_CAPACITY, LRU_HISTORY_LENGTH, LRU_PARDON);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
                 let hot = fpram.malloc(HOT_LEN * ELEMENT_SIZE).expect("hot alloc");
                 let rh = fpram.malloc(READ_HEAVY_LEN * ELEMENT_SIZE).expect("rh alloc");
                 let wh = fpram.malloc(WRITE_HEAVY_LEN * ELEMENT_SIZE).expect("wh alloc");
                 let cold = fpram.malloc(COLD_LEN * ELEMENT_SIZE).expect("cold alloc");
                 // init small portions to touch pages
-                for i in 0..HOT_LEN { hot.at::<u64>(i).write(&0).expect("init hot"); }
-                for i in 0..READ_HEAVY_LEN { rh.at::<u64>(i).write(&0).expect("init rh"); }
-                for i in 0..WRITE_HEAVY_LEN { wh.at::<u64>(i).write(&0).expect("init wh"); }
-                for i in 0..COLD_LEN { cold.at::<u64>(i).write(&0).expect("init cold"); }
+                for i in 0..HOT_LEN { hot.at(i).set(&0u64).expect("init hot"); }
+                for i in 0..READ_HEAVY_LEN { rh.at(i).set(&0u64).expect("init rh"); }
+                for i in 0..WRITE_HEAVY_LEN { wh.at(i).set(&0u64).expect("init wh"); }
+                for i in 0..COLD_LEN { cold.at(i).set(&0u64).expect("init cold"); }
                 (dir, fpram, hot, rh, wh, cold)
             },
             |(dir, mut fpram, hot, rh, wh, cold)| {
@@ -275,44 +273,44 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                 for i in 0..ITERS {
                     // HOT: frequent read-write (+1)
                     let idx = i % HOT_LEN;
-                    let mut p = hot.at::<u64>(idx);
-                    let v = *p.deref::<u64>().expect("hot rd");
-                    p.write(&(v + 1)).expect("hot wr");
+                    let mut p = hot.at(idx);
+                    let v: u64 = p.deref().expect("hot rd");
+                    p.set(&(v + 1)).expect("hot wr");
 
                     // READ-HEAVY: 3 reads, occasional write every 16
                     let r1 = i % READ_HEAVY_LEN;
                     let r2 = (i.wrapping_mul(7)) % READ_HEAVY_LEN;
                     let r3 = (i.wrapping_mul(13)) % READ_HEAVY_LEN;
-                    let _ = rh.at::<u64>(r1).deref::<u64>().expect("rh rd1");
-                    let _ = rh.at::<u64>(r2).deref::<u64>().expect("rh rd2");
-                    let _ = rh.at::<u64>(r3).deref::<u64>().expect("rh rd3");
+                    let _ = rh.at(r1).deref().expect("rh rd1");
+                    let _ = rh.at(r2).deref().expect("rh rd2");
+                    let _ = rh.at(r3).deref().expect("rh rd3");
                     if (i & 0xF) == 0 {
-                        let mut p = rh.at::<u64>(r1);
-                        let v = *p.deref::<u64>().expect("rh wr rd");
-                        p.write(&(v + 1)).expect("rh wr");
+                        let mut p = rh.at(r1);
+                        let v: u64 = p.deref().expect("rh wr rd");
+                        p.set(&(v + 1)).expect("rh wr");
                     }
 
                     // WRITE-HEAVY: two writes per iter, rare reads
                     let w1 = i % WRITE_HEAVY_LEN;
                     let w2 = (i.wrapping_mul(3)) % WRITE_HEAVY_LEN;
-                    let mut p1 = wh.at::<u64>(w1);
-                    let v1 = *p1.deref::<u64>().expect("wh rd1");
-                    p1.write(&(v1 + 1)).expect("wh wr1");
-                    let mut p2 = wh.at::<u64>(w2);
-                    let v2 = *p2.deref::<u64>().expect("wh rd2");
-                    p2.write(&(v2 + 1)).expect("wh wr2");
+                    let mut p1 = wh.at(w1);
+                    let v1: u64 = p1.deref().expect("wh rd1");
+                    p1.set(&(v1 + 1)).expect("wh wr1");
+                    let mut p2 = wh.at(w2);
+                    let v2: u64 = p2.deref().expect("wh rd2");
+                    p2.set(&(v2 + 1)).expect("wh wr2");
                     if (i & 0x1F) == 0 {
-                        let _ = p1.deref::<u64>().expect("wh occasional rd");
+                        let _ = p1.deref().expect("wh occasional rd");
                     }
 
                     // COLD: rare write (every 128), else read
                     let c = i % COLD_LEN;
                     if (i & 0x7F) == 0 {
-                        let mut p = cold.at::<u64>(c);
-                        let v = *p.deref::<u64>().expect("cold rd");
-                        p.write(&(v + 1)).expect("cold wr");
+                        let mut p = cold.at(c);
+                        let v: u64 = p.deref().expect("cold rd");
+                        p.set(&(v + 1)).expect("cold wr");
                     } else {
-                        let _ = cold.at::<u64>(c).deref::<u64>().expect("cold read");
+                        let _ = cold.at(c).deref().expect("cold read");
                     }
                 }
                 black_box(&mut fpram);

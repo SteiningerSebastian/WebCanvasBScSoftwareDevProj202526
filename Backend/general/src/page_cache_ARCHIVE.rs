@@ -7,12 +7,14 @@ const INF_SCORE: u64 = u64::MAX / 4;
 #[derive(Debug)]
 pub enum Error {
     NoEvictableSlot,
+    SlotNotFound,
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NoEvictableSlot => write!(f, "No Evictable Slot Available"),
+            Error::SlotNotFound => write!(f, "Slot Not Found"),
         }
     }
 }
@@ -208,6 +210,24 @@ impl LruKCache {
         None
     }
 
+    /// Peak at a page's data.
+    ///
+    /// Parameters:
+    /// - `page_index`: The index of the page to peak at
+    /// 
+    /// Returns:
+    /// - `Option<&Vec<u8>>`: Some(&Vec<u8>) if found, None otherwise
+    pub fn peak_page(&mut self, page_index: usize) -> Option<&Vec<u8>> {
+        if let Some(&slot_id) = self.page_map.get(&page_index) {
+            self.touch(slot_id);
+            let slot = self.slots[slot_id].as_ref();
+            if let Some(s) = slot {
+                return s.data.as_ref();
+            }
+        }
+        None
+    }
+
     /// Check pardoned slots to see if any can be reinserted into the eviction heap
     #[inline]
     fn check_pardons(&mut self) {
@@ -324,8 +344,23 @@ impl LruKCache {
         None
     }
 
+    /// Mark a slot as clean (not dirty)
+    pub fn marke_slot_as_clean(&'_ mut self, page_index: usize) -> Result<(), Error> {
+        if let Some(&slot_id) = self.page_map.get(&page_index) {
+            let slot = self.slots[slot_id].as_mut().unwrap();
+            slot.dirty = false;
+            Ok(())
+        } else {
+            Err(Error::SlotNotFound)
+        }
+    }
+
     pub fn iter_mut(&'_ mut  self) -> IterMut<'_, Option<Slot>> {
        self.slots.iter_mut()
+    }
+
+    pub fn iter(&'_ self) -> std::slice::Iter<'_, Option<Slot>> {
+       self.slots.iter()
     }
 }
 
