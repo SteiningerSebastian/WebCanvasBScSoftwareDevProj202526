@@ -34,14 +34,14 @@ impl Display for Error {
 }
 
 pub struct Pointer {
-    pub pointer: u64,
+    pub address: u64,
     memory: Weak<dyn PersistentRandomAccessMemory>,
 }
 
 impl Clone for Pointer {
     fn clone(&self) -> Self {
         Self {
-            pointer: self.pointer,
+            address: self.address,
             memory: self.memory.clone(),
         }
     }
@@ -61,7 +61,7 @@ impl Pointer {
     /// Returns:
     /// - A new Pointer instance.
     pub fn new(pointer: u64, memory: Weak<dyn PersistentRandomAccessMemory>) -> Self {
-        Self { pointer, memory }
+        Self { address: pointer, memory }
     }
 
     /// Creates a Pointer from a given address and memory manager.
@@ -76,7 +76,7 @@ impl Pointer {
     /// Warning: The memory manager must outlive the Pointer instance to avoid dangling references.
     /// Also this will not allocate new memory (mark space as used) to allocate new use salloc on the memory.
     pub fn from_address(pointer: u64, memory: Rc<dyn PersistentRandomAccessMemory>) -> Self {
-        Self { pointer, memory: Rc::downgrade(&memory) }
+        Self { address: pointer, memory: Rc::downgrade(&memory) }
     }
 
     /// Dereferences the pointer to get a reference to the value of type T.
@@ -94,11 +94,11 @@ impl Pointer {
     /// while the reference is in use.
     pub fn unsafe_deref<T>(&mut self) -> Result<Option<&T>, Error> {
         // Reject misaligned access to prevent UB on &T
-        if (self.pointer as usize) % std::mem::align_of::<T>() != 0 {
+        if (self.address as usize) % std::mem::align_of::<T>() != 0 {
             return Ok(None);
         }
         unsafe {
-            let res = (*self.memory.as_ptr()).unsafe_read(self.pointer, std::mem::size_of::<T>()).map(|data| {
+            let res = (*self.memory.as_ptr()).unsafe_read(self.address, std::mem::size_of::<T>()).map(|data| {
                 if data.len() == std::mem::size_of::<T>() {
                     let ptr = data.as_ptr() as *const T;
                     Some(&*ptr)
@@ -133,11 +133,11 @@ impl Pointer {
     /// while the mutable reference is in use.
     pub fn unsafe_deref_mut<T>(&mut self) -> Result<Option<&mut T>, Error> where T: Sized {
         // Reject misaligned access to prevent UB on &mut T
-        if (self.pointer as usize) % std::mem::align_of::<T>() != 0 {
+        if (self.address as usize) % std::mem::align_of::<T>() != 0 {
             return Ok(None);
         }
         unsafe {
-            let res = (*self.memory.as_ptr()).unsafe_read_mut(self.pointer, std::mem::size_of::<T>()).map(|data| {
+            let res = (*self.memory.as_ptr()).unsafe_read_mut(self.address, std::mem::size_of::<T>()).map(|data| {
                 if data.len() == std::mem::size_of::<T>() {
                     let ptr = data.as_ptr() as *mut T;
                     Some(&mut *ptr)
@@ -172,7 +172,7 @@ impl Pointer {
                 value.as_mut_ptr() as *mut u8,
                 std::mem::size_of::<T>(),
             );
-            (*self.memory.as_ptr()).read(self.pointer, buf)?;
+            (*self.memory.as_ptr()).read(self.address, buf)?;
             Ok(Box::new(value.assume_init()))
         }
     }
@@ -186,7 +186,7 @@ impl Pointer {
     /// - Result containing the byte vector on success or Error on failure.
     pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         unsafe {
-            (*self.memory.as_ptr()).read(self.pointer, buf)?;
+            (*self.memory.as_ptr()).read(self.address, buf)?;
         }
         Ok(())
     }
@@ -205,7 +205,7 @@ impl Pointer {
                 std::mem::size_of::<T>(),
             );
         
-            (*self.memory.as_ptr()).write(self.pointer, slice)?;
+            (*self.memory.as_ptr()).write(self.address, slice)?;
         };
         Ok(())
     }
@@ -219,7 +219,7 @@ impl Pointer {
     /// - Result indicating success or failure.
     pub fn write_exact(&mut self, buf: &[u8]) -> Result<(), Error> {
         unsafe {
-            (*self.memory.as_ptr()).write(self.pointer, buf)?;
+            (*self.memory.as_ptr()).write(self.address, buf)?;
         };
         Ok(())
     }
@@ -234,7 +234,7 @@ impl Pointer {
     /// - A new Pointer offset by the given index.
     pub fn at<T>(&self, index: usize) -> Pointer where T: Sized {
         let offset = (index * std::mem::size_of::<T>()) as u64;
-        Pointer::new(self.pointer + offset, self.memory.clone())
+        Pointer::new(self.address + offset, self.memory.clone())
     }
 
     /// Dereferences the pointer at the given index to get a value of type T.
@@ -256,7 +256,7 @@ impl Pointer {
                 std::mem::size_of::<T>(),
             );
             let offset = (index * std::mem::size_of::<T>()) as u64;
-            (*self.memory.as_ptr()).read(self.pointer + offset, buf)?;
+            (*self.memory.as_ptr()).read(self.address + offset, buf)?;
             Ok(Box::new(value.assume_init()))
         }
     }   
@@ -451,7 +451,7 @@ impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
     /// - Result indicating success or failure.
     fn free(&self, pointer: Pointer, len: usize) -> Result<(), Error> {
         // Free the specified memory region and merge it with adjacent free slots.
-        self.free_and_merge(pointer.pointer, len);
+        self.free_and_merge(pointer.address, len);
         Ok(())
     }
 

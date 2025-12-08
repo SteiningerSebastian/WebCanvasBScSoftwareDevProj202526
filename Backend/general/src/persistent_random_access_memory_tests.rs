@@ -145,12 +145,12 @@ mod tests {
         let memory = create_test_memory();
         
         let ptr1 = memory.malloc(64).unwrap();
-        let ptr1_addr = ptr1.pointer;
+        let ptr1_addr = ptr1.address;
         
         memory.free(ptr1, 64).unwrap();
         
         let ptr2 = memory.malloc(64).unwrap();
-        assert_eq!(ptr2.pointer, ptr1_addr); // Should reuse the freed space
+        assert_eq!(ptr2.address, ptr1_addr); // Should reuse the freed space
         
         cleanup_test_files();
     }
@@ -169,7 +169,7 @@ mod tests {
         
         // After freeing all three adjacent blocks, we should be able to allocate 192 bytes
         let large_ptr = memory.malloc(192).unwrap();
-        assert!(large_ptr.pointer == 0); // Should start at the beginning
+        assert!(large_ptr.address == 0); // Should start at the beginning
         
         cleanup_test_files();
     }
@@ -261,12 +261,12 @@ mod tests {
         // Allocate a large block that leaves a small gap before the page boundary
         let page_size = PAGE_SIZE;
         let ptr1 = memory.malloc(page_size - 100).unwrap();
-        assert_eq!(ptr1.pointer, 0);
+        assert_eq!(ptr1.address, 0);
         
         // Next allocation should skip the 100-byte gap and start at the next page
         // to ensure the allocation fits within a single page
         let ptr2 = memory.malloc(128).unwrap();
-        assert_eq!(ptr2.pointer, page_size as u64);
+        assert_eq!(ptr2.address, page_size as u64);
         
         cleanup_test_files();
     }
@@ -321,11 +321,11 @@ mod tests {
         let slice = unsafe {
             std::slice::from_raw_parts(test_data.as_ptr(), data_size)
         };
-        memory.write(ptr.pointer, slice).unwrap();
+        memory.write(ptr.address, slice).unwrap();
         
         // Read back
         let mut read_buffer = vec![0u8; data_size];
-        memory.read(ptr.pointer, &mut read_buffer).unwrap();
+        memory.read(ptr.address, &mut read_buffer).unwrap();
         
         assert_eq!(test_data, read_buffer);
         
@@ -414,7 +414,7 @@ mod tests {
         // Verify free_slots are sorted by checking allocation order
         let new_ptr1 = memory.malloc(50).unwrap();
         let new_ptr2 = memory.malloc(50).unwrap();
-        assert!(new_ptr1.pointer < new_ptr2.pointer);
+        assert!(new_ptr1.address < new_ptr2.address);
         
         cleanup_test_files();
     }
@@ -629,7 +629,7 @@ mod tests {
         
         // Allocate smaller block - should fill the gap
         let p4 = memory.malloc(50).unwrap();
-        assert_eq!(p4.pointer, p2.pointer);
+        assert_eq!(p4.address, p2.address);
         
         cleanup_test_files();
     }
