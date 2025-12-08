@@ -4,7 +4,7 @@ use general::pram_btree_index::{ConcurrentBTreeIndexPRAM, BTreeIndex};
 use std::rc::Rc;
 use std::time::Duration;
 
-const PAGE_SIZE: usize = 16*1024; // to fit the set b tree node size
+const PAGE_SIZE: usize = 4*1024; // to fit the set b tree node size
 const LRU_CAPACITY: usize = 64;
 const LRU_HISTORY_LENGTH: usize = 3;
 const LRU_PARDON: usize = 16;

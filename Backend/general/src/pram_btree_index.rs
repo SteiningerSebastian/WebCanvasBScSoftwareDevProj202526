@@ -62,7 +62,7 @@ pub trait BTreeIndex {
 }
 
 // The order of the B-tree (maximum number of children per node) Should be odd for simplicity.
-const BTREE_ORDER: usize = 1000; // 1000 - Assuming 16kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
+const BTREE_ORDER: usize = 255; // 255 - Assuming 4kb pages and u64 (8 bytes) for keys and values (16 bytes total per entry) + some overhead for length, is_leaf and padding
 const ROOT_NODE_ADDRESS: u64 = 0; // Address of the root node in PRAM
 
 #[repr(C)] // Keep the order of values in memory
