@@ -9,6 +9,7 @@ mod tests {
 
     const TEST_SIZE: usize = 16384; // 4 pages
     const PAGE_SIZE: usize = 4096;
+
     // Use unique temp file paths per test to allow parallel runs
     fn unique_test_path(suffix: &str) -> String {
         let tmp = std::env::temp_dir();
@@ -30,7 +31,7 @@ mod tests {
     fn create_test_memory() -> Arc<PersistentRandomAccessMemory> {
         let path = unique_test_path("general");
         cleanup_test_files(&path);
-        PersistentRandomAccessMemory::new(TEST_SIZE, &path, PAGE_SIZE)
+        PersistentRandomAccessMemory::new(TEST_SIZE, &path)
     }
 
     #[test]
@@ -43,7 +44,7 @@ mod tests {
     #[should_panic(expected = "Size must be a multiple of PAGE_SIZE (4096 bytes) -> Default for most OSes")]
     fn test_new_panics_on_invalid_size() {
         let path = unique_test_path("invalid_size");
-        PersistentRandomAccessMemory::new(100, &path, PAGE_SIZE);
+        PersistentRandomAccessMemory::new(100, &path);
     }
 
     #[test]
@@ -210,14 +211,13 @@ mod tests {
         let memory = create_test_memory();
         
         // Allocate a large block that leaves a small gap before the page boundary
-        let page_size = PAGE_SIZE;
-        let ptr1 = memory.malloc::<u8>(page_size - 100).unwrap();
+        let ptr1 = memory.malloc::<u8>(PAGE_SIZE - 100).unwrap();
         assert_eq!(ptr1.address, 0);
         
         // Next allocation should skip the 100-byte gap and start at the next page
         // to ensure the allocation fits within a single page
         let ptr2 = memory.malloc::<u8>(128).unwrap();
-        assert_eq!(ptr2.address, page_size as u64);
+        assert_eq!(ptr2.address, PAGE_SIZE as u64);
         
         // unique temp files; no shared cleanup needed
     }
@@ -548,7 +548,7 @@ mod tests {
         // Use the same path for reopen to validate persistence properly
         let path = unique_test_path("persist_twice");
         cleanup_test_files(&path);
-        let memory = PersistentRandomAccessMemory::new(TEST_SIZE, &path, PAGE_SIZE);
+        let memory = PersistentRandomAccessMemory::new(TEST_SIZE, &path);
         let page_size =  PAGE_SIZE as u64;
 
         // Place four u64s on distinct pages
@@ -596,7 +596,7 @@ mod tests {
         drop(memory);
 
         // Reopen the SAME path and verify second set of values survived
-        let memory2 = PersistentRandomAccessMemory::new(TEST_SIZE, &path, PAGE_SIZE);
+        let memory2 = PersistentRandomAccessMemory::new(TEST_SIZE, &path);
         let p0r = Pointer::<u64>::from_address(0, memory2.clone());
         let p1r = Pointer::<u64>::from_address(page_size -1, memory2.clone());
         let p2r = Pointer::<u64>::from_address(page_size * 2 -2, memory2.clone());

@@ -1117,7 +1117,7 @@ mod tests {
     fn make_pram(id: &str) -> Arc<PersistentRandomAccessMemory> {
         // 4 MiB total, 4 KiB pages, moderate LRU settings
         let path = temp_path(&format!("pram_test{}", id));
-        PersistentRandomAccessMemory::new(16 * 1024 * 1024, &path, 16 * 1024)
+        PersistentRandomAccessMemory::new(16 * 1024 * 1024, &path)
     }
 
     fn new_index(id: &str) -> ConcurrentBTreeIndexPRAM {

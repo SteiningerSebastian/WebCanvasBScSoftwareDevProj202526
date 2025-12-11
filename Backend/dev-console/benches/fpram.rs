@@ -35,7 +35,7 @@ fn bench_malloc_free(c: &mut Criterion) {
                     let dir = tempfile::tempdir().expect("tempdir");
                     let path = dir.path().join("f.ignore.pram");
                     let path_str = path.to_string_lossy().to_string();
-                    let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                    let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                     (dir, fpram, alloc_size)
                 },
                 |(dir, fpram, alloc_size)| {
@@ -75,7 +75,7 @@ fn bench_salloc(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 (dir, fpram)
             },
             |(dir, fpram)| {
@@ -109,7 +109,7 @@ fn bench_random_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
                     let p = fpram.malloc::<u64>(std::mem::size_of::<u64>()).expect("malloc");
@@ -139,7 +139,7 @@ fn bench_random_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
                     let mut p = fpram.malloc::<u64>(std::mem::size_of::<u64>()).expect("malloc");
@@ -183,7 +183,7 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let array = fpram
                     .malloc::<u64>(ELEMENTS * std::mem::size_of::<u64>())
                     .expect("malloc array");
@@ -210,7 +210,7 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let array = fpram
                     .malloc::<u64>(ELEMENTS * std::mem::size_of::<u64>())
                     .expect("malloc array");
@@ -256,7 +256,7 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().join("f.ignore.pram");
                 let path_str = path.to_string_lossy().to_string();
-                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str, PAGE_SIZE);
+                let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let hot = fpram.malloc(HOT_LEN * ELEMENT_SIZE).expect("hot alloc");
                 let rh = fpram.malloc(READ_HEAVY_LEN * ELEMENT_SIZE).expect("rh alloc");
                 let wh = fpram.malloc(WRITE_HEAVY_LEN * ELEMENT_SIZE).expect("wh alloc");

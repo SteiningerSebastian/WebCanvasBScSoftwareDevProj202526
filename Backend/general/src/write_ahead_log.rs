@@ -195,8 +195,11 @@ impl<T> PRAMWriteAheadLog<T> where T: Sized {
     pub fn new(pram: Arc<PersistentRandomAccessMemory>, size: usize) -> Self {
         // Allocate space for head and tail pointers
         // Assuming head and tail are stored at the beginning of the allocated space
-        let head: Pointer<u64> = pram.smalloc::<u64>(HEAD_OFFSET, 8).unwrap();
-        let tail: Pointer<u64> = pram.smalloc::<u64>(TAIL_OFFSET, 8).unwrap();
+        let mut head: Pointer<u64> = pram.smalloc::<u64>(HEAD_OFFSET, 8).unwrap();
+        let mut tail: Pointer<u64> = pram.smalloc::<u64>(TAIL_OFFSET, 8).unwrap();
+
+        tail.set(&0).unwrap();
+        head.set(&0).unwrap();
         
         // Allocate the data array, an array of T with the given size
         let data = pram.smalloc::<T>(DATA_OFFSET, size * std::mem::size_of::<T>()).unwrap();
@@ -352,7 +355,7 @@ mod tests {
         // Round up to page size (4096)
         let page = 4096usize;
         let alloc = ((total + page - 1) / page) * page;
-        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal.ignore", page);
+        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal.ignore");
         let wal = PRAMWriteAheadLog::<T>::new(pram, size);
         wal
     }
@@ -434,7 +437,7 @@ mod tests {
         let total = (DATA_OFFSET as usize) + data_bytes;
         let page = 4096usize;
         let alloc = ((total + page - 1) / page) * page;
-        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal_concurrent.ignore", page);
+        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal_concurrent.ignore");
         ConcurrentPRAMWriteAheadLog::new(pram, size)
     }
 

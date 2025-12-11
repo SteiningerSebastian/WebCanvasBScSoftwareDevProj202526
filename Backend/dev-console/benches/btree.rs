@@ -12,7 +12,6 @@ fn make_index(path: &str) -> ConcurrentBTreeIndexPRAM {
 	let pram = PersistentRandomAccessMemory::new(
 		16 * 1024 * 1024,
 		path,
-		PAGE_SIZE,
 	);
 	ConcurrentBTreeIndexPRAM::new(pram)
 }

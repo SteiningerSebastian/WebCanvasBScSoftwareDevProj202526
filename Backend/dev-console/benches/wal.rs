@@ -20,7 +20,7 @@ fn make_wal<T: Sized>(entries: usize, path: &str) -> PRAMWriteAheadLog<T> {
 	let data_bytes = entries * std::mem::size_of::<T>();
 	let raw = 16 + data_bytes; // head+tail+data start
 	let mem_size = align_to_page(raw.max(PAGE_SIZE));
-	let fpram = PersistentRandomAccessMemory::new(mem_size, path, PAGE_SIZE);
+	let fpram = PersistentRandomAccessMemory::new(mem_size, path);
 	PRAMWriteAheadLog::new(fpram, entries)
 }
 

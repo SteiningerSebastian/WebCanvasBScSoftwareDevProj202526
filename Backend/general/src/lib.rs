@@ -6,7 +6,6 @@ pub mod persistent_random_access_memory;
 pub mod write_ahead_log;
 pub mod pram_btree_index;
 
-
 #[cfg(test)]
 mod persistent_random_access_memory_tests;
 
