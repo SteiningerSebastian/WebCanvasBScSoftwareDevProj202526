@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput, BatchSize, black_box};
 use general::persistent_random_access_memory::PersistentRandomAccessMemory;
-use general::write_ahead_log::{PRAMWriteAheadLog, WriteAheadLog};
+use general::write_ahead_log::{WriteAheadLog, WriteAheadLog};
 use std::time::Duration;
 
 const PAGE_SIZE: usize = 4096; // match other benches
@@ -15,13 +15,13 @@ struct Large { _buf: [u8; 128] }
 
 fn align_to_page(len: usize) -> usize { ((len + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE }
 
-fn make_wal<T: Sized>(entries: usize, path: &str) -> PRAMWriteAheadLog<T> {
+fn make_wal<T: Sized>(entries: usize, path: &str) -> WriteAheadLog<T> {
 	// memory required for static region + data
 	let data_bytes = entries * std::mem::size_of::<T>();
 	let raw = 16 + data_bytes; // head+tail+data start
 	let mem_size = align_to_page(raw.max(PAGE_SIZE));
 	let fpram = PersistentRandomAccessMemory::new(mem_size, path);
-	PRAMWriteAheadLog::new(fpram, entries)
+	WriteAheadLog::new(fpram, entries)
 }
 
 fn bench_wal_append(c: &mut Criterion) {

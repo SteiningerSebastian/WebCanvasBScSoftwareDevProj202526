@@ -54,8 +54,6 @@ pub struct Pointer<T> where T: Sized {
     pub address: u64,
     memory: Weak<PersistentRandomAccessMemory>,
     _marker: std::marker::PhantomData<T>,
-    // This field blocks Sync, because Cell<T> is NOT Sync.
-    _marker_not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 impl<T> Clone for Pointer<T> where T: Sized {
@@ -64,7 +62,6 @@ impl<T> Clone for Pointer<T> where T: Sized {
             address: self.address,
             memory: self.memory.clone(),
             _marker: std::marker::PhantomData,
-            _marker_not_sync: std::marker::PhantomData,
         }
     }
 }
@@ -83,7 +80,7 @@ impl<T> Pointer<T> where T: Sized {
     /// Returns:
     /// - A new Pointer instance.
     pub fn new(pointer: u64, memory: Weak<PersistentRandomAccessMemory>) -> Self {
-        Self { address: pointer, memory, _marker: std::marker::PhantomData, _marker_not_sync: std::marker::PhantomData }
+        Self { address: pointer, memory, _marker: std::marker::PhantomData}
     }
 
     /// Creates a Pointer from a given address and memory manager.
@@ -98,7 +95,7 @@ impl<T> Pointer<T> where T: Sized {
     /// Warning: The memory manager must outlive the Pointer instance to avoid dangling references.
     /// Also this will not allocate new memory (mark space as used) to allocate new use salloc on the memory.
     pub fn from_address(pointer: u64, memory: Arc<PersistentRandomAccessMemory>) -> Self {
-        Self { address: pointer, memory: Arc::downgrade(&memory), _marker: std::marker::PhantomData, _marker_not_sync: std::marker::PhantomData  }
+        Self { address: pointer, memory: Arc::downgrade(&memory), _marker: std::marker::PhantomData }
     }
 
     /// Writes the given value of type T to the location pointed to by this Pointer.
@@ -129,7 +126,6 @@ impl<T> Pointer<T> where T: Sized {
             address: self.address + (index as u64 * std::mem::size_of::<T>() as u64),
             memory: self.memory.clone(),
             _marker: std::marker::PhantomData,
-            _marker_not_sync: std::marker::PhantomData,
         }
     }
 
@@ -324,9 +320,24 @@ impl PersistentRandomAccessMemory {
         }
 
         // Reserve the specified memory region by removing it from the free slots.
-        let _result = Self::reserve_exact(&mut *self.free_slots.lock().unwrap(), pointer, length);
+        let result = Self::reserve_exact(&mut *self.free_slots.lock().unwrap(), pointer, length);
 
-        return Ok(Pointer::new(pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>));
+        let pointer = Pointer::new(pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>);
+
+        match result {
+            Err(Error::MemoryAllocationError) => {
+                Ok(pointer)
+            },
+            Err(e) => {
+                Err(e)
+            },
+            Ok(_) => {
+                // Successfully reserved the memory region. Initialize with 0's
+                let zero_bytes = vec![0u8; length];
+                self.write(pointer.address, &zero_bytes)?;
+                Ok(pointer)
+            },
+        }
     }
 
     /// Dynamically allocates the necessary space for a value in persistent memory
@@ -346,10 +357,15 @@ impl PersistentRandomAccessMemory {
 
         // Find a free slot that can accommodate the requested length
         if let Ok(allocated_pointer) = self.reserve(length) {
-            return Ok(Pointer::new(allocated_pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>));
+            let pointer = Pointer::new(allocated_pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>);
+            
+            // Initialize the allocated memory with 0's
+            let zero_bytes = vec![0u8; length];
+            self.write(pointer.address, &zero_bytes)?;
+            Ok(pointer)
+        } else {
+            Err(Error::OutOfMemoryError)
         }
-
-        Err(Error::OutOfMemoryError)
     }
 
     /// Frees the space allocated for the value in persistent memory

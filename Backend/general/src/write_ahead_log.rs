@@ -1,19 +1,25 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, atomic::{AtomicI64, AtomicU64}};
 
 use crate::persistent_random_access_memory::{self, PersistentRandomAccessMemory, Pointer};
 
 #[derive(Debug)]
 pub enum Error {
+    /// IO error during WAL operations
     IoError(std::io::Error),
+    /// Error committing changes to persistent storage
     CommitError(persistent_random_access_memory::Error),
+    /// Error appending an entry to the WAL
     AppendFailed,
+    /// Error when the WAL is out of memory
     OutOfMemory,
+    /// Error peaking at the next entry in the WAL
     PeakFailed,
+    /// Error popping the next entry from the WAL
     PopFailed,
 }
 
 /// A trait representing a Write-Ahead Log (WAL) for ensuring data integrity.
-pub trait WriteAheadLog<T> where T: Sized {
+pub trait WriteAheadLogTrait<T> where T: Sized {
     /// Appends an entry to the write-ahead log.
     /// 
     /// Parameters:
@@ -41,143 +47,53 @@ pub trait WriteAheadLog<T> where T: Sized {
     /// - `Result<Vec<u8>, Error>`: Ok containing the popped log entry if successful, Err otherwise.
     fn pop(&mut self) -> Result<T, Error>;
 
-    /// Creates an iterator over the write-ahead log entries.
-    /// 
-    /// Parameters:
-    /// - `reverse`: A boolean indicating whether to iterate in reverse order.
+    /// Creates an iterator over the write-ahead log entries. (lifo order)
     /// 
     /// Returns:
     /// - `WALIterator<'_, T>`: An iterator over the log entries.
-    fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized;
+    /// 
+    /// Warning: The iterator does not guarantee consistency if the WAL is modified during iteration.
+    /// If modifications occur, the iterator may yield already removed entries.
+    fn iter(&mut self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized;
 }
 
-pub struct ConcurrentPRAMWriteAheadLog<T> where T: Sized{
-    wla: Arc<Mutex<PRAMWriteAheadLog<T>>>,
-}
+pub struct WriteAheadLog<T> where T: Sized{
+    // Internal state and fields for the WAL
 
-impl<T> ConcurrentPRAMWriteAheadLog<T> where T: Sized {
-    pub fn new(pram: Arc<PersistentRandomAccessMemory>, size: usize) -> Self {
-        ConcurrentPRAMWriteAheadLog { 
-            wla: Arc::new(Mutex::new(PRAMWriteAheadLog::new(pram, size))),
-        }
-    }
-}
-
-pub struct ConcurrentWALIterator<T> where T: Sized {
-    wal: Arc<Mutex<PRAMWriteAheadLog<T>>>,
-    current_index: u64,
-    reverse: bool,
-}
-
-/// Implement WriteAheadLog for ConcurrentPRAMWriteAheadLog by locking the internal mutex.
-impl<T> WriteAheadLog<T> for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
-    fn append(&mut self, entry: &T) -> Result<(), Error> {
-        let mut wla = self.wla.lock().unwrap();
-        wla.append(entry)
-    }
-
-    fn commit(&mut self) -> Result<(), Error> {
-        let mut wla = self.wla.lock().unwrap();
-        wla.commit()
-    }
-
-    fn peak(&mut self) -> Result<T, Error> {
-        let mut wla = self.wla.lock().unwrap();
-        wla.peak()
-    }
-
-    fn pop(&mut self) -> Result<T, Error> {
-        let mut wla = self.wla.lock().unwrap();
-        wla.pop()
-    }
-
-    fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
-        let wla = self.wla.lock().unwrap();
-
-        let mut head: u64 = wla.head.deref().unwrap();
-        let tail: u64 = wla.tail.deref().unwrap();
-
-        // Adjust head for iteration (Point to last valid entry)
-        if head == 0 {
-            head = wla.size as u64 -1;
-        }else {
-            head -= 1; // -1 as head points to next free slot
-        }
-
-        Box::new(ConcurrentWALIterator {
-            wal: Arc::clone(&self.wla),
-            current_index: if reverse { head } else { tail },
-            reverse,
-        })
-    }
-}
-
-impl<T> Iterator for ConcurrentWALIterator<T> where T: Sized {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let wal = self.wal.lock().unwrap();
-
-        // Read head and tail indices
-        let tail = wal.tail.deref().ok()?;
-        let mut head = wal.head.deref().ok()?; // read current head
-
-        // Adjust head for iteration
-        if head == 0 {
-            head = wal.size as u64 -1;
-        }else {
-            head -= 1; // -1 as head points to next free slot
-        }
-
-        // Check bounds - Return None if current_index is out of [tail, head] (circularly)
-        if head > tail {
-            if self.current_index < tail || self.current_index > head {
-                return None;
-            }
-        } else if tail > head {
-            if self.current_index < tail && self.current_index > head {
-                return None;
-            }
-        }
-
-        let item: T = wal.data.at(self.current_index as usize).deref().ok()?;
-
-        // Direction in which to iterate
-        if self.reverse {
-            // Move backwards
-            self.current_index = if self.current_index == 0 {
-                wal.size as u64 - 1 
-            } else {
-                self.current_index - 1
-            };
-
-            Some(item)
-        } else {
-            // Move forwards
-            self.current_index = (self.current_index + 1) % wal.size as u64;
-
-            Some(item)
-        }  
-    }
-}
-
-impl<T> Clone for ConcurrentPRAMWriteAheadLog<T> where T: Sized {
-    fn clone(&self) -> Self {
-        ConcurrentPRAMWriteAheadLog {
-            wla: std::sync::Arc::clone(&self.wla),
-        }
-    }
-}
-
-pub struct PRAMWriteAheadLog<T> where T: Sized{
-    // Internal state and fields for the PRAMWriteAheadLog
     pram: Arc<PersistentRandomAccessMemory>,
+    // Maximum number of entries in the WAL
     size: usize,
-    length: usize,
-    head: Pointer<u64>,
-    tail: Pointer<u64>,
-    data: Pointer<T>,
+
+    // Current number of entries in the WAL
+    length: Arc<AtomicU64>,
+    // Pointers to head, tail, and data in the PRAM
+    head: Arc<RwLock<Pointer<u64>>>,
+    head_cache: Arc<AtomicU64>,
+    tail: Arc<RwLock<Pointer<u64>>>,
+    tail_cache: Arc<AtomicU64>,
+    data: Arc<Pointer<T>>,
+
+    persist_lock: Arc<RwLock<()>>,
+
+    // Phantom data to associate type T
     _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> Clone for WriteAheadLog<T> where T: Sized {
+    fn clone(&self) -> Self {
+        WriteAheadLog {
+            pram: self.pram.clone(),
+            size: self.size,
+            length: self.length.clone(),
+            head: self.head.clone(),
+            head_cache: self.head_cache.clone(),
+            tail: self.tail.clone(),
+            tail_cache: self.tail_cache.clone(),
+            data: self.data.clone(),
+            persist_lock: self.persist_lock.clone(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 // Offsets for head, tail, and data in the PRAM (their positions in memory)
@@ -185,158 +101,195 @@ static HEAD_OFFSET: u64 = 0;
 static TAIL_OFFSET: u64 = 8;
 static DATA_OFFSET: u64 = 16;
 
-struct WALIterator<'a, T> where T: Sized {
-    wal: &'a mut PRAMWriteAheadLog<T>,
-    reverse: bool,
-    current_index: u64,
-}
-
-impl<T> PRAMWriteAheadLog<T> where T: Sized {
+impl<T> WriteAheadLog<T> where T: Sized {
     pub fn new(pram: Arc<PersistentRandomAccessMemory>, size: usize) -> Self {
         // Allocate space for head and tail pointers
         // Assuming head and tail are stored at the beginning of the allocated space
-        let mut head: Pointer<u64> = pram.smalloc::<u64>(HEAD_OFFSET, 8).unwrap();
-        let mut tail: Pointer<u64> = pram.smalloc::<u64>(TAIL_OFFSET, 8).unwrap();
-
-        tail.set(&0).unwrap();
-        head.set(&0).unwrap();
+        let head: Pointer<u64> = pram.smalloc::<u64>(HEAD_OFFSET, 8).unwrap();
+        let tail: Pointer<u64> = pram.smalloc::<u64>(TAIL_OFFSET, 8).unwrap();
         
+        let head_val: u64 = head.deref().unwrap_or(0);
+        let tail_val: u64 = tail.deref().unwrap_or(0);
+
+        // calculate length
+        let length = if head_val >= tail_val {
+            head_val - tail_val
+        } else {
+            (size as u64 - tail_val) + head_val
+        };
+
         // Allocate the data array, an array of T with the given size
         let data = pram.smalloc::<T>(DATA_OFFSET, size * std::mem::size_of::<T>()).unwrap();
-        PRAMWriteAheadLog { 
+        WriteAheadLog { 
             pram,
             size,
-            head,
-            tail,
-            data,
+            head: Arc::new(RwLock::new(head)),
+            tail: Arc::new(RwLock::new(tail)),
+            data: Arc::new(data),
             _phantom: std::marker::PhantomData,
-            length: 0,
+            length: Arc::new(AtomicU64::new(length)),
+            // Keeping a copy in memory for faster access
+            head_cache: Arc::new(AtomicU64::new(head_val)),
+            tail_cache: Arc::new(AtomicU64::new(tail_val)),
+            persist_lock: Arc::new(RwLock::new(())),
         }
     }
 }
 
-impl<T> WriteAheadLog<T> for PRAMWriteAheadLog<T> where T: Sized {
+impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
     fn append(&mut self, entry: &T) -> Result<(), Error> {
-        // Check if there is space in the log
-        if self.length >= self.size {
-            return Err(Error::OutOfMemory);
+        // Acquire read lock to allow concurrent appends and pops but block commits
+        let _persist_guard = self.persist_lock.read().unwrap();
+
+        // Atomically increase length
+        loop {
+            let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
+            if length >= self.size as u64 {
+                return Err(Error::OutOfMemory);
+            }
+
+            if let Ok(_) = self.length.compare_exchange(
+                length, 
+                length+1, 
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
         }
 
         // Read current head index
-        let current_head = self.head.deref().map_err(|_| Error::AppendFailed)?;
-        let prev_head_index = current_head;
-        let new_head = (current_head + 1) % self.size as u64;
-        // Update head index and length
-        self.head.set(&new_head).map_err(|_| Error::AppendFailed)?;
+        let head;
+        {
+            let mut head_pointer = self.head.write().map_err(|_| Error::AppendFailed)?;
+            head = self.head_cache.load(std::sync::atomic::Ordering::SeqCst);
+            let new_head = (head + 1) % self.size as u64;
+            // Update head index and length
+            head_pointer.set(&new_head).map_err(|_| Error::AppendFailed)?;
+            self.head_cache.store(new_head, std::sync::atomic::Ordering::SeqCst);
+        } // release lock on head
 
-        // Here the page may be swapped out when we access the data pointer
-        // So we do this after updating the head index
-
-        // Write the entry at the head position
-        self.data.at(prev_head_index as usize).set(entry).map_err(|_| Error::AppendFailed)?;
-
-        self.length += 1;
+        // Write the entry at the head position (ensure that at a given index only one write can happen concurrently)
+        self.data.at(head as usize).set(entry).map_err(|_| Error::AppendFailed)?;
 
         Ok(())
     }
 
     fn commit(&mut self) -> Result<(), Error> {
+        // Acquire write lock to prevent appends/pops during commit
+        let _persist_guard = self.persist_lock.write().unwrap();
         self.pram.persist().map_err(Error::CommitError)
     }
 
     fn peak(&mut self) -> Result<T, Error> {
-        if self.length == 0 {
+        let tail = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
+
+        let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
+        if length == 0 {
             return Err(Error::PeakFailed);
         }
 
         // Read tail index
-        let tail = self.tail.deref().map_err(|_| Error::AppendFailed)?;
         let entry = self.data.at(tail as usize).deref().map_err(|_| Error::AppendFailed)?;
         Ok(entry)
     }
 
     fn pop(&mut self) -> Result<T, Error> {
-        // Check if there are entries to pop
-        if self.length == 0 {
-            return Err(Error::PopFailed);
+        // Acquire read lock to allow concurrent appends and pops but block commits
+        let _persist_guard = self.persist_lock.read().unwrap();
+
+        // Make sure there is at least one entry to pop
+        loop {
+            let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
+            if length <= 0 {
+                return Err(Error::PopFailed);
+            }
+
+            if let Ok(_) = self.length.compare_exchange(
+                length, 
+                length-1, 
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
         }
 
-        // Read tail, fetch entry, then advance tail
-        let tail_val = self.tail.deref().map_err(|_| Error::AppendFailed)?;
-        let entry = self.data.at(tail_val as usize).deref().map_err(|_| Error::AppendFailed)?;
-        let new_tail = (tail_val + 1) % self.size as u64;
-        self.tail.set(&new_tail).map_err(|_| Error::AppendFailed)?;
+        let tail_val;
+        {
+            let mut tail_pointer = self.tail.write().map_err(|_| Error::AppendFailed)?;
+            // Read tail, fetch entry, then advance tail
+            tail_val = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
+            let new_tail = (tail_val + 1) % self.size as u64;
 
-        self.length -= 1;
+            tail_pointer.set(&new_tail).map_err(|_| Error::AppendFailed)?;
+            self.tail_cache.store(new_tail, std::sync::atomic::Ordering::SeqCst);
+        } // release lock on tail
         
+        let entry = self.data.at(tail_val as usize).deref().map_err(|_| Error::AppendFailed)?;
+
         Ok(entry)
     }
 
-    fn iter(&mut self, reverse: bool) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
-        let mut head: u64 = self.head.deref().unwrap();
-        let tail: u64 = self.tail.deref().unwrap();
+    fn iter(&mut self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
+        // Read head and tail indices from cache
+        let head = self.head_cache.load(std::sync::atomic::Ordering::SeqCst);
 
-        // Adjust head for iteration (Point to last valid entry)
-        if head == 0 {
-            head = self.size as u64 -1;
-        }else {
-            head -= 1; // -1 as head points to next free slot
-        }
+        // Start from the head - the first entry is at head - 1 which is decremented to iterate in reverse
+        let current = (head as i64 - 1) % self.size as i64;
 
         Box::new(WALIterator {
-            wal: self,
-            reverse,
-            current_index: if reverse { head } else { tail }
+            wal: self.clone(),
+            current_index: Arc::new(AtomicI64::new(current)),
         })
     }
 }
 
-impl<T> Iterator for WALIterator<'_, T> where T: Sized {
+struct WALIterator<T> where T: Sized {
+    wal: WriteAheadLog<T>,
+    current_index: Arc<AtomicI64>,
+}
+
+impl<T> Iterator for WALIterator<T> where T: Sized {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Read indices
-        let tail = self.wal.tail.deref().ok()?;
-        let mut head = self.wal.head.deref().ok()?; // read current head
+        let current_not_wrapped = self.current_index.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
-        // Adjust head for iteration
-        if head == 0 {
-            head = self.wal.size as u64 -1;
+        // Wrap around if needed
+        let current = if current_not_wrapped < 0 {
+            self.wal.size as i64 + current_not_wrapped
         }else {
-            head -= 1; // -1 as head points to next free slot
-        }
+            current_not_wrapped
+        } as u64;
 
-        // Check bounds - Return None if current_index is out of [tail, head] (circularly)
+        // Need to aquire both locks, to ensure consistency (else head and tail may change during check)
+        let tail;
+        let head;
+        {
+            let _head_guard = self.wal.head.read().ok()?;
+            let _tail_guard = self.wal.tail.read().ok()?;
+
+            tail = self.wal.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
+            head = self.wal.head_cache.load(std::sync::atomic::Ordering::SeqCst);
+        } // release locks
+
+
         if head > tail {
-            if self.current_index < tail || self.current_index > head {
+            // Normal case
+            if current < tail || current >= head {
                 return None;
             }
-        } else if tail > head {
-            if self.current_index < tail && self.current_index > head {
+        } else if head < tail {
+            // Wrapped case
+            if current < tail && current >= head {
                 return None;
             }
-        }
-        let item: T = self.wal.data.at(self.current_index as usize).deref().ok()?;
-
-        // Direction in which to iterate
-        if self.reverse {
-            // Move backwards (pfram will swap in pages as needed, so reverse reading the data will still sequentially access the disk 
-            // but not as efficiently as seeking to the start of the previous page and reading forward takes one seek per page instead of just reading the next page)
-            // Iterating the WAL and concurrently appending to it will decrease the effective cache size as we need to keep swaping pages in and out more frequently.
-            self.current_index = if self.current_index == 0 {
-                self.wal.size as u64 - 1 
-            } else {
-                self.current_index - 1
-            };
-
-            Some(item)
         } else {
-            // Move forwards
-            self.current_index = (self.current_index + 1) % self.wal.size as u64;
+            // head == tail, empty
+            return None;
+        }
 
-            Some(item)
-        }    
-
+        let entry = self.wal.data.at(current as usize).deref().ok()?;
+        Some(entry)
     }
 }
 
@@ -347,16 +300,22 @@ mod tests {
     // Simple in-memory implementation of PersistentRandomAccessMemory for testing.
     // no additional imports needed
 
-    // Helper to construct WAL with generic T and given size using Rc for Weak pointer expectations.
-    fn new_wal<T: Sized>(size: usize) -> PRAMWriteAheadLog<T> {
-        // Compute memory needed: head (8) + tail (8) + data
-        let data_bytes = size * std::mem::size_of::<T>();
-        let total = (DATA_OFFSET as usize) + data_bytes;
-        // Round up to page size (4096)
-        let page = 4096usize;
-        let alloc = ((total + page - 1) / page) * page;
-        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal.ignore");
-        let wal = PRAMWriteAheadLog::<T>::new(pram, size);
+    fn unique_test_path(suffix: &str) -> String {
+        let tmp = std::env::temp_dir();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        tmp.join(format!("pram_{}_{}_{}.ignore", suffix, pid, ts))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    // Helper to construct WAL with generic T and given size using Arc for Weak pointer expectations.
+    fn new_wal<T: Sized>(size: usize, id: &str) -> WriteAheadLog<T> {
+        let pram = PersistentRandomAccessMemory::new(10*4096, &unique_test_path(id));
+        let wal = WriteAheadLog::<T>::new(pram, size);
         wal
     }
 
@@ -369,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_append_and_pop_basic() {
-        let mut wal = new_wal::<Small>(4);
+        let mut wal = new_wal::<Small>(4, "basic");
         wal.append(&Small(10)).unwrap();
         wal.append(&Small(20)).unwrap();
         // Pop first inserted value per current implementation logic
@@ -381,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_out_of_memory() {
-        let mut wal = new_wal::<Small>(2);
+        let mut wal = new_wal::<Small>(2, "out_of_memory");
         wal.append(&Small(1)).unwrap();
         wal.append(&Small(2)).unwrap();
         assert!(matches!(wal.append(&Small(3)), Err(Error::OutOfMemory)));
@@ -389,13 +348,13 @@ mod tests {
 
     #[test]
     fn test_peak_empty_error() {
-        let mut wal = new_wal::<Medium>(3);
+        let mut wal = new_wal::<Medium>(3, "peak_empty_error");
         assert!(matches!(wal.peak(), Err(Error::PeakFailed)));
     }
 
     #[test]
     fn test_peak_after_append() {
-        let mut wal = new_wal::<Medium>(3);
+        let mut wal = new_wal::<Medium>(3, "peak_after_append");
         wal.append(&Medium { a: 1, b: 2 }).unwrap();
         // Current implementation peaks at tail index which is initially 0 (likely default memory)
         let val = wal.peak();
@@ -404,46 +363,36 @@ mod tests {
 
     #[test]
     fn test_commit() {
-        let mut wal = new_wal::<Large>(2);
+        let mut wal = new_wal::<Large>(2, "commit");
         wal.append(&Large { arr: [1u8; 32] }).unwrap();
         assert!(wal.commit().is_ok());
     }
 
     #[test]
     fn test_pop_empty_error() {
-        let mut wal = new_wal::<Small>(2);
+        let mut wal = new_wal::<Small>(2, "pop_empty_error");
         assert!(matches!(wal.pop(), Err(Error::PopFailed)));
     }
 
     #[test]
     fn test_multiple_types_capacity() {
-        let mut wal_small = new_wal::<Small>(1);
+        let mut wal_small = new_wal::<Small>(1, "multiple_types_capacity_small");
         wal_small.append(&Small(5)).unwrap();
         assert!(matches!(wal_small.append(&Small(6)), Err(Error::OutOfMemory)));
 
-        let mut wal_medium = new_wal::<Medium>(2);
+        let mut wal_medium = new_wal::<Medium>(2, "multiple_types_capacity_medium");
         wal_medium.append(&Medium { a: 3, b: 4 }).unwrap();
         wal_medium.append(&Medium { a: 5, b: 6 }).unwrap();
         assert!(matches!(wal_medium.append(&Medium { a: 7, b: 8 }), Err(Error::OutOfMemory)));
 
-        let mut wal_large = new_wal::<Large>(1);
+        let mut wal_large = new_wal::<Large>(1, "multiple_types_capacity_large");
         wal_large.append(&Large { arr: [9u8; 32] }).unwrap();
         assert!(matches!(wal_large.append(&Large { arr: [8u8; 32] }), Err(Error::OutOfMemory)));
     }
 
-    // Helper to construct Concurrent WAL with generic T and given size using Rc for Weak pointer expectations.
-    fn new_concurrent_wal<T: Sized>(size: usize) -> ConcurrentPRAMWriteAheadLog<T> {
-        let data_bytes = size * std::mem::size_of::<T>();
-        let total = (DATA_OFFSET as usize) + data_bytes;
-        let page = 4096usize;
-        let alloc = ((total + page - 1) / page) * page;
-        let pram = PersistentRandomAccessMemory::new(alloc, "C:/data/test_wal_concurrent.ignore");
-        ConcurrentPRAMWriteAheadLog::new(pram, size)
-    }
-
     #[test]
-    fn test_pram_iterator_forward_and_reverse() {
-        let mut wal = new_wal::<Small>(5);
+    fn test_wal_iterator() {
+        let mut wal = new_wal::<Small>(5, "test_wal_iterator");
         wal.append(&Small(1)).unwrap();
         wal.append(&Small(2)).unwrap();
         wal.append(&Small(3)).unwrap();
@@ -453,36 +402,10 @@ mod tests {
         wal.append(&Small(5)).unwrap();
 
         // Use the internal length to know how many items to take (avoids infinite iteration issues)
-        let len = wal.length;
-
-        let items_forward: Vec<Small> = wal.iter(false).take(len).collect();
-        assert_eq!(items_forward, vec![Small(3), Small(4), Small(5)]);
+        let len = wal.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
 
         // Reverse iteration should yield reversed order
-        let items_reverse: Vec<Small> = wal.iter(true).take(len).collect();
-        assert_eq!(items_reverse, vec![Small(5), Small(4), Small(3)]);
-    }
-
-    #[test]
-    fn test_concurrent_wal_iterator_forward_and_reverse() {
-        let mut cwal = new_concurrent_wal::<Small>(6);
-        cwal.append(&Small(1)).unwrap();
-        cwal.append(&Small(2)).unwrap();
-        cwal.append(&Small(3)).unwrap();
-        cwal.pop().unwrap(); // Pop one to test iterator bounds
-        cwal.pop().unwrap();
-        cwal.append(&Small(4)).unwrap();
-        cwal.append(&Small(5)).unwrap();
-
-        // read length under lock
-        let len = cwal.wla.lock().unwrap().length;
-
-        // Forward iteration via concurrent WAL
-        let items_forward: Vec<Small> = cwal.iter(false).take(len).collect();
-        assert_eq!(items_forward, vec![Small(3), Small(4), Small(5)]);
-
-        // Reverse iteration via concurrent WAL
-        let items_reverse: Vec<Small> = cwal.iter(true).take(len).collect();
+        let items_reverse: Vec<Small> = wal.iter().take(len).collect();
         assert_eq!(items_reverse, vec![Small(5), Small(4), Small(3)]);
     }
 }
