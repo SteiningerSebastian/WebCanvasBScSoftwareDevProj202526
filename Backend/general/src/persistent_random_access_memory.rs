@@ -1,5 +1,6 @@
-use std::{collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Mutex, RwLock, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
+use std::{collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
 use memmap2::{MmapMut};
+use parking_lot::{Mutex, RwLock};
 
 #[derive(Debug)]
 pub enum Error {
@@ -284,8 +285,8 @@ impl PersistentRandomAccessMemory {
         me.load_free_list().unwrap();
         
         // Ensure there is at least one free slot covering the entire memory if none was loaded.
-        if me.free_slots.lock().unwrap().is_empty() {
-            me.free_slots.lock().unwrap().push((0, size));
+        if me.free_slots.lock().is_empty() {
+            me.free_slots.lock().push((0, size));
         }
         
         let rc_me = Arc::new(me);
@@ -320,7 +321,7 @@ impl PersistentRandomAccessMemory {
         }
 
         // Reserve the specified memory region by removing it from the free slots.
-        let result = Self::reserve_exact(&mut *self.free_slots.lock().unwrap(), pointer, length);
+        let result = Self::reserve_exact(&mut *self.free_slots.lock(), pointer, length);
 
         let pointer = Pointer::new(pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>);
 
@@ -385,10 +386,10 @@ impl PersistentRandomAccessMemory {
     pub fn free(&self, pointer: u64, length: usize) -> Result<(), Error> {
         // First we need to aquire a read-lock so we know that data is not currently being persisted
         // This prevents modifying the freelist during a persist operation.
-        let _lock = self._swap_mmap_lock.read().map_err(|_| Error::SynchronizationError)?;
+        let _lock = self._swap_mmap_lock.read();
 
         // Free the specified memory region and merge it with adjacent free slots.
-        let mut free_slots = self.free_slots.lock().map_err(|_| Error::SynchronizationError)?;
+        let mut free_slots = self.free_slots.lock();
         Self::free_and_merge(&mut *free_slots, pointer, length);
         Ok(())
     }
@@ -408,7 +409,7 @@ impl PersistentRandomAccessMemory {
         let mut dirty_pages;
 
         // Lock the swap mmap for reading and replacing during the persist operation.
-        let _lock = self._swap_mmap_lock.write().map_err(|_| Error::SynchronizationError)?;
+        let _lock = self._swap_mmap_lock.write();
 
         // Flush the memory-mapped swap file to disk.
         unsafe { (*self.swap_mmap.load(Ordering::SeqCst)).flush().map_err(|_| Error::FlushError)?; }
@@ -417,7 +418,7 @@ impl PersistentRandomAccessMemory {
         std::sync::atomic::fence(Ordering::SeqCst);
 
         // Lock the swap file for writing during the persist operation.
-        let mut swap_file = self.swap_file.write().map_err(|_| Error::FlushError)?;
+        let mut swap_file = self.swap_file.write();
 
         // Flush the free list to the swap file.
         self.flush_free_list(&mut *swap_file)?;
@@ -462,7 +463,7 @@ impl PersistentRandomAccessMemory {
 
         // The swap file is at this point stale, as it has been swapped with the persistent file.
         // We need to write the recorded dirty pages back to the new swap file.
-        dirty_pages = self.dirty_swaped_pages.write().map_err(|_| Error::FlushError)?;
+        dirty_pages = self.dirty_swaped_pages.write();
         let mut current_cursor: u64 = u64::MAX;
 
         // Read the page data from the persistent file and write it to the new swap file
@@ -505,7 +506,7 @@ impl PersistentRandomAccessMemory {
         new_persistent_file.sync_all().map_err(|_| Error::FlushError)?;
 
         // Update the file handles
-        let mut persistent_file = self.persistent_file.lock().map_err(|_| Error::FlushError)?;
+        let mut persistent_file = self.persistent_file.lock();
         *persistent_file = new_persistent_file;
         *swap_file = new_swap_file;
 
@@ -571,7 +572,7 @@ impl PersistentRandomAccessMemory {
 
         {
             // First we need to aquire a read-lock so we know that data is not currently being persisted
-            let _lock = self._swap_mmap_lock.read().map_err(|_| Error::SynchronizationError)?;
+            let _lock = self._swap_mmap_lock.read();
 
             unsafe {
                 (&mut (*self.swap_mmap.load(Ordering::SeqCst)))
@@ -588,8 +589,7 @@ impl PersistentRandomAccessMemory {
         {
             let mut dirty = self
                 .dirty_swaped_pages
-                .write()
-                .map_err(|_| Error::SynchronizationError)?;
+                .write();
             for page in start_page..=end_page {
                 dirty.insert(page);
             }
@@ -609,14 +609,14 @@ impl PersistentRandomAccessMemory {
     fn reserve(&self, len:usize) -> Result<u64, Error> {
         // First we need to aquire a read-lock so we know that data is not currently being persisted.
         // Changing the freelist during the persist-operation will lead to undefined behaviour.
-        let _lock = self._swap_mmap_lock.read().map_err(|_| Error::SynchronizationError)?;
+        let _lock = self._swap_mmap_lock.read();
 
         // Find a free slot that can accommodate the requested length
         // First, try to find a free slot where the allocation can fit entirely within a single page.
         // This avoids allocations that span pages when possible. (reduced page faults)
         let mut allocated_pointer: Option<u64> = None;
 
-        let mut free_slots = self.free_slots.lock().map_err(|_| Error::SynchronizationError)?;
+        let mut free_slots = self.free_slots.lock();
 
         if len <= PAGE_SIZE {
             let page_size = PAGE_SIZE as u64;
@@ -774,7 +774,7 @@ impl PersistentRandomAccessMemory {
     /// Returns:
     /// - Result indicating success or failure.
     fn load_free_list(&self) -> Result<(), Error> {
-        let mut file = self.swap_file.write().map_err(|_| Error::SynchronizationError)?;
+        let mut file = self.swap_file.write();
         
         file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
 
@@ -801,7 +801,7 @@ impl PersistentRandomAccessMemory {
             bincode::config::standard()
         ).map_err(|_| Error::ReadError)?;
 
-        let mut free_slots = self.free_slots.lock().map_err(|_| Error::SynchronizationError)?;
+        let mut free_slots = self.free_slots.lock();
         *free_slots = decoded_free_slots;
 
         Ok(())
@@ -812,7 +812,7 @@ impl PersistentRandomAccessMemory {
     /// Returns:
     ///  - Result indicating success or failure.
     fn flush_free_list(&self, file: &mut std::fs::File) -> Result<(), Error> {
-        let free_slots = self.free_slots.lock().map_err(|_| Error::SynchronizationError)?;
+        let free_slots = self.free_slots.lock();
         
         file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
 

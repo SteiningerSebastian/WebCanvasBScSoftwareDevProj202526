@@ -1,4 +1,6 @@
-use std::{fmt::Display, sync::Mutex, sync::Arc, u64};
+use std::{fmt::Display, sync::{Arc}, u64};
+
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 
 use crate::persistent_random_access_memory::{Error as PRAMError, PersistentRandomAccessMemory, Pointer};
 
@@ -9,6 +11,8 @@ pub enum Error {
     InvalidOperation,
     UnspecifiedMemoryError(PRAMError),
     PersistenceError(PRAMError),
+    SynchronizationError,
+    RecursiveChangedNeeded,
 }
 
 impl Display for Error {
@@ -19,6 +23,8 @@ impl Display for Error {
             Error::InvalidOperation => write!(f, "Invalid operation"),
             Error::UnspecifiedMemoryError(e) => write!(f, "Unspecified memory error: {}", e),
             Error::PersistenceError(e) => write!(f, "Persistence error: {}", e),
+            Error::SynchronizationError => write!(f, "Synchronization error"),
+            Error::RecursiveChangedNeeded => write!(f, "Recursive change needed but prohibeded."),
         }
     }
 }
@@ -31,9 +37,9 @@ pub trait BTreeIndex {
     /// - `value`: The value to associate with the key.
     /// 
     /// Returns:
-    /// - `Ok(())` if the operation was successful.
+    /// - `Ok(Some(old_value))` if the key already existed, where `old_value` is the previous value associated with the key.
     /// - `Err(Error)` if there was an error during the operation.
-    fn set(&mut self, key: u64, value: u64) -> Result<(), Error>;
+    fn set(&mut self, key: u64, value: u64) -> Result<Option<u64>, Error>;
 
     /// Gets the value associated with the given key.
     /// 
@@ -107,41 +113,6 @@ impl Clone for BTreeNode {
 }
 impl Copy for BTreeNode {}
 
-pub struct ConcurrentBTreeIndexPRAM {
-    tree: Arc<Mutex<BTreeIndexPRAM>>,
-}
-
-impl BTreeIndex for ConcurrentBTreeIndexPRAM {
-    fn set(&mut self, key: u64, value: u64) -> Result<(), Error> {
-        let mut tree = self.tree.lock().unwrap();
-        tree.insert_or_update(key, value)
-    }
-
-    fn get(&self, key: u64) -> Result<u64, Error> {
-        let tree = self.tree.lock().unwrap();
-        tree.get(key)
-    }
-
-    fn remove(&mut self, key: u64) -> Result<(), Error> {
-        let mut tree = self.tree.lock().unwrap();
-        tree.remove(key)?;
-        Ok(())
-    }
-
-    fn persist(&self) -> Result<(), Error> {
-        let tree = self.tree.lock().unwrap();
-        tree.pram.persist().map_err(Error::PersistenceError)
-    }
-}
-
-impl Clone for ConcurrentBTreeIndexPRAM {
-    fn clone(&self) -> Self {
-        ConcurrentBTreeIndexPRAM {
-            tree: Arc::clone(&self.tree),
-        }
-    }
-}
-
 pub struct ConcurrentIterator<'a> {
     _guard: std::sync::MutexGuard<'a, BTreeIndexPRAM>,
     iter: Box<dyn Iterator<Item = (u64, u64)> + 'a>,
@@ -156,35 +127,11 @@ impl<'a> Iterator for ConcurrentIterator<'a>
     }
 }
 
-impl ConcurrentBTreeIndexPRAM {
-    pub fn new(pram: Arc<PersistentRandomAccessMemory>) -> Self {
-        let tree = BTreeIndexPRAM::new(pram);
-        ConcurrentBTreeIndexPRAM {
-            tree: Arc::new(Mutex::new(tree)),
-        }
-    }
-
-    /// Creates an iterator over the B-tree index.
-    /// 
-    /// Returns:
-    /// - `Ok(ConcurrentIterator)` if the operation was successful.
-    /// - `Err(Error)` if there was an error during the operation.
-    /// 
-    /// Warning: The iterator holds a lock on the B-tree index for its lifetime.
-    pub fn iter(&'_ self) -> Result<ConcurrentIterator<'_>, Error> {
-        let tree = self.tree.lock().unwrap();
-        let iter = tree.iter()?;
-        Ok(ConcurrentIterator {
-            _guard: tree,
-            iter: Box::new(iter),
-        })
-    }
-}
-
 
 pub struct BTreeIndexPRAM {
     pram: Arc<PersistentRandomAccessMemory>,
     root: Pointer<BTreeNode>,
+    lock: Arc<RwLock<()>>, // For concurrent access
 }
 
 struct BTreeNodeRemovePointerCache{
@@ -214,6 +161,7 @@ impl BTreeIndexPRAM {
         BTreeIndexPRAM { 
             pram,
             root,
+            lock: Arc::new(RwLock::new(())),
         }
     }
 
@@ -246,6 +194,34 @@ impl BTreeIndexPRAM {
         }
     }
 
+    /// Upgrades a read lock to a write lock in the given LockGuard.
+    /// 
+    /// Parameters:
+    /// - `lock_guard`: The LockGuard containing the locks to upgrade.
+    fn upgrade_lock(lock_guard: &mut LockGuard) {
+        if lock_guard.write_lock.is_none() {
+            if let Some(read_lock) = lock_guard.read_lock.take() {
+                let write_lock = RwLockUpgradableReadGuard::upgrade(read_lock);
+                lock_guard.write_lock = Some(write_lock);
+                lock_guard.read_lock = None;
+            }
+        }
+    }
+
+    /// Downgrades a write lock to a read lock in the given LockGuard.
+    /// 
+    /// Parameters:
+    /// - `lock_guard`: The LockGuard containing the locks to downgrade.
+    fn downgrade_lock(lock_guard: &mut LockGuard) {
+        if lock_guard.read_lock.is_none() {
+            if let Some(write_lock) = lock_guard.write_lock.take() {
+                let read_lock = RwLockWriteGuard::downgrade_to_upgradable(write_lock);
+                lock_guard.read_lock = Some(read_lock);
+                lock_guard.write_lock = None;
+            }
+        }
+    }
+
     /// Recursive helper function to insert or update a key-value pair.
     ///
     /// Parameters:
@@ -254,10 +230,13 @@ impl BTreeIndexPRAM {
     /// - `node_ptr`: The pointer to the current node being processed.
     /// 
     /// Returns:
-    /// - `Ok(Some((median_key, new_node_ptr)))` if the node was split, where `median_key` is the key to promote and `new_node_ptr` is the pointer to the new node.
+    /// - `Ok((Some(old_value), Some(median_key, pointer)))` if the key already existed, where `old_value` is the previous value associated with the key.
     /// - `Ok(None)` if no split was needed.
-    fn insert_or_update_recursive(&mut self, key: u64, value: u64, node: &mut BTreeNode, parent_key: u64) -> Result<Option<(u64, Pointer<BTreeNode>)>, Error> {
+    fn insert_or_update_recursive(&mut self, key: u64, value: u64, node: &mut BTreeNode, parent_key: u64, lock_guard: &mut LockGuard) -> Result<(Option<u64>, Option<(u64, Pointer<BTreeNode>)>), Error> {
         if node.is_leaf {
+            // Upgrade to write lock as we are modifying the node.
+            Self::upgrade_lock(lock_guard);
+
             // Search for the correct position to insert the new key
             let index = node.keys.as_slice()[0..node.length].iter().position(|e| *e >= key);
 
@@ -266,7 +245,9 @@ impl BTreeIndexPRAM {
                 if node.keys[index] == key { // key exist and mode is not insert!
                     node.values[index] = value;
 
-                    return Ok(None); // No split needed
+                    // Downgrade back to read lock as no further modifications are needed.
+                    Self::downgrade_lock(lock_guard);
+                    return Ok((Some(value), None)); // No split needed
                 }
             }
 
@@ -286,7 +267,10 @@ impl BTreeIndexPRAM {
                 node.values[index] = value;
                 node.length += 1;
 
-                Ok(None) // No split needed
+                // Downgrade back to read lock as no further modifications are needed.
+                Self::downgrade_lock(lock_guard);
+
+                Ok((None, None)) // No split needed
             } else { // Need to split the node
                 // Find median key
                 let median_index = node.length / 2 - 1;
@@ -343,7 +327,7 @@ impl BTreeIndexPRAM {
                 node.values[BTREE_ORDER - 1] = right_node_ptr.address;
 
                 // The median key is actually not in the new node, it's the first key of the original node
-                return Ok(Some((median_key, right_node_ptr))); // Return median key and new node pointer
+                return Ok((None,Some((median_key, right_node_ptr)))); // Return median key and new node pointer
             }
         } else {
             // Search for the correct position to insert the new key
@@ -359,7 +343,7 @@ impl BTreeIndexPRAM {
             // The caller that dereferences the Node is responsible to write the value back.
             let mut child = child_ptr.deref().map_err(Error::UnspecifiedMemoryError)?;
 
-            let split_result = self.insert_or_update_recursive(key, value, &mut child, child_key)?;
+            let (old_value, split_result) = self.insert_or_update_recursive(key, value, &mut child, child_key, lock_guard)?;
 
             child_ptr.set(&child).map_err(Error::UnspecifiedMemoryError)?;
 
@@ -393,7 +377,7 @@ impl BTreeIndexPRAM {
                         node.length += 1;
                     }
 
-                    return Ok(None); // No split needed
+                    return Ok((old_value, None)); // No split needed
                 } else {
                     // Need to split this internal node
                     let median_index = node.length / 2 -1;
@@ -476,10 +460,10 @@ impl BTreeIndexPRAM {
                     let mut right_node_ptr = self.pram.malloc::<BTreeNode>(std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
                     right_node_ptr.set(&right_node).map_err(Error::UnspecifiedMemoryError)?;
 
-                    return Ok(Some((median_key, right_node_ptr))); // Return median key and new node pointer
+                    return Ok((old_value, Some((median_key, right_node_ptr)))); // Return median key and new node pointer
                 }
             }
-            Ok(None) // No split needed
+            Ok((None, None)) // No split needed
         }
     }
 
@@ -490,12 +474,12 @@ impl BTreeIndexPRAM {
     /// - `value`: The value to associate with the key.
     /// 
     /// Returns:
-    /// - `Ok(())` if the operation was successful.
+    /// - `Ok(old_value)` if the key already existed, where `old_value` is the previous value associated with the key.
     /// - `Err(Error)` if there was an error during the operation.
-    fn insert_or_update(&mut self, key: u64, value: u64) -> Result<(), Error> {
+    fn insert_or_update(&mut self, key: u64, value: u64, lock_guard: &mut LockGuard) -> Result<Option<u64>, Error> {
         let mut root = self.root.deref().map_err(Error::UnspecifiedMemoryError)?;
 
-        let split = self.insert_or_update_recursive(key, value, &mut root, u64::MAX)?;
+        let (old_value, split) = self.insert_or_update_recursive(key, value, &mut root, u64::MAX, lock_guard)?;
 
         if let Some((median_key, new_right_ptr)) = split {
             let mut left_child_ptr = self.pram.malloc::<BTreeNode>(std::mem::size_of::<BTreeNode>()).map_err(Error::UnspecifiedMemoryError)?;
@@ -521,7 +505,7 @@ impl BTreeIndexPRAM {
             self.root.set(&root).map_err(Error::UnspecifiedMemoryError)?;
         }
 
-        Ok(())
+        Ok(old_value)
     }
 
     /// Borrows a key from the left sibling of the given node.
@@ -1010,12 +994,26 @@ impl BTreeIndexPRAM {
     }
 }
 
+struct LockGuard<'a> {
+    read_lock: Option<RwLockUpgradableReadGuard<'a, ()>>,
+    write_lock: Option<RwLockWriteGuard<'a, ()>>,
+}
+
 impl BTreeIndex for BTreeIndexPRAM {
-    fn set(&mut self, key: u64, value: u64) -> Result<(), Error> {
-        self.insert_or_update(key, value)
+    fn set(&mut self, key: u64, value: u64) -> Result<Option<u64>, Error> {
+        let lock = self.lock.clone();
+        // Acquire write lock as we are modifying the structure. (Locked until dropped)
+        let upgradable_read_lock = lock.upgradable_read();
+        let mut lock_guard = LockGuard {
+            read_lock: Some(upgradable_read_lock),
+            write_lock: None,
+        };
+        self.insert_or_update(key, value, &mut lock_guard)
     }
 
     fn get(&self, key: u64) -> Result<u64, Error> {
+        // Acquire read lock as we are only reading the structure. (Locked until dropped)
+        let _read_lock = self.lock.read();
         let leaf = self.find_leaf_node(key, &mut self.root.clone())?;
 
         // search for key in leafe node.
@@ -1035,6 +1033,8 @@ impl BTreeIndex for BTreeIndexPRAM {
     }
 
     fn persist(&self) -> Result<(), Error> {
+        // Acquire write lock as we are persisting the structure. (Locked until dropped)
+        let _read_lock = self.lock.read();
         self.pram.persist().map_err(Error::PersistenceError)
     }
 }
@@ -1120,9 +1120,9 @@ mod tests {
         PersistentRandomAccessMemory::new(16 * 1024 * 1024, &path)
     }
 
-    fn new_index(id: &str) -> ConcurrentBTreeIndexPRAM {
+    fn new_index(id: &str) -> BTreeIndexPRAM {
         let pram = make_pram(id);
-        ConcurrentBTreeIndexPRAM::new(pram)
+        BTreeIndexPRAM::new(pram)
     }
 
     #[test]
@@ -1264,7 +1264,7 @@ mod tests {
         delete_rate: u32,
         update_rate: u32,
         id: &str,
-    ) -> (super::ConcurrentBTreeIndexPRAM, std::collections::HashMap<u64, u64>) {
+    ) -> (super::BTreeIndexPRAM, std::collections::HashMap<u64, u64>) {
         let mut idx = new_index(&format!("generate_random_tree_{}", id));
         use std::collections::HashMap;
         let mut expected: HashMap<u64, u64> = HashMap::new();

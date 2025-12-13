@@ -1,4 +1,6 @@
-use std::sync::{Arc, RwLock, atomic::{AtomicI64, AtomicU64}};
+use std::sync::{Arc, atomic::{AtomicI64, AtomicU64}};
+
+use parking_lot::RwLock;
 
 use crate::persistent_random_access_memory::{self, PersistentRandomAccessMemory, Pointer};
 
@@ -139,7 +141,7 @@ impl<T> WriteAheadLog<T> where T: Sized {
 impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
     fn append(&mut self, entry: &T) -> Result<(), Error> {
         // Acquire read lock to allow concurrent appends and pops but block commits
-        let _persist_guard = self.persist_lock.read().unwrap();
+        let _persist_guard = self.persist_lock.read();
 
         // Atomically increase length
         loop {
@@ -160,7 +162,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         // Read current head index
         let head;
         {
-            let mut head_pointer = self.head.write().map_err(|_| Error::AppendFailed)?;
+            let mut head_pointer = self.head.write();
             head = self.head_cache.load(std::sync::atomic::Ordering::SeqCst);
             let new_head = (head + 1) % self.size as u64;
             // Update head index and length
@@ -176,7 +178,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
     fn commit(&mut self) -> Result<(), Error> {
         // Acquire write lock to prevent appends/pops during commit
-        let _persist_guard = self.persist_lock.write().unwrap();
+        let _persist_guard = self.persist_lock.write();
         self.pram.persist().map_err(Error::CommitError)
     }
 
@@ -195,7 +197,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
     fn pop(&mut self) -> Result<T, Error> {
         // Acquire read lock to allow concurrent appends and pops but block commits
-        let _persist_guard = self.persist_lock.read().unwrap();
+        let _persist_guard = self.persist_lock.read();
 
         // Make sure there is at least one entry to pop
         loop {
@@ -215,7 +217,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
         let tail_val;
         {
-            let mut tail_pointer = self.tail.write().map_err(|_| Error::AppendFailed)?;
+            let mut tail_pointer = self.tail.write();
             // Read tail, fetch entry, then advance tail
             tail_val = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
             let new_tail = (tail_val + 1) % self.size as u64;
@@ -265,8 +267,8 @@ impl<T> Iterator for WALIterator<T> where T: Sized {
         let tail;
         let head;
         {
-            let _head_guard = self.wal.head.read().ok()?;
-            let _tail_guard = self.wal.tail.read().ok()?;
+            let _head_guard = self.wal.head.read();
+            let _tail_guard = self.wal.tail.read();
 
             tail = self.wal.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
             head = self.wal.head_cache.load(std::sync::atomic::Ordering::SeqCst);

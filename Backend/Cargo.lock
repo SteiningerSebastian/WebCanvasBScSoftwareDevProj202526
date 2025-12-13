@@ -894,6 +894,7 @@ dependencies = [
  "arc-swap",
  "bincode",
  "memmap2",
+ "parking_lot",
  "serde_json",
  "tempfile",
  "tracing",
