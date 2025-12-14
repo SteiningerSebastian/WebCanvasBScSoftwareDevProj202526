@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn test_write_and_read_u64() {
         let memory = create_test_memory();
-        let mut ptr = memory.malloc::<u64>(std::mem::size_of::<u64>()).unwrap();
+        let ptr = memory.malloc::<u64>(std::mem::size_of::<u64>()).unwrap();
         
         let value: u64 = 0x1234567890ABCDEF;
         ptr.set(&value).unwrap();
@@ -105,7 +105,7 @@ mod tests {
         }
         
         let memory = create_test_memory();
-        let mut ptr = memory.malloc::<TestStruct>(std::mem::size_of::<TestStruct>()).unwrap();
+        let ptr = memory.malloc::<TestStruct>(std::mem::size_of::<TestStruct>()).unwrap();
         
         let value = TestStruct { a: 42, b: 0xDEADBEEF, c: 255 };
         ptr.set(&value).unwrap();
@@ -123,7 +123,7 @@ mod tests {
         
         let value: [u64; 5] = [1, 2, 3, 4, 5];
         for i in 0..5 {
-            let mut elem_ptr = ptr.at(i);
+            let elem_ptr = ptr.at(i);
             elem_ptr.set(&value[i]).unwrap();
         }
 
@@ -137,9 +137,9 @@ mod tests {
     fn test_multiple_allocations() {
         let memory = create_test_memory();
         
-        let mut ptr1 = memory.malloc::<u64>(64).unwrap();
-        let mut ptr2 = memory.malloc::<u64>(128).unwrap();
-        let mut ptr3 = memory.malloc::<u64>(256).unwrap();
+        let ptr1 = memory.malloc::<u64>(64).unwrap();
+        let ptr2 = memory.malloc::<u64>(128).unwrap();
+        let ptr3 = memory.malloc::<u64>(256).unwrap();
         
         let val1: u64 = 111;
         let val2: u64 = 222;
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn test_persist() {
         let memory = create_test_memory();
-        let mut ptr = memory.malloc::<u64>(std::mem::size_of::<u64>()).unwrap();
+        let ptr = memory.malloc::<u64>(std::mem::size_of::<u64>()).unwrap();
         
         let value: u64 = 0x123456789ABCDEF0;
         ptr.set(&value).unwrap();
@@ -262,12 +262,12 @@ mod tests {
         let memory = create_test_memory();
         
         // Write to page 0
-        let mut ptr1 = memory.smalloc::<u64>(0, 8).unwrap();
+        let ptr1 = memory.smalloc::<u64>(0, 8).unwrap();
         let val1: u64 = 0xAAAA;
         ptr1.set(&val1).unwrap();
         
         // Write to page 2 (foArces page swap)
-        let mut ptr2 = memory.smalloc::<u64>(8192, 8).unwrap();
+        let ptr2 = memory.smalloc::<u64>(8192, 8).unwrap();
         let val2: u64 = 0xBBBB;
         ptr2.set(&val2).unwrap();
         
@@ -283,9 +283,9 @@ mod tests {
         let memory = create_test_memory();
         
         // Write to multiple pages
-        let mut ptr1 = memory.smalloc::<u64>(0, 8).unwrap();
-        let mut ptr2 = memory.smalloc::<u64>(4096, 8).unwrap();
-        let mut ptr3 = memory.smalloc::<u64>(8192, 8).unwrap();
+        let ptr1 = memory.smalloc::<u64>(0, 8).unwrap();
+        let ptr2 = memory.smalloc::<u64>(4096, 8).unwrap();
+        let ptr3 = memory.smalloc::<u64>(8192, 8).unwrap();
         
         ptr1.set(&1u64).unwrap();
         ptr2.set(&2u64).unwrap();
@@ -346,10 +346,10 @@ mod tests {
         let memory = create_test_memory();
 
         let page_size = PAGE_SIZE as u64;
-        let mut p0 = memory.smalloc::<u64>(0, 8).unwrap();
-        let mut p1 = memory.smalloc::<u64>(page_size, 8).unwrap();
-        let mut p2 = memory.smalloc::<u64>(page_size * 2, 8).unwrap();
-        let mut p3 = memory.smalloc::<u64>(page_size * 3, 8).unwrap();
+        let p0 = memory.smalloc::<u64>(0, 8).unwrap();
+        let p1 = memory.smalloc::<u64>(page_size, 8).unwrap();
+        let p2 = memory.smalloc::<u64>(page_size * 2, 8).unwrap();
+        let p3 = memory.smalloc::<u64>(page_size * 3, 8).unwrap();
 
         let mut vals = [
             0x1111_1111_1111_1111u64,
@@ -396,10 +396,9 @@ mod tests {
         
         // Write to all pages
         for page in 0..4 {
-            let mut ptr = memory.smalloc::<u64>(page * page_size, 8).unwrap();
+            let ptr = memory.smalloc::<u64>(page * page_size, 8).unwrap();
             let value = (page + 1) as u64 * 0x1111_1111_1111_1111u64;
             ptr.set(&value).unwrap();
-            memory.free(ptr.address, 8).unwrap(); // Free after writing so someone else can allocate.
         }
         
         // Read all pages in sequence multiple times
@@ -408,7 +407,6 @@ mod tests {
                 let ptr = memory.smalloc::<u64>(page * page_size, 8).unwrap();
                 let expected = (page + 1) as u64 * 0x1111_1111_1111_1111u64;
                 assert_eq!(ptr.deref().unwrap(), expected);
-                memory.free(ptr.address, 8).unwrap(); // Free after reading so someone else can allocate.
             }
         }
         
@@ -454,7 +452,7 @@ mod tests {
         // Write to more pages than cache can hold (cache holds 2 pages)
         let mut ptrs = Vec::new();
         for page in 0..4 {
-            let mut ptr = memory.smalloc::<u64>(page * page_size, 8).unwrap();
+            let ptr = memory.smalloc::<u64>(page * page_size, 8).unwrap();
             let value = 0xAAAA_0000_0000_0000u64 | page;
             ptr.set(&value).unwrap();
             ptrs.push((ptr, value));
@@ -474,8 +472,8 @@ mod tests {
         let memory = create_test_memory();
         let page_size =  PAGE_SIZE as u64;
         
-        let mut p0 = memory.smalloc::<u64>(0, 8).unwrap();
-        let mut p1 = memory.smalloc::<u64>(page_size * 3, 8).unwrap();
+        let p0 = memory.smalloc::<u64>(0, 8).unwrap();
+        let p1 = memory.smalloc::<u64>(page_size * 3, 8).unwrap();
         
         p0.set(&0xAAAAu64).unwrap();
         p1.set(&0xBBBBu64).unwrap();
@@ -528,7 +526,7 @@ mod tests {
 
         // Write values with indexing
         for i in 0..elem_count {
-            let mut p = array.at(i);
+            let p = array.at(i);
             let v = Elem(((i as u64) << 32) ^ 0xDEAD_BEEF_u64 ^ (i as u64));
             p.set(&v).unwrap();
         }
@@ -552,10 +550,10 @@ mod tests {
         let page_size =  PAGE_SIZE as u64;
 
         // Place four u64s on distinct pages
-        let mut p0 = memory.smalloc::<u64>(0, 8).unwrap();
-        let mut p1 = memory.smalloc::<u64>(page_size-1, 8).unwrap();
-        let mut p2 = memory.smalloc::<u64>(page_size * 2 -2, 8).unwrap();
-        let mut p3 = memory.smalloc::<u64>(page_size * 3 -3, 8).unwrap();
+        let p0 = memory.smalloc::<u64>(0, 8).unwrap();
+        let p1 = memory.smalloc::<u64>(page_size-1, 8).unwrap();
+        let p2 = memory.smalloc::<u64>(page_size * 2 -2, 8).unwrap();
+        let p3 = memory.smalloc::<u64>(page_size * 3 -3, 8).unwrap();
 
         let vals_a = [
             0xAAAA_AAAA_AAAA_AAAAu64,

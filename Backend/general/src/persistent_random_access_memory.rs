@@ -106,7 +106,7 @@ impl<T> Pointer<T> where T: Sized {
     /// 
     /// Returns:
     /// - Result indicating success or failure.
-    pub fn set(&mut self, value: &T) -> Result<(), Error> where T: Sized {
+    pub fn set(&self, value: &T) -> Result<(), Error> where T: Sized {
         let pram = self.memory.upgrade().ok_or(Error::MemoryAllocationError)?;
         let bytes = unsafe {
             std::slice::from_raw_parts((value as *const T) as *const u8, std::mem::size_of::<T>())

@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput, BatchSize, black_box};
 use general::persistent_random_access_memory::PersistentRandomAccessMemory;
-use general::write_ahead_log::{WriteAheadLog, WriteAheadLog};
+use general::write_ahead_log::{WriteAheadLog, WriteAheadLogTrait};
 use std::time::Duration;
 
 const PAGE_SIZE: usize = 4096; // match other benches
@@ -121,11 +121,11 @@ fn bench_wal_pop(c: &mut Criterion) {
 				|| {
 					let dir = tempfile::tempdir().unwrap();
 					let path = dir.path().join("wal_pop.pram").to_string_lossy().to_string();
-					let mut wal = make_wal::<Small>(cap, &path);
+					let wal = make_wal::<Small>(cap, &path);
 					for _ in 0..cap { let _ = wal.append(&Small { _a: 0 }); }
 					(dir, wal)
 				},
-				|(dir, mut wal)| {
+				|(dir, wal)| {
 					let _keep = dir;
 					let mut popped = 0usize;
 					while let Ok(_) = wal.pop() { popped += 1; }
@@ -149,11 +149,11 @@ fn bench_wal_peak(c: &mut Criterion) {
 			|| {
 				let dir = tempfile::tempdir().unwrap();
 				let path = dir.path().join("wal_peak.pram").to_string_lossy().to_string();
-				let mut wal = make_wal::<Medium>(CAP, &path);
+				let wal = make_wal::<Medium>(CAP, &path);
 				for i in 0..CAP { let entry = Medium { a: i as u64, _b: 1, _c: 2, _d: 3 }; let _ = wal.append(&entry); }
 				(dir, wal)
 			},
-			|(dir, mut wal)| {
+			|(dir, wal)| {
 				let _keep = dir;
 				let mut sum = 0u64;
 				for _ in 0..CAP { if let Ok(v) = wal.peak() { sum = sum.wrapping_add(v.a); } }

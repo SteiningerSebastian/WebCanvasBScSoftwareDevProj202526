@@ -142,7 +142,7 @@ fn bench_random_access(c: &mut Criterion) {
                 let fpram = PersistentRandomAccessMemory::new(MEMORY_SIZE, &path_str);
                 let mut ptrs = Vec::with_capacity(TOTAL_PTRS);
                 for _ in 0..TOTAL_PTRS {
-                    let mut p = fpram.malloc::<u64>(std::mem::size_of::<u64>()).expect("malloc");
+                    let p = fpram.malloc::<u64>(std::mem::size_of::<u64>()).expect("malloc");
                     // init to make sure pages exist
                     p.set(&0u64).expect("init");
                     ptrs.push(p);
@@ -193,7 +193,7 @@ fn bench_sequential_access(c: &mut Criterion) {
                 let _keep_dir = dir;
                 for i in 0..OPS_PER_SAMPLE {
                     let idx = i % ELEMENTS;
-                    let mut elem = array.at(idx);
+                    let elem = array.at(idx);
                     let v = i as u64;
                     elem.set(&v).expect("seq write");
                 }
@@ -273,7 +273,7 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                 for i in 0..ITERS {
                     // HOT: frequent read-write (+1)
                     let idx = i % HOT_LEN;
-                    let mut p = hot.at(idx);
+                    let p = hot.at(idx);
                     let v: u64 = p.deref().expect("hot rd");
                     p.set(&(v + 1)).expect("hot wr");
 
@@ -285,7 +285,7 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                     let _ = rh.at(r2).deref().expect("rh rd2");
                     let _ = rh.at(r3).deref().expect("rh rd3");
                     if (i & 0xF) == 0 {
-                        let mut p = rh.at(r1);
+                        let p = rh.at(r1);
                         let v: u64 = p.deref().expect("rh wr rd");
                         p.set(&(v + 1)).expect("rh wr");
                     }
@@ -293,10 +293,10 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                     // WRITE-HEAVY: two writes per iter, rare reads
                     let w1 = i % WRITE_HEAVY_LEN;
                     let w2 = (i.wrapping_mul(3)) % WRITE_HEAVY_LEN;
-                    let mut p1 = wh.at(w1);
+                    let p1 = wh.at(w1);
                     let v1: u64 = p1.deref().expect("wh rd1");
                     p1.set(&(v1 + 1)).expect("wh wr1");
-                    let mut p2 = wh.at(w2);
+                    let p2 = wh.at(w2);
                     let v2: u64 = p2.deref().expect("wh rd2");
                     p2.set(&(v2 + 1)).expect("wh wr2");
                     if (i & 0x1F) == 0 {
@@ -306,7 +306,7 @@ fn bench_mixed_hot_cold(c: &mut Criterion) {
                     // COLD: rare write (every 128), else read
                     let c = i % COLD_LEN;
                     if (i & 0x7F) == 0 {
-                        let mut p = cold.at(c);
+                        let p = cold.at(c);
                         let v: u64 = p.deref().expect("cold rd");
                         p.set(&(v + 1)).expect("cold wr");
                     } else {

@@ -29,25 +29,25 @@ pub trait WriteAheadLogTrait<T> where T: Sized {
     /// 
     /// Returns:
     /// - `Result<(), Error>`: Ok if the operation is successful, Err otherwise.
-    fn append(&mut self, entry: &T) -> Result<(), Error>;
+    fn append(&self, entry: &T) -> Result<(), Error>;
 
     /// Commits the current state of the write-ahead log.
     /// 
     /// Returns:
     /// - `Result<(), Error>`: Ok if the operation is successful, Err otherwise.
-    fn commit(&mut self) -> Result<(), Error>;
+    fn commit(&self) -> Result<(), Error>;
 
     /// Peeks at the next entry in the write-ahead log without removing it.
     ///
     /// Returns:
     /// - `Result<Vec<u8>, Error>`: Ok containing the next log entry if successful, Err otherwise.
-    fn peak(&mut self) -> Result<T, Error>;
+    fn peak(&self) -> Result<T, Error>;
 
     /// Pops the next entry from the write-ahead log, removing it from the log.
     /// 
     /// Returns:
     /// - `Result<Vec<u8>, Error>`: Ok containing the popped log entry if successful, Err otherwise.
-    fn pop(&mut self) -> Result<T, Error>;
+    fn pop(&self) -> Result<T, Error>;
 
     /// Creates an iterator over the write-ahead log entries. (lifo order)
     /// 
@@ -56,7 +56,7 @@ pub trait WriteAheadLogTrait<T> where T: Sized {
     /// 
     /// Warning: The iterator does not guarantee consistency if the WAL is modified during iteration.
     /// If modifications occur, the iterator may yield already removed entries.
-    fn iter(&mut self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized;
+    fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized;
 }
 
 pub struct WriteAheadLog<T> where T: Sized{
@@ -139,7 +139,7 @@ impl<T> WriteAheadLog<T> where T: Sized {
 }
 
 impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
-    fn append(&mut self, entry: &T) -> Result<(), Error> {
+    fn append(&self, entry: &T) -> Result<(), Error> {
         // Acquire read lock to allow concurrent appends and pops but block commits
         let _persist_guard = self.persist_lock.read();
 
@@ -162,7 +162,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         // Read current head index
         let head;
         {
-            let mut head_pointer = self.head.write();
+            let head_pointer = self.head.write();
             head = self.head_cache.load(std::sync::atomic::Ordering::SeqCst);
             let new_head = (head + 1) % self.size as u64;
             // Update head index and length
@@ -176,13 +176,13 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<(), Error> {
+    fn commit(&self) -> Result<(), Error> {
         // Acquire write lock to prevent appends/pops during commit
         let _persist_guard = self.persist_lock.write();
         self.pram.persist().map_err(Error::CommitError)
     }
 
-    fn peak(&mut self) -> Result<T, Error> {
+    fn peak(&self) -> Result<T, Error> {
         let tail = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
 
         let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
@@ -195,7 +195,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         Ok(entry)
     }
 
-    fn pop(&mut self) -> Result<T, Error> {
+    fn pop(&self) -> Result<T, Error> {
         // Acquire read lock to allow concurrent appends and pops but block commits
         let _persist_guard = self.persist_lock.read();
 
@@ -217,7 +217,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
         let tail_val;
         {
-            let mut tail_pointer = self.tail.write();
+            let tail_pointer = self.tail.write();
             // Read tail, fetch entry, then advance tail
             tail_val = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
             let new_tail = (tail_val + 1) % self.size as u64;
@@ -231,7 +231,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         Ok(entry)
     }
 
-    fn iter(&mut self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
+    fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
         // Read head and tail indices from cache
         let head = self.head_cache.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -301,7 +301,6 @@ mod tests {
 
     // Simple in-memory implementation of PersistentRandomAccessMemory for testing.
     // no additional imports needed
-
     fn unique_test_path(suffix: &str) -> String {
         let tmp = std::env::temp_dir();
         let ts = std::time::SystemTime::now()
@@ -330,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_append_and_pop_basic() {
-        let mut wal = new_wal::<Small>(4, "basic");
+        let wal = new_wal::<Small>(4, "basic");
         wal.append(&Small(10)).unwrap();
         wal.append(&Small(20)).unwrap();
         // Pop first inserted value per current implementation logic
@@ -342,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_out_of_memory() {
-        let mut wal = new_wal::<Small>(2, "out_of_memory");
+        let wal = new_wal::<Small>(2, "out_of_memory");
         wal.append(&Small(1)).unwrap();
         wal.append(&Small(2)).unwrap();
         assert!(matches!(wal.append(&Small(3)), Err(Error::OutOfMemory)));
@@ -350,13 +349,13 @@ mod tests {
 
     #[test]
     fn test_peak_empty_error() {
-        let mut wal = new_wal::<Medium>(3, "peak_empty_error");
+        let wal = new_wal::<Medium>(3, "peak_empty_error");
         assert!(matches!(wal.peak(), Err(Error::PeakFailed)));
     }
 
     #[test]
     fn test_peak_after_append() {
-        let mut wal = new_wal::<Medium>(3, "peak_after_append");
+        let wal = new_wal::<Medium>(3, "peak_after_append");
         wal.append(&Medium { a: 1, b: 2 }).unwrap();
         // Current implementation peaks at tail index which is initially 0 (likely default memory)
         let val = wal.peak();
@@ -365,36 +364,36 @@ mod tests {
 
     #[test]
     fn test_commit() {
-        let mut wal = new_wal::<Large>(2, "commit");
+        let wal = new_wal::<Large>(2, "commit");
         wal.append(&Large { arr: [1u8; 32] }).unwrap();
         assert!(wal.commit().is_ok());
     }
 
     #[test]
     fn test_pop_empty_error() {
-        let mut wal = new_wal::<Small>(2, "pop_empty_error");
+        let wal = new_wal::<Small>(2, "pop_empty_error");
         assert!(matches!(wal.pop(), Err(Error::PopFailed)));
     }
 
     #[test]
     fn test_multiple_types_capacity() {
-        let mut wal_small = new_wal::<Small>(1, "multiple_types_capacity_small");
+        let wal_small = new_wal::<Small>(1, "multiple_types_capacity_small");
         wal_small.append(&Small(5)).unwrap();
         assert!(matches!(wal_small.append(&Small(6)), Err(Error::OutOfMemory)));
 
-        let mut wal_medium = new_wal::<Medium>(2, "multiple_types_capacity_medium");
+        let wal_medium = new_wal::<Medium>(2, "multiple_types_capacity_medium");
         wal_medium.append(&Medium { a: 3, b: 4 }).unwrap();
         wal_medium.append(&Medium { a: 5, b: 6 }).unwrap();
         assert!(matches!(wal_medium.append(&Medium { a: 7, b: 8 }), Err(Error::OutOfMemory)));
 
-        let mut wal_large = new_wal::<Large>(1, "multiple_types_capacity_large");
+        let wal_large = new_wal::<Large>(1, "multiple_types_capacity_large");
         wal_large.append(&Large { arr: [9u8; 32] }).unwrap();
         assert!(matches!(wal_large.append(&Large { arr: [8u8; 32] }), Err(Error::OutOfMemory)));
     }
 
     #[test]
     fn test_wal_iterator() {
-        let mut wal = new_wal::<Small>(5, "test_wal_iterator");
+        let wal = new_wal::<Small>(5, "test_wal_iterator");
         wal.append(&Small(1)).unwrap();
         wal.append(&Small(2)).unwrap();
         wal.append(&Small(3)).unwrap();

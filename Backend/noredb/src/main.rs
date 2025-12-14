@@ -1,15 +1,16 @@
-use std::{env, net::SocketAddr, path::Path, process};
+use std::{env, fmt::Write, net::SocketAddr, path::Path, process, sync::Arc};
 
 use tonic::{transport::Server};
 use tracing::{Level, debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use general::concurrent_file_key_value_store::{ConcurrentFileKeyValueStore, ConcurrentKeyValueStore};
+use general::{concurrent_file_key_value_store::{ConcurrentFileKeyValueStore, ConcurrentKeyValueStore}, persistent_random_access_memory::PersistentRandomAccessMemory};
 use veritas_client::veritas_client::VeritasClient;
 
-use crate::server::{MyDatabase, noredb};
+use crate::server::{MyDatabaseServer, noredb};
 
 mod server;
+mod canvasdb;
 
 const CONFIG_PATH: &str = "/data/noredb.config";
 const UNIQUE_ID_KEY: &str = "noredb.unique_id";
@@ -152,7 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = format!("0.0.0.0:{}", PORT).parse()?;
-    let database = MyDatabase::new(store);
+
+    // Initialize database server components
+
+    let database = MyDatabaseServer::new(store);
 
     Server::builder()
         .add_service(noredb::database_server::DatabaseServer::new(database))
