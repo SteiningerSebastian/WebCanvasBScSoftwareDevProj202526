@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
-// use general::write_ahead_log::ConcurrentPRAMWriteAheadLog;
+use general::persistent_random_access_memory::PersistentRandomAccessMemory;
+use general::pram_btree_index::{BTreeIndex, BTreeIndexPRAM};
+use general::write_ahead_log::{self, WriteAheadLog};
 use noredb::database_server::{Database};
 use noredb::{Data, DataRequest, DataResponse, GraveStone, Commit};
 
@@ -7,21 +11,20 @@ pub mod noredb {
     tonic::include_proto!("noredb");
 }
 
-pub struct MyDatabase {
+pub struct MyDatabaseServer {
     config : ConcurrentFileKeyValueStore,
-    // write_ahead_log: ConcurrentPRAMWriteAheadLog<>
 }
 
-impl MyDatabase {
+impl MyDatabaseServer {
     pub fn new(config: ConcurrentFileKeyValueStore) -> Self {
-        MyDatabase {
-            config,
+        MyDatabaseServer {
+            config
         }
     }
 }
 
 #[tonic::async_trait]
-impl Database for MyDatabase {
+impl Database for MyDatabaseServer {
     // Implement NoReDB service methods here
     async fn set(
         &self,

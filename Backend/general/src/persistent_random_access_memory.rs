@@ -1,50 +1,47 @@
-use std::{cell::RefCell, collections::BTreeSet, fmt::{Display}, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, rc::{Rc, Weak}};
-
-use crate::page_cache::{self, LruKCache};
+use std::{collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
+use memmap2::{MmapMut};
+use parking_lot::{Mutex, RwLock};
 
 #[derive(Debug)]
 pub enum Error {
+    /// Error reading from persistent memory.
     ReadError,
+    /// Error writing to persistent memory.
     WriteError,
+    /// Error flushing persistent memory to disk.
     FlushError,
-    FileReadError(io::Error),
+    /// Out of memory error. Unable to allocate requested memory.
     OutOfMemoryError,
-    NotOnOnePageError,
-    CacheStoreError(page_cache::Error),
+    /// Data is fragmented across pages.
+    PageFragmentationError,
+    /// Error while swapping files.
     SwapFileError(io::Error),
+    /// Error reading from file.
+    FileReadError(io::Error),
+    /// Error opening file.
     FileOpenError(io::Error),
+    /// Error writing to file.
     FileWriteError(io::Error),
+    /// Unexpected memory allocation error.
     MemoryAllocationError,
+    /// Error during synchronization of access to persistent memory.
+    SynchronizationError,
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::ReadError => write!(f, "Read Error"),
-            Error::WriteError => write!(f, "Write Error"),
-            Error::FlushError => write!(f, "Flush Error"),
-            Error::FileReadError(e) => write!(f, "File Read Error: {}", e),
-            Error::OutOfMemoryError => write!(f, "Out of Memory Error"),
-            Error::NotOnOnePageError => write!(f, "Data not contained on single page Error"),
-            Error::CacheStoreError(e) => write!(f, "Cache Store Error: {}", e),
-            Error::SwapFileError(e) => write!(f, "Swap File Error: {}", e),
-            Error::FileOpenError(e) => write!(f, "File Open Error: {}", e),
-            Error::FileWriteError(e) => write!(f, "File Write Error: {}", e),
+            Error::ReadError => write!(f, "Unable to read from persistent memory."),
+            Error::WriteError => write!(f, "Unable to write to persistent memory."),
+            Error::FlushError => write!(f, "Unable to flush persistent memory to disk."),
+            Error::FileReadError(e) => write!(f, "Unable to read file: {}", e),
+            Error::OutOfMemoryError => write!(f, "Out of memory Error"),
+            Error::PageFragmentationError => write!(f, "Data is fragmented across pages"),
+            Error::SwapFileError(e) => write!(f, "Error while swapping file: {}", e),
+            Error::FileOpenError(e) => write!(f, "Unable to open file: {}", e),
+            Error::FileWriteError(e) => write!(f, "Unable to write to file: {}", e),
             Error::MemoryAllocationError => write!(f, "Memory Allocation Error"),
-        }
-    }
-}
-
-pub struct Pointer {
-    pub address: u64,
-    memory: Weak<dyn PersistentRandomAccessMemory>,
-}
-
-impl Clone for Pointer {
-    fn clone(&self) -> Self {
-        Self {
-            address: self.address,
-            memory: self.memory.clone(),
+            Error::SynchronizationError => write!(f, "Synchronization Error"),
         }
     }
 }
@@ -53,7 +50,28 @@ impl Clone for Pointer {
 /// 
 /// Warning: Be careful when using this struct as it contains a raw pointer to the memory manager.
 /// Improper use can lead to undefined behavior, memory leaks, or data corruption.
-impl Pointer {
+/// Also make sure to synchronize access to the underlying PersistentRandomAccessMemory if used across threads.
+pub struct Pointer<T> where T: Sized {
+    pub address: u64,
+    memory: Weak<PersistentRandomAccessMemory>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> Clone for Pointer<T> where T: Sized {
+    fn clone(&self) -> Self {
+        Self {
+            address: self.address,
+            memory: self.memory.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A Pointer represents a location in persistent random access memory.
+/// 
+/// Warning: Be careful when using this struct as it contains a raw pointer to the memory manager.
+/// Improper use can lead to undefined behavior, memory leaks, or data corruption.
+impl<T> Pointer<T> where T: Sized {
     /// Creates a new Pointer instance.
     ///    
     /// Parameters:
@@ -62,8 +80,8 @@ impl Pointer {
     /// 
     /// Returns:
     /// - A new Pointer instance.
-    pub fn new(pointer: u64, memory: Weak<dyn PersistentRandomAccessMemory>) -> Self {
-        Self { address: pointer, memory }
+    pub fn new(pointer: u64, memory: Weak<PersistentRandomAccessMemory>) -> Self {
+        Self { address: pointer, memory, _marker: std::marker::PhantomData}
     }
 
     /// Creates a Pointer from a given address and memory manager.
@@ -77,153 +95,23 @@ impl Pointer {
     /// 
     /// Warning: The memory manager must outlive the Pointer instance to avoid dangling references.
     /// Also this will not allocate new memory (mark space as used) to allocate new use salloc on the memory.
-    pub fn from_address(pointer: u64, memory: Rc<dyn PersistentRandomAccessMemory>) -> Self {
-        Self { address: pointer, memory: Rc::downgrade(&memory) }
-    }
-
-    /// Dereferences the pointer to get a reference to the value of type T.
-    /// This only works if T is stored within the same page, it will return None otherwise.
-    ///
-    /// Warning: A reference to the internal page_cache is returned. If the page is swapped out, the reference will become invalid.
-    /// Only use this function for short lived operations with high performance requirements, where you are sure the page will not be swapped out of memory.
-    /// 
-    /// Returns:
-    /// - A reference to the value of type T.
-    /// 
-    /// # Safety
-    /// This function is unsafe because it allows access to the underlying data without any lifetime guarantees.
-    /// The caller must ensure that the page containing the data is not swapped out of memory
-    /// while the reference is in use.
-    pub fn unsafe_deref<T>(&mut self) -> Result<Option<&T>, Error> {
-        // Reject misaligned access to prevent UB on &T
-        if (self.address as usize) % std::mem::align_of::<T>() != 0 {
-            return Ok(None);
-        }
-        unsafe {
-            let res = (*self.memory.as_ptr()).unsafe_read(self.address, std::mem::size_of::<T>()).map(|data| {
-                if data.len() == std::mem::size_of::<T>() {
-                    let ptr = data.as_ptr() as *const T;
-                    Some(&*ptr)
-                } else {
-                    None
-                }
-            });
-
-            if let Err(e) = &res {
-                if matches!(e, &Error::NotOnOnePageError) {
-                    return Ok(None);
-                }
-            }
-            res
-        }
-    }
-
-    /// Mutably dereferences the pointer to get a mutable reference to the value of type T.
-    /// This only works if T is stored within the same page, it will return None otherwise.
-    /// 
-    /// Warning: A mutable reference to the internal page_cache is returned. If the page is swapped out, the reference will become invalid.
-    /// Only use this function for short lived operations with high performance requirements, where you are sure
-    /// the page will not be swapped out of memory.
-    /// 
-    /// Returns:
-    /// - A mutable reference to the value of type T.
-    /// 
-    /// # Safety
-    /// This function is unsafe because it allows mutable access to the underlying data, which can lead to
-    /// data races if not used carefully. The caller must ensure that no other references to the same data exist
-    /// while this mutable reference is in use. Additionally, the caller must ensure that the page containing the data is not swapped out of memory
-    /// while the mutable reference is in use.
-    pub fn unsafe_deref_mut<T>(&mut self) -> Result<Option<&mut T>, Error> where T: Sized {
-        // Reject misaligned access to prevent UB on &mut T
-        if (self.address as usize) % std::mem::align_of::<T>() != 0 {
-            return Ok(None);
-        }
-        unsafe {
-            let res = (*self.memory.as_ptr()).unsafe_read_mut(self.address, std::mem::size_of::<T>()).map(|data| {
-                if data.len() == std::mem::size_of::<T>() {
-                    let ptr = data.as_ptr() as *mut T;
-                    Some(&mut *ptr)
-                } else {
-                    None
-                }
-            });
-
-            // Mirror unsafe_deref: treat cross-page as None
-            if let Err(e) = &res {
-                if matches!(e, &Error::NotOnOnePageError) {
-                    return Ok(None);
-                }
-            }
-            res
-        }
-    }
-
-    /// Dereferences the pointer to get a value of type T. 
-    /// This involves reading from the persistent memory and copying the data.
-    /// 
-    /// Warning: Changes to the returned value will not be reflected in persistent memory.
-    /// You must explicitly write back to persistent memory if you want to persist changes.
-    /// 
-    /// Returns:
-    /// - Result containing the value of type T on success or Error on failure.
-    pub fn deref<T>(&self) -> Result<Box<T>, Error> where T: Sized {
-        use std::mem::MaybeUninit;
-        unsafe {
-            let mut value = MaybeUninit::<T>::uninit();
-            let buf = std::slice::from_raw_parts_mut(
-                value.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<T>(),
-            );
-            (*self.memory.as_ptr()).read(self.address, buf)?;
-            Ok(Box::new(value.assume_init()))
-        }
-    }
-
-    /// Dereferences the pointer to get a byte vector of exact length.
-    /// 
-    /// Warning: Changes to the returned value will not be reflected in persistent memory.
-    /// You must explicitly write back to persistent memory if you want to persist changes.
-    /// 
-    /// Returns:
-    /// - Result containing the byte vector on success or Error on failure.
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        unsafe {
-            (*self.memory.as_ptr()).read(self.address, buf)?;
-        }
-        Ok(())
+    pub fn from_address(pointer: u64, memory: Arc<PersistentRandomAccessMemory>) -> Self {
+        Self { address: pointer, memory: Arc::downgrade(&memory), _marker: std::marker::PhantomData }
     }
 
     /// Writes the given value of type T to the location pointed to by this Pointer.
-    ///     
+    /// 
     /// Parameters:
-    /// - value: The value to be written to persistent memory.
+    /// - value: The value of type T to be written to persistent memory.
     /// 
     /// Returns:
     /// - Result indicating success or failure.
-    pub fn write<T>(&mut self, value: &T) -> Result<(), Error> where T: Sized {
-        unsafe {
-            let slice = std::slice::from_raw_parts(
-                (value as *const T) as *const u8,
-                std::mem::size_of::<T>(),
-            );
-        
-            (*self.memory.as_ptr()).write(self.address, slice)?;
+    pub fn set(&self, value: &T) -> Result<(), Error> where T: Sized {
+        let pram = self.memory.upgrade().ok_or(Error::MemoryAllocationError)?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts((value as *const T) as *const u8, std::mem::size_of::<T>())
         };
-        Ok(())
-    }
-
-    /// Writes the given byte slice to the location pointed to by this Pointer.
-    /// 
-    /// Parameters:
-    /// - buf: The byte slice to be written to persistent memory.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    pub fn write_exact(&mut self, buf: &[u8]) -> Result<(), Error> {
-        unsafe {
-            (*self.memory.as_ptr()).write(self.address, buf)?;
-        };
-        Ok(())
+        pram.write(self.address, bytes)
     }
 
     /// Returns a new Pointer offset by the given index of type T.
@@ -234,123 +122,30 @@ impl Pointer {
     /// 
     /// Returns:
     /// - A new Pointer offset by the given index.
-    pub fn at<T>(&self, index: usize) -> Pointer where T: Sized {
-        let offset = (index * std::mem::size_of::<T>()) as u64;
-        Pointer::new(self.address + offset, self.memory.clone())
+    pub fn at(&self, index: usize) -> Pointer<T> where T: Sized { 
+        Pointer {
+            address: self.address + (index as u64 * std::mem::size_of::<T>() as u64),
+            memory: self.memory.clone(),
+            _marker: std::marker::PhantomData,
+        }
     }
 
-    /// Dereferences the pointer at the given index to get a value of type T.
-    /// 
-    /// Warning: Changes to the returned value will not be reflected in persistent memory.
-    /// You must explicitly write back to persistent memory if you want to persist changes.
-    /// 
-    /// Parameters:
-    /// - index: The index to dereference.
+    /// Dereferences the pointer to get the value of type T.
     /// 
     /// Returns:
     /// - Result containing the value of type T on success or Error on failure.
-    pub fn deref_at<T>(&self, index: usize) -> Result<Box<T>, Error> where T: Sized {
-        use std::mem::MaybeUninit;
-        unsafe {
-            let mut value = MaybeUninit::<T>::uninit();
-            let buf = std::slice::from_raw_parts_mut(
-                value.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<T>(),
-            );
-            let offset = (index * std::mem::size_of::<T>()) as u64;
-            (*self.memory.as_ptr()).read(self.address + offset, buf)?;
-            Ok(Box::new(value.assume_init()))
-        }
-    }   
+    /// 
+    /// Warning: The caller must ensure that the memory at the pointer's address is valid and properly aligned for type T.
+    /// Accessing invalid memory may lead to undefined behavior.
+    /// The returned value is a copy of the data at the pointer's address.
+    pub fn deref(&self) -> Result<T, Error> where T: Sized {
+        let pram = self.memory.upgrade().ok_or(Error::MemoryAllocationError)?;
+        pram.read::<T>(self.address)
+    }
 }
 
-pub trait PersistentRandomAccessMemory {
-    /// Dynamically allocates the necessary space for a value in persistent memory
-    /// and returns a Pointer<T> to that location.
-    /// 
-    /// Parameters:
-    /// - value: The value to be stored in persistent memory.
-    /// 
-    /// Returns:
-    /// - Result containing Pointer on success or Error on failure.
-    fn malloc(&self, len: usize) -> Result<Pointer, Error>;
-
-    /// Statically allocates the necessary space for a value in persistent memory
-    /// and returns a Pointer to that location.
-    /// 
-    /// Parameters:
-    /// - len: The length of space to allocate.
-    /// - pointer: The memory address as a u64.
-    /// 
-    /// Returns:
-    /// - Result containing Pointer on success or Error on failure.
-    fn smalloc(&self, pointer: u64, len: usize) -> Result<Pointer, Error>;
-
-    /// Frees the space allocated for the value in persistent memory
-    /// pointed to by the given Pointer.
-    /// 
-    /// Parameters:
-    /// - pointer: The Pointer pointing to the value to be freed.
-    /// - len: The length of space to free.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn free(&self, pointer: Pointer, len: usize) -> Result<(), Error>;
-
-    /// Persist all data in memory.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn persist(&self) -> Result<(), Error>;
-
-    /// Reads data from the specified pointer into the provided buffer.
-    /// 
-    /// Parameters:
-    /// - pointer: The memory address as a u64.
-    /// - len: The length of data to read.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn read(&self, pointer: u64, buf: &mut [u8]) -> Result<(), Error>;
-
-    /// Unsafely reads data from the specified pointer.
-    ///
-    /// Parameters:
-    /// - pointer: The memory address as a u64.
-    /// - len: The length of data to read.
-    /// 
-    /// Returns:
-    /// - Result containing a byte slice on success or Error on failure.
-    /// 
-    /// # Safety
-    /// This function is unsafe because it allows access to the underlying data without any lifetime guarantees.
-    /// The caller must ensure that the page containing the data is not swapped out of memory.
-    fn unsafe_read(&self, pointer: u64, len: usize) -> Result<&[u8], Error>;
-
-    /// Unsafely reads data from the specified pointer.
-    ///
-    /// Parameters:
-    /// - pointer: The memory address as a u64.
-    /// - len: The length of data to read.
-    /// 
-    /// Returns:
-    /// - Result containing a byte slice on success or Error on failure.
-    /// 
-    /// # Safety
-    /// This function is unsafe because it allows access to the underlying data without any lifetime guarantees.
-    /// The caller must ensure that the page containing the data is not swapped out of memory.
-    fn unsafe_read_mut(&self, pointer: u64, len: usize) -> Result<&mut [u8], Error>;
-    
-    /// Writes data from the provided buffer to the specified pointer.
-    ///  
-    /// Parameters:
-    /// - pointer: The memory address as a u64.
-    /// - buf: The buffer containing data to write.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn write(&self, pointer: u64, buf: &[u8]) -> Result<(), Error>;  
-}
+/// The page size we assume the OS to use.
+const PAGE_SIZE: usize = 4096;
 
 /// A persistent random access memory implementation that uses two files as backing storage.
 /// 
@@ -358,404 +153,40 @@ pub trait PersistentRandomAccessMemory {
 /// The second file is the swap file that holds the "uncommited" changes.
 /// This is necessary to ensure data atomicity in case of crashes or power failures.
 /// Either all changes are persisted or none are.
-/// 
-/// Warning: This implementation is not thread-safe. Concurrent access to the same instance
-/// may lead to data races or corruption. Use external synchronization if needed.
-pub struct FilePersistentRandomAccessMemory {
-    cached_page: RefCell<Vec<u8>>,
-    cached_page_dirty: RefCell<bool>,
+pub struct PersistentRandomAccessMemory {
+    // The path does not change.
     path: String,
-    swap_file: RefCell<File>,
-    dirty_swaped_pages: RefCell<BTreeSet<usize>>,
-    persistent_file: RefCell<File>,
-
-    current_cursor_position: RefCell<u64>,
-    current_page_index: RefCell<Option<usize>>,
-
-    // TODO Warning this is not persisted across restarts! (dynamic allocation not fully supported!!!) 
-    // Also very naive free slot management and no deframentation, all allocations are pinned, performance is bad and only keept in memory, SIZE!!!
-    free_slots: RefCell<Vec<(u64, usize)>>, 
-    
-    malloc_called: RefCell<bool>,
-    me: Weak<FilePersistentRandomAccessMemory>,
-
-    page_size: usize,
-    page_shift: usize,
-    cache: RefCell<LruKCache>,
-
     size: usize,
+
+    malloc_called: Arc<AtomicBool>,
+
+    // The order of fields is important to prevent dead-locks. All locks locking multiple fields must lock them
+    // in the same order - the order they are listed below!
+    free_slots: Arc<Mutex<Vec<(u64, usize)>>>, 
+
+    // Read Write lock allows concurrent read access to same file but prevents concurrent writes to the file.
+    swap_file: Arc<RwLock<File>>,
+    // Memory map of the swap file. 
+    // No thread-safty is needed as MmapMut allows for concurrent read and writes, as long as the bytes are different.
+    // The caller is responsible to not create two pointers to the same data and write to it concurrently.
+    swap_mmap: AtomicPtr<MmapMut>,
+    // Locking the swap mmap for writes during persist.
+    _swap_mmap_lock: Arc<RwLock<()>>,
+
+    // Store / Remember which "logical" pages are dirty in the swap file and need to be persisted.
+    // This is used to optimize the persist() function to only write dirty pages to disk.
+    // The time difference between writing a whole page and just a few bytes on a page is negligible. 
+    // So we reduce the complexity by just storing the pages themselfs.
+    dirty_swaped_pages: Arc<RwLock<BTreeSet<usize>>>,
+
+    // The file where the commited data is stored.
+    persistent_file: Arc<Mutex<File>>,
+ 
+    // A weak reference to oneself.
+    me: Weak<PersistentRandomAccessMemory>,
 }
 
-impl PersistentRandomAccessMemory for FilePersistentRandomAccessMemory {
-    /// Statically allocates the necessary space for a value in persistent memory
-    /// and returns a Pointer to that location.
-    /// 
-    /// Parameters:
-    /// - len: The length of space to allocate.
-    /// - pointer: The memory address as a u64.
-    /// 
-    /// Warning: Static allocations must be done before any dynamic allocations (malloc).
-    /// They do not manage free space and will ignore any overlaps with other static allocated memory.
-    /// 
-    /// Returns:
-    /// - Result containing Pointer on success or Error on failure.
-    fn smalloc(&self, pointer: u64, len: usize) -> Result<Pointer, Error> {
-        {
-            let malloc_called = self.malloc_called.borrow();
-            if *malloc_called {
-                panic!("Static memory allocation cannot happen after malloc has been used. This ensures that dynamically allocated memory is not overwritten.");
-            }
-        } // release borrow of malloc_called
-
-        // Reserve the specified memory region by removing it from the free slots.
-        let _result = self.reserve_exact(pointer, len);
-
-        return Ok(Pointer::new(pointer, self.me.clone() as Weak<dyn PersistentRandomAccessMemory>));
-    }
-
-    /// Dynamically allocates the necessary space for a value in persistent memory
-    /// and returns a Pointer<T> to that location.
-    /// 
-    /// This function allocates 'len' bytes in persistent memory and returns a Pointer to that location.
-    /// The Runtime Complexity is O(n) where n is the number of free slots, as it may need to search through the free slots.
-    /// 
-    /// Warning: Don't leak the returned Pointer as it will cause memory leaks!
-    /// Also the free list is not persisted across restarts. On restart all memory is considered unused. 
-    /// This is not an issue for static allocations as they are managed seperately.
-    /// 
-    /// Parameters:
-    /// - len: The length of space to allocate.
-    /// 
-    /// Returns:
-    /// - Result containing Pointer on success or Error on failure.
-    fn malloc(&self, len: usize) -> Result<Pointer, Error> {
-        self.malloc_called.replace(true);
-
-        // Find a free slot that can accommodate the requested length
-        if let Ok(allocated_pointer) = self.reserve(len) {
-            return Ok(Pointer::new(allocated_pointer, self.me.clone() as Weak<dyn PersistentRandomAccessMemory>));
-        }
-
-        Err(Error::OutOfMemoryError)
-    }
-
-    /// Frees the space allocated for the value in persistent memory
-    /// pointed to by the given Pointer.
-    /// 
-    /// Warning: Don't use the Pointer after calling free on it as it will lead to undefined behavior.
-    /// And don't double free the same Pointer as it will lead to undefined behavior.
-    /// Additionally, freeing memory that was not allocated will lead to undefined behavior.
-    /// Also be conscious that the free list is not persisted across restarts. On restart all memory is considered unused.
-    /// 
-    /// Parameters:
-    /// - pointer: The Pointer pointing to the value to be freed.
-    /// - len: The length of space to free.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn free(&self, pointer: Pointer, len: usize) -> Result<(), Error> {
-        // Free the specified memory region and merge it with adjacent free slots.
-        self.free_and_merge(pointer.address, len);
-        Ok(())
-    }
-
-    /// Persist all data in memory.
-    /// 
-    /// Warning: This function must be called to ensure all data is written to persistent storage.
-    /// Failing to call this function may result in data loss. This function flushes all unsynced pages to disk.
-    /// As such, it may be a costly operation depending on the amount of unsynced data and the underlying storage performance.
-    /// It will block until all data is persisted.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn persist(&self) -> Result<(), Error> {
-        // write the current cached page if it is unsynced
-        if let Some(current_page_index) = *self.current_page_index.borrow() {
-            if *self.cached_page_dirty.borrow() {
-                self.flush_page(current_page_index, &self.cached_page.borrow())?;
-                self.cached_page_dirty.replace(false);
-            }
-        }
-
-        // Flush all other dirty pages in the cache
-        let mut cache = self.cache.borrow_mut();
-
-        // Iterate through all cache slots and flush dirty pages 
-        // First collect all dirty slots, don't sort non dirty slots => less work
-        let mut slots = cache.iter_mut().filter(|s|{
-            if let Some(slot) = s {
-                slot.dirty && slot.data.is_some()
-            } else {
-                false
-            }
-        }).collect::<Vec<_>>();
-
-        // Sort them py page index to minimize seek time
-        slots.sort_by(| a, b| {
-            match (a, b) {
-                (Some(slot_a), Some(slot_b)) => slot_a.page_index.cmp(&slot_b.page_index),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-        });
-
-        for slot in slots {
-            if let Some(slot) = slot {
-                if slot.dirty {
-                    if let Some(data) = slot.data.as_ref() {
-                        self.flush_page(slot.page_index, data)?;
-                        slot.dirty = false;
-                    }
-                }
-            }
-        }
-
-        // Flush the free list to disk
-        self.flush_free_list(&mut self.swap_file.borrow_mut())?;
-
-        // Make sure all data is written to disk
-        self.swap_file.borrow_mut().sync_all().map_err(|_| Error::FlushError)?;
-
-        // Makes sure taht the swap_file is persisted atomically
-        self.persist_swap_file()?;
-
-        Ok(())
-    }
-
-    fn read(&self, pointer: u64, buf: &mut [u8]) -> Result<(), Error> {
-        let len = buf.len();
-
-        if len == 0 {
-            return Ok(());
-        }
-
-        // if the page containing the pointer is not loaded, load it
-        let page_index = self.get_page_index(pointer);
-        self.ensure_page_loaded(page_index)?;
-
-        // Check if the entire requested data fits within the current page
-        let page_offset = self.get_page_offset(pointer);
-        if page_offset + len <= self.page_size {
-            buf.copy_from_slice(&self.cached_page.borrow()[page_offset..page_offset + len]);
-            Ok(())
-        } else {
-            // Data spans multiple pages, copy data into a temporary buffer
-            let mut remaining = len;
-            let mut dst_offset = 0;
-            let mut current_pointer = pointer;
-            while remaining > 0 {
-                let page_index = self.get_page_index(current_pointer);
-                self.ensure_page_loaded(page_index)?;
-
-                let page_offset = self.get_page_offset(current_pointer);
-                let to_copy = std::cmp::min(remaining, self.page_size - page_offset);
-
-                // Copy data from the current page to the buffer
-                let page = self.cached_page.borrow();
-                buf[dst_offset..dst_offset + to_copy]
-                    .copy_from_slice(&page[page_offset..page_offset + to_copy]);
-
-                current_pointer += to_copy as u64;
-                dst_offset += to_copy;
-                remaining -= to_copy;
-            }
-            Ok(())
-        }
-    }
-    
-    fn unsafe_read(&self, pointer: u64, len: usize) -> Result<&[u8], Error> {
-        // if the page containing the pointer is not loaded, load it
-        let page_index = self.get_page_index(pointer);
-        self.ensure_page_loaded(page_index)?;
-
-        // Check if the entire requested data fits within the current page
-        let page_offset = self.get_page_offset(pointer);
-        if page_offset + len <= self.page_size {
-            unsafe {
-                let raw_ptr = self.cached_page.borrow().as_ptr();
-                let cached_page = std::slice::from_raw_parts(raw_ptr, self.page_size);
-                Ok(&cached_page[page_offset..page_offset + len])
-            }
-        } else {
-            // Data spans multiple pages, cannot provide a continuous slice
-            Err(Error::NotOnOnePageError)
-        }
-    }
-    
-    fn write(&self, pointer: u64, buf: &[u8]) -> Result<(), Error> {
-        let len = buf.len();
-
-        // if the page containing the pointer is not loaded, load it
-        let page_index = self.get_page_index(pointer);
-        self.ensure_page_loaded(page_index)?;
-
-        // Check if the entire data fits within the current page
-        let page_offset = self.get_page_offset(pointer);
-        if page_offset + len <= self.page_size {
-            self.cached_page.borrow_mut()[page_offset..page_offset + len].copy_from_slice(buf);
-            self.cached_page_dirty.replace(true);
-            Ok(())
-        } else {
-            // Data spans multiple pages, copy data from a temporary buffer
-            let mut src_offset = 0;
-            let mut remaining = len;
-            let mut current_pointer = pointer;
-            while remaining > 0 {
-                let page_index = self.get_page_index(current_pointer);
-                self.ensure_page_loaded(page_index)?;
-
-                let page_offset = self.get_page_offset(current_pointer);
-                let to_copy = std::cmp::min(remaining, self.page_size - page_offset);
-
-                // Copy data from the buffer to the current page
-                // Single borrow_mut per iteration
-                {
-                    let mut page = self.cached_page.borrow_mut();
-                    page[page_offset..page_offset + to_copy]
-                        .copy_from_slice(&buf[src_offset..src_offset + to_copy]);
-                }
-
-                // Mark the page as dirty
-                self.cached_page_dirty.replace(true);
-
-                current_pointer += to_copy as u64;
-                src_offset += to_copy;
-                remaining -= to_copy;
-            }
-            Ok(())
-        }
-    }
-    
-    fn unsafe_read_mut(&self, pointer: u64, len: usize) -> Result<&mut [u8], Error> {
-        // if the page containing the pointer is not loaded, load it
-        let page_index = self.get_page_index(pointer);
-        self.ensure_page_loaded(page_index)?;
-
-        // Check if the entire requested data fits within the current page
-        let page_offset = self.get_page_offset(pointer);
-        if page_offset + len <= self.page_size {
-            unsafe {
-                let raw_ptr = self.cached_page.borrow().as_ptr();
-                let cached_page = std::slice::from_raw_parts_mut(raw_ptr as *mut u8, self.page_size);
-                
-                // creating an unsafe mutable slice, mark the page as dirty
-                self.cached_page_dirty.replace(true);
-        
-                Ok(&mut cached_page[page_offset..page_offset + len])
-            }
-        } else {
-            // Data spans multiple pages, cannot provide a continuous slice
-            Err(Error::NotOnOnePageError)
-        }
-    }
-}
-
-impl FilePersistentRandomAccessMemory {
-    /// Creates a new FilePersistentRandomAccessMemory instance.
-    /// 
-    /// Parameters:
-    /// - size: The total size of the persistent memory in bytes. Must be a multiple of page_size.
-    /// - path: The file path for the persistent memory storage.
-    /// - page_size: The size of each page in bytes.
-    /// - lru_capacity: The maximum number of pages to keep in the LRU cache.
-    /// - lru_history_length: The history length for the LRU cache.
-    /// - lru_pardon: The number of accesses before a page is considered for eviction in the LRU cache.
-    /// 
-    ///   Returns:
-    /// - A reference-counted pointer to the newly created FilePersistentRandomAccessMemory instance.
-    pub fn new(size: usize, path: &str, page_size: usize, lru_capacity: usize, lru_history_length: usize, lru_pardon: usize) -> Rc<Self> {
-        // Ensure size is a multiple of PAGE_SIZE
-        if (size % page_size) != 0 {
-            panic!("Size must be a multiple of PAGE_SIZE (4096 bytes)");
-        }
-
-        // Be aware that this is a very naive free slot management
-        // and the free list will not be persisted across restarts.
-        let mut free_slots = Vec::new();
-        free_slots.push((0, size));
-        
-        let swap_file_path = Self::get_swap_file_path(path);
-        let persistent_file_path = Self::get_persistent_file_path(path);
-
-        // if the .tmp file exists, rename it back to the swap file
-        let tmp_file_path = format!("{}.tmp", persistent_file_path);
-        if std::path::Path::new(&tmp_file_path).exists() {
-            std::fs::rename(&tmp_file_path, &swap_file_path)
-                .expect("Failed to rename temporary swap file back to swap file");
-        }
-
-        // Initialize the swap file
-        let swap_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&swap_file_path)
-            .expect("Failed to create page file");
-
-        // Ensure the swap file is the correct size or larger (+ length of freelist + freelist)
-        if swap_file.metadata().expect("Failed to get swap file metadata").len() < (size as u64 + 8) {
-            // Set the file size to the total size (+8 for the length of the free list)
-            swap_file.set_len(size as u64 + 8)
-                .expect("Failed to size page file");   
-        }  
-
-        // Initialize the persistent file
-        let persistent_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&persistent_file_path)
-            .expect("Failed to create persistent file");
-
-        // Ensure the persistent file is the correct size or larger (+ length of freelist + freelist)
-        if persistent_file.metadata().expect("Failed to get persistent file metadata").len() < (size as u64 + 8) {
-            persistent_file.set_len(size as u64 + 8)
-                .expect("Failed to size persistent file");
-        }
-
-        // As at this point we don't know if the swap file is in a valid state, we copy the persistent file over it.
-        std::fs::copy(persistent_file_path, swap_file_path)
-            .expect("Failed to initialize swap file from persistent file");
-
-        let me = Self {
-            cached_page: RefCell::new(vec![0; page_size]),
-            cached_page_dirty: RefCell::new(false),
-            swap_file: RefCell::new(swap_file),
-            dirty_swaped_pages: RefCell::new(BTreeSet::new()),
-            path: path.to_string(),
-            persistent_file: RefCell::new(persistent_file),
-            current_cursor_position: RefCell::new(0),
-            current_page_index: RefCell::new(None),
-            free_slots: RefCell::new(free_slots),
-            malloc_called: RefCell::new(false),
-            me: Weak::new(),
-            page_size,
-            page_shift: page_size.trailing_zeros() as usize,
-            cache: RefCell::new(LruKCache::new(lru_history_length, lru_capacity, lru_pardon)),
-            size,
-        };
-
-        // Load the free list from disk.
-        me.load_free_list().unwrap();
-        // Ensure there is at least one free slot covering the entire memory if none was loaded.
-        if me.free_slots.borrow().is_empty() {
-            me.free_slots.borrow_mut().push((0, size));
-        }
-        
-        let rc_me = Rc::new(me);
-
-        let weak_me = Rc::downgrade(&rc_me);
-
-        let ptr = Rc::into_raw(rc_me);
-
-        unsafe {
-            let mut_ref = (ptr as *mut Self).as_mut().unwrap();
-            mut_ref.me = weak_me;
-            Rc::from_raw(ptr)
-        }
-    }
-
+impl PersistentRandomAccessMemory {
     /// Generates the swap file path based on the given base path.
     fn get_swap_file_path(path: &str) -> String {
         format!("{}.swap.fpram", path)
@@ -766,26 +197,240 @@ impl FilePersistentRandomAccessMemory {
         format!("{}.fpram", path)
     }
 
-    /// Returns statistics about the cache as a formatted string.
+    /// Creates a new FilePersistentRandomAccessMemory instance.
+    /// 
+    /// Parameters:
+    /// - size: The total size of the persistent memory in bytes. Must be a multiple of PAGE_SIZE (4096 bytes).
+    /// - path: The file path for the persistent memory storage.
+    /// 
+    /// 
+    ///   Returns:
+    /// - A atomic-reference-counted pointer to the newly created FilePersistentRandomAccessMemory instance.
+    pub fn new(size: usize, path: &str) -> Arc<Self> {
+        // Ensure size is a multiple of PAGE_SIZE.
+        if (size % PAGE_SIZE) != 0 {
+            panic!("Size must be a multiple of PAGE_SIZE ({} bytes) -> Default for most OSes", PAGE_SIZE);
+        }
+
+        // Be aware that this is a very naive free slot management
+        // and the free list will not be persisted across restarts.
+        let mut free_slots = Vec::new();
+        free_slots.push((0, size));
+        
+        let swap_file_path = Self::get_swap_file_path(path);
+        let persistent_file_path = Self::get_persistent_file_path(path);
+
+        // If the .tmp file exists, something went wrong during the last persist operation.
+        // The .tmp file is only created during persist and renamed back to .swap.fpram after persisting.
+        let tmp_file_path = format!("{}.tmp", persistent_file_path);
+        if std::path::Path::new(&tmp_file_path).exists() {
+            std::fs::rename(&tmp_file_path, &swap_file_path)
+                .expect("Failed to rename temporary swap file back to swap file.");
+        }
+
+        // Initialize the swap file.
+        let swap_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&swap_file_path)
+            .expect("Failed to create page file");
+
+        // Ensure the swap file is the correct size (size + length of freelist) or larger (freelist)
+        if swap_file.metadata().expect("Failed to get swap file metadata").len() < (size as u64 + 8) {
+            // Set the file size to the total size (+8 for the length of the free list)
+            swap_file.set_len(size as u64 + 8)
+                .expect("Failed to size page file");   
+        }
+
+        // Initialize the persistent file.
+        let mut persistent_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&persistent_file_path)
+            .expect("Failed to create persistent file");
+
+        // Ensure the persistent file is the correct size (size + length of freelist) or larger (freelist)
+        if persistent_file.metadata().expect("Failed to get persistent file metadata").len() < (size as u64 + 8) {
+            persistent_file.set_len(size as u64 + 8)
+                .expect("Failed to size persistent file");
+        }
+
+        // As at this point we can't gurantee that the swap file is in a valid state, we copy the persistent file over it.
+        io::copy(&mut persistent_file, &mut &swap_file)
+            .expect("Failed to initialize swap file from persistent file");
+
+        // Create the memory map for the swap file.
+        let mmap_swap = unsafe {
+            MmapMut::map_mut(&swap_file).expect("Failed to memory map the swap file")
+        };
+
+        let arc_mmap_swap = Arc::new(mmap_swap);
+            
+        let me = Self {
+            swap_file: Arc::new(RwLock::new(swap_file)),
+            dirty_swaped_pages: Arc::new(RwLock::new(BTreeSet::new())),
+            path: path.to_string(),
+            persistent_file: Arc::new(Mutex::new(persistent_file)),
+            free_slots: Arc::new(Mutex::new(free_slots)),
+            malloc_called: Arc::new(AtomicBool::new(false)),
+            me: Weak::new(),
+            size,
+            swap_mmap: AtomicPtr::new(Arc::into_raw(arc_mmap_swap) as *mut MmapMut),
+            _swap_mmap_lock: Arc::new(RwLock::new(())),
+        };
+
+        // Load the free list from disk.
+        me.load_free_list().unwrap();
+        
+        // Ensure there is at least one free slot covering the entire memory if none was loaded.
+        if me.free_slots.lock().is_empty() {
+            me.free_slots.lock().push((0, size));
+        }
+        
+        let rc_me = Arc::new(me);
+
+        let weak_me = Arc::downgrade(&rc_me);
+
+        let ptr = Arc::into_raw(rc_me);
+
+        unsafe {
+            let mut_ref = (ptr as *mut Self).as_mut().unwrap();
+            mut_ref.me = weak_me;
+            Arc::from_raw(ptr)
+        }
+    }
+
+    /// Statically allocates the necessary space for a value in persistent memory
+    /// and returns a Pointer to that location.
+    /// 
+    /// Parameters:
+    /// - length: The length of space to allocate.
+    /// - pointer: The memory address as a u64.
+    /// 
+    /// Warning: Static allocations must be done before any dynamic allocations (malloc).
+    /// They do not manage free space and will ignore any overlaps with other static allocated memory.
     /// 
     /// Returns:
-    /// - A string containing cache statistics.
-    pub fn get_cache_miss_rate(&self) -> f64 {
-        self.cache.borrow().get_cache_miss_rate()
+    /// - Result containing Pointer on success or Error on failure.
+    pub fn smalloc<T>(&self, pointer: u64, length: usize) -> Result<Pointer<T>, Error> where T: Sized {
+        // This panic is not guaranteed to be thread-safe but should generally work.
+        if self.malloc_called.load(Ordering::SeqCst) {
+            panic!("Static memory allocation cannot happen after malloc has been used. This ensures that dynamically allocated memory is not overwritten.");
+        }
+
+        // Reserve the specified memory region by removing it from the free slots.
+        let result = Self::reserve_exact(&mut *self.free_slots.lock(), pointer, length);
+
+        let pointer = Pointer::new(pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>);
+
+        match result {
+            Err(Error::MemoryAllocationError) => {
+                Ok(pointer)
+            },
+            Err(e) => {
+                Err(e)
+            },
+            Ok(_) => {
+                // Successfully reserved the memory region. Initialize with 0's
+                let zero_bytes = vec![0u8; length];
+                self.write(pointer.address, &zero_bytes)?;
+                Ok(pointer)
+            },
+        }
     }
 
-    /// Returns the current loaded page index, or None if no page is loaded.
-    pub fn get_current_page_index(&self) -> Option<usize> {
-        self.current_page_index.borrow().clone()
+    /// Dynamically allocates the necessary space for a value in persistent memory
+    /// and returns a Pointer<T> to that location.
+    /// 
+    /// This function allocates 'len' bytes in persistent memory and returns a Pointer to that location.
+    /// The runtime complexity is O(n) where n is the number of free slots, as it may need to search through the free slots.
+    /// 
+    /// Warning: Don't leak the returned Pointer as it will cause memory leaks!
+    /// Also be conscious that the free list is held in memory and enough memory must be available ot work with this list.
+    /// If the memory is fragmented, the list will grow and may consume significant memory.
+    /// 
+    /// Returns:
+    /// - Result containing Pointer on success or Error on failure.
+    pub fn malloc<T>(&self, length: usize) -> Result<Pointer<T>, Error> where T: Sized {
+        self.malloc_called.store(true, Ordering::SeqCst);
+
+        // Find a free slot that can accommodate the requested length
+        if let Ok(allocated_pointer) = self.reserve(length) {
+            let pointer = Pointer::new(allocated_pointer, self.me.clone() as Weak<PersistentRandomAccessMemory>);
+            
+            // Initialize the allocated memory with 0's
+            let zero_bytes = vec![0u8; length];
+            self.write(pointer.address, &zero_bytes)?;
+            Ok(pointer)
+        } else {
+            Err(Error::OutOfMemoryError)
+        }
     }
 
-    /// Persists the swap file to disk.
-    fn persist_swap_file(&self) -> Result<(), Error> {
-        let swap_file_path = Self::get_swap_file_path(&self.path);
-        let persistent_file_path = Self::get_persistent_file_path(&self.path);
+    /// Frees the space allocated for the value in persistent memory
+    /// pointed to by the given Pointer.
+    /// 
+    /// Warning: Don't use the Pointer after calling free on it as it will lead to undefined behavior.
+    /// And don't double free the same Pointer as it will lead to undefined behavior.
+    /// Additionally, freeing memory that was not allocated will lead to undefined behavior.
+    /// Also, be aware that freeing memory may increase the size of the freelist and may overflow memory.
+    /// 
+    /// Parameters:
+    /// - pointer: The memory address as a u64.
+    /// - length: The length of space to free.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    pub fn free(&self, pointer: u64, length: usize) -> Result<(), Error> {
+        // First we need to aquire a read-lock so we know that data is not currently being persisted
+        // This prevents modifying the freelist during a persist operation.
+        let _lock = self._swap_mmap_lock.read();
 
-        let swap_file = std::path::Path::new(&swap_file_path);
-        let persistent_file = std::path::Path::new(&persistent_file_path);
+        // Free the specified memory region and merge it with adjacent free slots.
+        let mut free_slots = self.free_slots.lock();
+        Self::free_and_merge(&mut *free_slots, pointer, length);
+        Ok(())
+    }
+
+    /// Persist all data in memory.
+    /// 
+    /// Warning: This function must be called to ensure all data is written to persistent storage.
+    /// Failing to call this function will result in data loss. This function flushes all unsynced data to disk.
+    /// As such, it may be a costly operation depending on the amount of unsynced data and the underlying storage performance.
+    /// It will block until all data is persisted.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    pub fn persist(&self) -> Result<(), Error> {
+        let mut new_swap_file;
+        let mut new_persistent_file;
+        let mut dirty_pages;
+
+        // Lock the swap mmap for reading and replacing during the persist operation.
+        let _lock = self._swap_mmap_lock.write();
+
+        // Flush the memory-mapped swap file to disk.
+        unsafe { (*self.swap_mmap.load(Ordering::SeqCst)).flush().map_err(|_| Error::FlushError)?; }
+
+        // Ensure all writes are completed before proceeding.
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        // Lock the swap file for writing during the persist operation.
+        let mut swap_file = self.swap_file.write();
+
+        // Flush the free list to the swap file.
+        self.flush_free_list(&mut *swap_file)?;
+
+        // Sync the swap file to ensure all data is written to disk.
+        swap_file.sync_all().map_err(|_| Error::FlushError)?;
+
+        let swap_file_path_str = Self::get_swap_file_path(&self.path);
+        let persistent_file_path_str = Self::get_persistent_file_path(&self.path);
+
+        let swap_file_path = std::path::Path::new(&swap_file_path_str);
+        let persistent_file_path = std::path::Path::new(&persistent_file_path_str);
 
         // Swap the files atomically -> the swap file has been fully written at this point
         // so we can just rename it to the persistent file.
@@ -794,66 +439,165 @@ impl FilePersistentRandomAccessMemory {
         // Warning: This may leave temporary files on disk if the process crashes during the swap.
 
         // First move the current persistent file to a temporary location
-        std::fs::rename(persistent_file, format!("{}.tmp", persistent_file_path))
+        std::fs::rename(persistent_file_path, format!("{}.tmp", persistent_file_path_str))
             .map_err(Error::SwapFileError)?;
         // Then move the swap file to the persistent file location
-        std::fs::rename(swap_file, persistent_file)
+        std::fs::rename(swap_file_path, persistent_file_path)
             .map_err(Error::SwapFileError)?;
         // Finally move the temporary file to the swap file location
-        std::fs::rename(format!("{}.tmp", persistent_file_path), swap_file)
+        std::fs::rename(format!("{}.tmp", persistent_file_path_str), swap_file_path)
             .map_err(Error::SwapFileError)?;
 
         // Reopen the swap file and persistent file handles after the swap
-        let mut new_swap_file = OpenOptions::new()
+        new_swap_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&swap_file_path)
+            .open(&swap_file_path_str)
             .map_err(Error::FileOpenError)?;
 
-        let mut new_persistent_file = OpenOptions::new()
+        new_persistent_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&persistent_file_path)
+            .open(&persistent_file_path_str)
             .map_err(Error::FileOpenError)?;
 
         // The swap file is at this point stale, as it has been swapped with the persistent file.
         // We need to write the recorded dirty pages back to the new swap file.
-        let mut dirty_pages = self.dirty_swaped_pages.borrow_mut();
-        let mut current_cursor: u64 = 0;
+        dirty_pages = self.dirty_swaped_pages.write();
+        let mut current_cursor: u64 = u64::MAX;
+
+        // Read the page data from the persistent file and write it to the new swap file
+        let mut page_data = [0u8; PAGE_SIZE];
 
         for dirty_page_index in dirty_pages.iter() {
-            let offset = self.get_page_offset_in_file(*dirty_page_index);
-            // Seek to the page offset in the new swap file
+            let offset = (*dirty_page_index as u64) * (PAGE_SIZE as u64);
+
+            // Seek to the page offset in both files to keep cursors aligned
             if offset != current_cursor {
-                new_swap_file.seek(std::io::SeekFrom::Start(offset)).map_err(Error::SwapFileError)?;
+                new_swap_file
+                    .seek(std::io::SeekFrom::Start(offset))
+                    .map_err(Error::SwapFileError)?;
+                new_persistent_file
+                    .seek(std::io::SeekFrom::Start(offset))
+                    .map_err(Error::SwapFileError)?;
                 current_cursor = offset;
             }
-            // Read the page data from the persistent file and write it to the new swap file
-            let mut page_data = vec![0; self.page_size];
-            new_persistent_file.read_exact(&mut page_data).map_err(Error::FileReadError)?;
-            new_swap_file.write_all(&page_data).map_err(Error::FileWriteError)?;
-            current_cursor += self.page_size as u64;
+
+            let n_read = new_persistent_file
+                .read(&mut page_data)
+                .map_err(Error::FileReadError)?;
+            new_swap_file
+                .write_all(&page_data[..n_read])
+                .map_err(Error::FileWriteError)?;
+            current_cursor += PAGE_SIZE as u64;
         }
 
         // Also write the free list to the new swap file
         self.flush_free_list(&mut new_swap_file)?;
 
-        // To ensure the files are persisted to disk, we need to flush and sync them
+        // To ensure the files are persisted to disk, we need to flush and sync them.
         new_swap_file.flush().map_err(|_| Error::FlushError)?;
         new_persistent_file.flush().map_err(|_| Error::FlushError)?;
+
+        // Ensure all writes are completed before proceeding.
+        std::sync::atomic::fence(Ordering::SeqCst);
 
         new_swap_file.sync_all().map_err(|_| Error::FlushError)?;
         new_persistent_file.sync_all().map_err(|_| Error::FlushError)?;
 
         // Update the file handles
-        self.swap_file.replace(new_swap_file);
-        self.persistent_file.replace(new_persistent_file);
+        let mut persistent_file = self.persistent_file.lock();
+        *persistent_file = new_persistent_file;
+        *swap_file = new_swap_file;
 
         // Now that both are in sync, we can clear the dirty pages set
         dirty_pages.clear(); 
 
+        // Memory map the new swap file
+        let new_mmap_swap = unsafe {
+            MmapMut::map_mut(&*swap_file).map_err(|_| Error::ReadError)?
+        };
+
+        let new_arc_mmap_swap = Arc::new(new_mmap_swap);
+        let new_ptr = Arc::into_raw(new_arc_mmap_swap) as *mut MmapMut;
+        let old_ptr = self.swap_mmap.swap(new_ptr, Ordering::SeqCst);
+
+        // Clean up the old mmap
+        if !old_ptr.is_null() {
+            unsafe {
+                Arc::from_raw(old_ptr);
+            }
+        }
+
+        Ok(()) // the lock is released here
+    }
+
+    /// Reads data from the specified pointer into the provided buffer.
+    ///
+    /// Parameters:
+    /// - pointer: The memory address as a u64.
+    /// - len: The length of data to read.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    fn read<T>(&self, pointer: u64) -> Result<T, Error> {
+        let len = std::mem::size_of::<T>();
+        let bytes = unsafe {
+            (&mut (*self.swap_mmap.load(Ordering::SeqCst)))
+                .get(pointer as usize..(pointer as usize + len))
+                .ok_or(Error::ReadError)?
+        };
+
+        let value = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr() as *const T)
+        };
+
+        Ok(value)
+    }
+    
+    /// Writes data from the provided buffer to the specified pointer.
+    /// 
+    /// Parameters:
+    /// - pointer: The memory address as a u64.
+    /// - buf: The buffer containing data to write.
+    ///
+    /// Returns:
+    /// - Result indicating success or failure.
+    pub fn write(&self, pointer: u64, buf: &[u8]) -> Result<(), Error> {
+        let len = buf.len();
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        {
+            // First we need to aquire a read-lock so we know that data is not currently being persisted
+            let _lock = self._swap_mmap_lock.read();
+
+            unsafe {
+                (&mut (*self.swap_mmap.load(Ordering::SeqCst)))
+                    .get_mut(pointer as usize..(pointer as usize + len))
+                    .ok_or(Error::WriteError)?
+                    .copy_from_slice(buf);
+            }
+        } // release lock
+
+        // Mark all pages touched by this write as dirty
+        let start_page = pointer as usize / PAGE_SIZE;
+        let end_offset = pointer + (len as u64).saturating_sub(1);
+        let end_page = end_offset as usize / PAGE_SIZE;
+        {
+            let mut dirty = self
+                .dirty_swaped_pages
+                .write();
+            for page in start_page..=end_page {
+                dirty.insert(page);
+            }
+        } // release lock
+
         Ok(())
-    }   
+    }
+
 
     /// Reserves memory of the specified length from the free slots.
     /// 
@@ -863,16 +607,21 @@ impl FilePersistentRandomAccessMemory {
     /// Returns:
     /// - Result containing the starting pointer of the reserved memory on success or Error on failure.
     fn reserve(&self, len:usize) -> Result<u64, Error> {
+        // First we need to aquire a read-lock so we know that data is not currently being persisted.
+        // Changing the freelist during the persist-operation will lead to undefined behaviour.
+        let _lock = self._swap_mmap_lock.read();
+
         // Find a free slot that can accommodate the requested length
         // First, try to find a free slot where the allocation can fit entirely within a single page.
-        // This avoids allocations that span pages when possible.
+        // This avoids allocations that span pages when possible. (reduced page faults)
         let mut allocated_pointer: Option<u64> = None;
 
-        if len <= self.page_size {
-            let page_size = self.page_size as u64;
+        let mut free_slots = self.free_slots.lock();
+
+        if len <= PAGE_SIZE {
+            let page_size = PAGE_SIZE as u64;
 
             // We need to borrow the free_slots twice, so we do it in a nested scope to avoid borrow conflicts.
-            let free_slots = self.free_slots.borrow();
             for (free_pointer, free_len) in free_slots.iter() {
                 if *free_len < len {
                     continue;
@@ -897,8 +646,6 @@ impl FilePersistentRandomAccessMemory {
                 }
             }
         }else {
-            let free_slots = self.free_slots.borrow();
-
             // Fallback: first-fit allocation (original behavior) if no single-page slot was found
             for (free_pointer, free_len) in free_slots.iter() {
                 if *free_len >= len {
@@ -909,7 +656,7 @@ impl FilePersistentRandomAccessMemory {
         }
 
         if let Some(allocated_pointer) = allocated_pointer {
-            self.reserve_exact(allocated_pointer, len)?;
+            Self::reserve_exact(&mut *free_slots, allocated_pointer, len)?;
             return Ok(allocated_pointer);
         }
 
@@ -919,13 +666,14 @@ impl FilePersistentRandomAccessMemory {
     /// Reserves the specified memory region by removing it from the free slots.
     ///
     /// Parameters:
+    /// - free_slots: A mutable reference to the vector of free slots.
     /// - pointer: The memory address as a u64.
     /// - len: The length of the memory region.
     /// 
     /// Returns:
     /// - None.
     /// Panics if the region is not fully free.
-    fn reserve_exact(&self, pointer: u64, len: usize) -> Result<(), Error> {
+    fn reserve_exact(free_slots: &mut Vec<(u64, usize)>, pointer: u64, len: usize) -> Result<(), Error> {
         // Allow allocation that spans multiple free slots or partially overlaps free slots,
         // but ensure the full requested region is covered by free space.
         let mut indices_to_remove: Vec<usize> = Vec::new();
@@ -934,8 +682,6 @@ impl FilePersistentRandomAccessMemory {
         let alloc_start = pointer;
         let alloc_end = pointer + (len as u64);
         let mut covered_bytes: usize = 0;
-
-        let mut free_slots = self.free_slots.borrow_mut();
 
         // Pre-allocate to avoid repeated reallocation
         indices_to_remove.reserve(free_slots.len());
@@ -990,34 +736,31 @@ impl FilePersistentRandomAccessMemory {
     /// 
     /// Returns:
     /// - None.
-    fn free_and_merge(&self, pointer: u64, len: usize) {
+    fn free_and_merge(free_slots: &mut Vec<(u64, usize)>, pointer: u64, len: usize) {
         let mut new_start = pointer;
         let mut new_end = pointer + (len as u64);
 
         let mut indices_to_remove: Vec<usize> = Vec::new();
         
-        {
-            let free_slots = self.free_slots.borrow();
-            indices_to_remove.reserve(free_slots.len());
+        indices_to_remove.reserve(free_slots.len());
 
-            for (idx, (free_pointer, free_len)) in free_slots.iter().enumerate() {
-                let free_start = *free_pointer;
-                let free_end = free_start + (*free_len as u64);
+        // Find and merge with adjacent or overlapping free slots.
+        for (idx, (free_pointer, free_len)) in free_slots.iter().enumerate() {
+            let free_start = *free_pointer;
+            let free_end = free_start + (*free_len as u64);
 
-                if !(free_end < new_start || free_start > new_end) {
-                    if free_start < new_start {
-                        new_start = free_start;
-                    }
-                    if free_end > new_end {
-                        new_end = free_end;
-                    }
-                    indices_to_remove.push(idx);
+            if !(free_end < new_start || free_start > new_end) {
+                if free_start < new_start {
+                    new_start = free_start;
                 }
+                if free_end > new_end {
+                    new_end = free_end;
+                }
+                indices_to_remove.push(idx);
             }
         }
 
         indices_to_remove.sort_unstable();
-        let mut free_slots = self.free_slots.borrow_mut();
         for idx in indices_to_remove.iter().rev() {
             free_slots.remove(*idx);
         }
@@ -1026,117 +769,20 @@ impl FilePersistentRandomAccessMemory {
         free_slots.sort_unstable_by_key(|(p, _)| *p);
     }
 
-    /// Calculates the page index for a given pointer.
-    ///     
-    /// Parameters:
-    /// - pointer: The memory address as a u64.
-    /// 
-    /// Returns:
-    /// - The page index as usize.
-    #[inline(always)]
-    fn get_page_index(&self, pointer: u64) -> usize {
-        (pointer as usize) >> self.page_shift
-    }
-
-    /// Calculates the offset within a page for a given pointer.
-    ///
-    /// Parameters:
-    /// - pointer: The memory address as a u64.
-    /// 
-    /// Returns:
-    /// - The offset within the page as usize.
-    #[inline(always)]
-    fn get_page_offset(&self, pointer: u64) -> usize {
-        (pointer as usize) & (self.page_size - 1)
-    }
-
-    /// Constructs the coursor position in the memory file for a given page index.
-    ///     
-    /// Parameters:
-    /// - base_path: The base path as a string slice.
-    /// - page_index: The index of the page.
-    #[inline(always)]
-    fn get_page_offset_in_file(&self, page_index: usize) -> u64 {
-        (page_index * self.page_size) as u64
-    }
-
-    /// Loads the specified page from persistent storage into memory.
-    ///
-    /// Parameters:
-    /// - page_index: The index of the page to load.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn load_page(&self, page_index: usize) -> Result<(), Error> {
-        let page_offset = self.get_page_offset_in_file(page_index);
-        let mut file = self.swap_file.borrow_mut();
-        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
-
-        // Seek to the start of the page if not already there
-        if page_offset != *current_cursor_position {
-            file.seek(std::io::SeekFrom::Start(page_offset)).map_err(Error::FileReadError)?;
-            *current_cursor_position = page_offset;
-        }
-
-        // Read the page into the cached page buffer
-        file.read_exact(&mut self.cached_page.borrow_mut()).map_err(Error::FileReadError)?;
-        // Update the cursor position (Sequential read will be faster as we don't need to seek again)
-        *current_cursor_position += self.page_size as u64;
-        
-        *self.current_page_index.borrow_mut() = Some(page_index);
-        self.cached_page_dirty.replace(false);
-        Ok(())
-    }
-
-    /// Flushes the specified page from memory to persistent storage.
-    ///     
-    /// Parameters:
-    /// - page_index: The index of the page to flush.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn flush_page(&self, page_index: usize, page: &Vec<u8>) -> Result<(), Error> {
-        let mut file = self.swap_file.borrow_mut();
-        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
-
-        // Mark the page as dirty in the dirty pages set
-        self.dirty_swaped_pages.borrow_mut().insert(page_index);
-
-        // Caclulate the offset in the file for the page
-        let page_offset = self.get_page_offset_in_file(page_index);
-
-        // Seek to the start of the page if not already there
-        if page_offset != *current_cursor_position {
-            file.seek(std::io::SeekFrom::Start(page_offset)).map_err(|_| Error::ReadError)?;
-            *current_cursor_position = page_offset;
-        }
-
-        // Write the page from the cached page buffer to the file
-        file.write_all(page).map_err(|_| Error::WriteError)?;
-        *current_cursor_position += self.page_size as u64;
-
-        Ok(())
-    }
-
     /// Loads the free list from persistent storage.
     /// 
     /// Returns:
     /// - Result indicating success or failure.
     fn load_free_list(&self) -> Result<(), Error> {
-        let mut file = self.swap_file.borrow_mut();
-        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
+        let mut file = self.swap_file.write();
         
-        if self.size as u64 != *current_cursor_position {
-            file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
-            *current_cursor_position = self.size as u64;
-        }
+        file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
 
         let mut buffer: Vec<u8> = Vec::new();
 
         // Read the length-prefixed serialized free slots
         let mut length_prefix = [0u8; 8];
         file.read_exact(&mut length_prefix).map_err(Error::FileReadError)?;
-        *current_cursor_position += 8;
 
         let length = u64::from_le_bytes(length_prefix) as usize;
 
@@ -1149,14 +795,14 @@ impl FilePersistentRandomAccessMemory {
 
         // Read the serialized free slots into the buffer
         file.read_exact(&mut buffer).map_err(Error::FileReadError)?;
-        *current_cursor_position += length as u64;
 
         let (decoded_free_slots, _): (Vec<(u64, usize)>, _) = bincode::decode_from_slice(
             &buffer[0..length],
             bincode::config::standard()
         ).map_err(|_| Error::ReadError)?;
 
-        *self.free_slots.borrow_mut() = decoded_free_slots;
+        let mut free_slots = self.free_slots.lock();
+        *free_slots = decoded_free_slots;
 
         Ok(())
     }
@@ -1166,14 +812,9 @@ impl FilePersistentRandomAccessMemory {
     /// Returns:
     ///  - Result indicating success or failure.
     fn flush_free_list(&self, file: &mut std::fs::File) -> Result<(), Error> {
-        let mut current_cursor_position = self.current_cursor_position.borrow_mut();
+        let free_slots = self.free_slots.lock();
         
-        if self.size as u64 != *current_cursor_position {
-            file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
-            *current_cursor_position = self.size as u64;
-        }
-
-        let free_slots = self.free_slots.borrow();
+        file.seek(std::io::SeekFrom::Start(self.size as u64)).map_err(Error::FileReadError)?;
 
         let mut bytes = Vec::new();
         bytes.resize((8+std::mem::size_of::<usize>()) * free_slots.len(), 0);
@@ -1188,86 +829,6 @@ impl FilePersistentRandomAccessMemory {
         // Write the page from the cached page buffer to the file
         file.write_all(&bytes[0..length]).map_err(Error::FileWriteError)?;
         
-        *current_cursor_position += length as u64;
-
         Ok(())
-    }
-
-    /// Ensures that the specified page is loaded into memory.
-    /// 
-    /// Parameters:
-    /// - page_index: The index of the page to ensure is loaded.
-    /// 
-    /// Returns:
-    /// - Result indicating success or failure.
-    fn ensure_page_loaded(&self, page_index: usize) -> Result<(), Error> {
-        if *self.current_page_index.borrow() == Some(page_index) {
-            return Ok(());
-        }
-
-        let mut cache = self.cache.borrow_mut();
-        // Case 1: Page is in cache
-        if cache.contains_page(page_index) {
-            // Can not return null as we made sure the page exists above
-            let (cache_data, dirty) = cache.fetch_page(page_index).unwrap();
-            let was_dirty = *self.cached_page_dirty.borrow();
-            let old_page = self.cached_page.replace(cache_data);
-            
-            if let Some(old_index) = *self.current_page_index.borrow() {
-                // Store the current cached page back into the cache
-                let evicted = cache.store_page(old_index, old_page, was_dirty)
-                                                .map_err(Error::CacheStoreError)?;
-
-                // Now we need to actually flush the evicted page to disk if it was dirty as we can't keep it in memory anymore.
-                if let Some(slot) = evicted {
-                    if slot.dirty {
-                        // If we fetch the page that we are evicting from the cache, this will be null
-                        // as the current page is held by the memory manager and not the cache.
-                        if let Some(data) = slot.data {
-                            self.flush_page(slot.page_index, &data)?;
-                        }
-                    }
-                }
-            }
-
-            *self.current_page_index.borrow_mut() = Some(page_index);
-            self.cached_page_dirty.replace(dirty);
-            return Ok(());
-        }
-
-        // Case 2: Page is not in cache, need to evict a page or create a new buffer.
-
-        // Remember the current page index and dirty state before swapping
-        let old_index = *self.current_page_index.borrow();
-        let was_dirty = *self.cached_page_dirty.borrow();
-        // Store the old page back into the cache if it exists
-        if let Some(old_index) = old_index {
-            let candidate = cache.eviction_candidate(old_index);
-
-            // Now we need to actually flush the evicted page to disk if it was dirty as we can't keep it in memory anymore.
-            let reuse_buffer = if let Some(slot) = candidate {
-                if slot.dirty {
-                    // If we fetch the page that we are evicting from the cache, this will be null
-                    // as the current page is held by the memory manager and not the cache.
-                    if let Some(data) = slot.data.as_ref() {
-                        self.flush_page(slot.page_index, data)?;
-                    }
-                }
-                slot.data.take()
-            } else {
-                None
-            };
-       
-            let old_page_buffer = self.cached_page.replace(
-                reuse_buffer.unwrap_or_else(|| vec![0; self.page_size])
-            );
-
-            // Store the current cached page back into the cache
-            let _ = cache.store_page(old_index, old_page_buffer, was_dirty)
-                    .map_err(Error::CacheStoreError)?;
-        }
-        
-        // Now load the requested page from disk to memory
-        return self.load_page(page_index); 
     }
 }

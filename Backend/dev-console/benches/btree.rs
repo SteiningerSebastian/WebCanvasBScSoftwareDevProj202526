@@ -1,27 +1,17 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, BatchSize, Criterion, Throughput, black_box};
-use general::persistent_random_access_memory::{FilePersistentRandomAccessMemory, PersistentRandomAccessMemory};
-use general::pram_btree_index::{ConcurrentBTreeIndexPRAM, BTreeIndex};
-use std::rc::Rc;
+use general::persistent_random_access_memory::PersistentRandomAccessMemory;
+use general::pram_btree_index::{BTreeIndex, BTreeIndexPRAM};
+// no additional imports needed
 use std::time::Duration;
 
-const PAGE_SIZE: usize = 4*1024; // to fit the set b tree node size
-const LRU_CAPACITY: usize = 64;
-const LRU_HISTORY_LENGTH: usize = 3;
-const LRU_PARDON: usize = 16;
 
-fn make_index(path: &str) -> ConcurrentBTreeIndexPRAM {
+fn make_index(path: &str) -> BTreeIndexPRAM {
 	// Allocate a modest PRAM backing file (16 MiB) matching typical page size
-	let pram = FilePersistentRandomAccessMemory::new(
+	let pram = PersistentRandomAccessMemory::new(
 		16 * 1024 * 1024,
 		path,
-		PAGE_SIZE,
-		LRU_CAPACITY,
-		LRU_HISTORY_LENGTH,
-		LRU_PARDON,
 	);
-
-	let pram_rc: Rc<dyn PersistentRandomAccessMemory> = pram;
-	ConcurrentBTreeIndexPRAM::new(pram_rc)
+	BTreeIndexPRAM::new(pram)
 }
 
 fn bench_btree_insert(c: &mut Criterion) {
@@ -65,7 +55,7 @@ fn bench_btree_get(c: &mut Criterion) {
 				|| {
 					let dir = tempfile::tempdir().unwrap();
 					let path = dir.path().join("btree_get.pram").to_string_lossy().to_string();
-					let mut idx = make_index(&path);
+					let idx = make_index(&path);
 					for i in 0..cap as u64 { let _ = idx.set(i, i ^ 0xDEADBEEF); }
 					(dir, idx)
 				},
@@ -95,7 +85,7 @@ fn bench_btree_update_commit(c: &mut Criterion) {
 			|| {
 				let dir = tempfile::tempdir().unwrap();
 				let path = dir.path().join("btree_update_commit.pram").to_string_lossy().to_string();
-				let mut idx = make_index(&path);
+				let idx = make_index(&path);
 				for i in 0..CAP as u64 { let _ = idx.set(i, i); }
 				(dir, idx)
 			},
@@ -124,11 +114,11 @@ fn bench_btree_remove(c: &mut Criterion) {
 				|| {
 					let dir = tempfile::tempdir().unwrap();
 					let path = dir.path().join(format!("btree_remove{}.pram", cap)).to_string_lossy().to_string();
-					let mut idx = make_index(&path);
+					let idx = make_index(&path);
 					for i in 0..cap as u64 { let _ = idx.set(i, i); }
 					(dir, idx)
 				},
-				|(dir, mut idx)| {
+				|(dir, idx)| {
 					let _keep = dir;
 					let mut removed = 0usize;
 					for i in 0..cap as u64 { if idx.remove(i).is_ok() { removed += 1; } }
@@ -152,7 +142,7 @@ fn bench_btree_iter(c: &mut Criterion) {
 			|| {
 				let dir = tempfile::tempdir().unwrap();
 				let path = dir.path().join("btree_iter.pram").to_string_lossy().to_string();
-				let mut idx = make_index(&path);
+				let idx = make_index(&path);
 				for i in 0..CAP as u64 { let _ = idx.set(i, i ^ 0xA5A5_A5A5_A5A5_A5A5); }
 				(dir, idx)
 			},

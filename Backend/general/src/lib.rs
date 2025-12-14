@@ -5,9 +5,6 @@ pub mod thread_pool;
 pub mod persistent_random_access_memory;
 pub mod write_ahead_log;
 pub mod pram_btree_index;
-pub mod mock_persistent_random_access_memory;
-
-mod page_cache;
 
 #[cfg(test)]
 mod persistent_random_access_memory_tests;
