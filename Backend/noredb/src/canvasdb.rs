@@ -367,7 +367,7 @@ impl CanvasDBTrait for CanvasDB {
                 error!("Failed to deref pixel pointer from data store.");
                 return None;
             }
-        } else if let Err(e) = pointer_address {
+        } else if let Err(_) = pointer_address {
 
             // No entry in B-tree index, check WAL
             if let Some(wal_entry) = most_current_wal {

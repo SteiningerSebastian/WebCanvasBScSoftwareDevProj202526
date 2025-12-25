@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, f32::consts::E, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
+use std::{collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
 use memmap2::{MmapMut};
 use parking_lot::{Mutex, RwLock};
 use tracing::error;

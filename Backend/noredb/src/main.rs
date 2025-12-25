@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let canvas_db = CanvasDB::new(CANVAS_WIDTH, CANVAS_HEIGHT, CANVAS_DB_PATH, WRITE_AHEAD_LOG_SIZE);
     canvas_db.start_worker_threads(NUM_WORKER_THREADS);
 
-    let database = MyDatabaseServer::new(store, canvas_db);
+    let database = MyDatabaseServer::new(canvas_db);
 
     Server::builder()
         .add_service(noredb::database_server::DatabaseServer::new(database))

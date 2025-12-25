@@ -1,24 +1,21 @@
-use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
 use noredb::database_server::{Database};
-use noredb::{Data, DataRequest, DataResponse, GraveStone, Commit};
+use noredb::{Data, DataRequest, DataResponse, Commit};
 
 use crate::canvasdb::{CanvasDB, CanvasDBTrait, Pixel, PixelEntry, TimeStamp};
 
-use tracing::{error, warn, debug};
+use tracing::{warn};
 
 pub mod noredb {
     tonic::include_proto!("noredb");
 }
 
 pub struct MyDatabaseServer {
-    config : ConcurrentFileKeyValueStore,
     db: CanvasDB,
 }
 
 impl MyDatabaseServer {
-    pub fn new(config: ConcurrentFileKeyValueStore, db: CanvasDB) -> Self {
+    pub fn new(db: CanvasDB) -> Self {
         MyDatabaseServer {
-            config,
             db
         }
     }
@@ -78,33 +75,6 @@ impl Database for MyDatabaseServer {
 
         Ok(tonic::Response::new(resp))
     } 
-
-    async fn force_set(
-        &self,
-        request: tonic::Request<Data>,
-    ) -> Result<tonic::Response<Commit>, tonic::Status> {
-        let data = request.into_inner();
-        // TODO: forcefully persist `data` (override tombstones/entries)
-        let resp = Commit {
-            index: data.index,
-            status: 1, // success
-        };
-        Ok(tonic::Response::new(resp))
-    }
-
-    async fn remove(
-        &self,
-        request: tonic::Request<GraveStone>,
-    ) -> Result<tonic::Response<DataResponse>, tonic::Status> {
-        let gs = request.into_inner();
-        // TODO: place gravestone for key and return previous value if any
-        let resp = DataResponse {
-            index: gs.index,
-            key: gs.key,
-            value: Vec::new(), // empty by default
-        };
-        Ok(tonic::Response::new(resp))
-    }
 
     async fn get(
         &self,
