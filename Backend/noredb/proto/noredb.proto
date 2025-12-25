@@ -19,32 +19,31 @@ service Database {
 }
 
 message Data {
-    int32 index = 1;  // The index of the transaction log
-    int32 key = 2;  // The key for the data entry
+    uint32 index = 1;  // The index of the transaction log
+    uint32 key = 2;  // The key for the data entry
     bytes timestamp = 3; // The timestamp of the data entry
     bytes value = 4; // The value of the data entry
 }
 
 message DataRequest {
-    int32 index = 1; // The index of the transaction
-    int32 key = 2;  // The key for the data entry
+    uint32 index = 1; // The index of the transaction
+    uint32 key = 2;  // The key for the data entry
 }
 
 message DataResponse {
-    int32 index = 1; // The index of the transaction
-    int32 key = 2;  // The key for the data entry
+    uint32 index = 1; // The index of the transaction
+    uint32 key = 2;  // The key for the data entry
     bytes value = 3; // The value of the data entry
 }
 
 message GraveStone {
-    int32 index = 1; // The index of the transaction
+    uint32 index = 1; // The index of the transaction
     bytes timestamp = 2; // The timestamp of the data entry
-    int32 key = 3;  // The key for the data entry
+    uint32 key = 3;  // The key for the data entry
 }
 
 message Commit {
-    int32 index = 1; // The index of the transaction
-
+    uint32 index = 1; // The index of the transaction
     // 0b0000 = pending,
     // 0b0001 = success,
     // 0b0010 = failure, 

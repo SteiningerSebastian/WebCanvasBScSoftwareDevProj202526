@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::{AtomicI64, AtomicU64}};
+use std::{fmt::Display, sync::{Arc, atomic::{AtomicI64, AtomicU64}}};
 
 use parking_lot::RwLock;
 
@@ -18,6 +18,19 @@ pub enum Error {
     PeakFailed,
     /// Error popping the next entry from the WAL
     PopFailed,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::IoError(e) => write!(f, "IO Error: {}", e),
+            Error::CommitError(e) => write!(f, "Commit Error: {}", e),
+            Error::AppendFailed => write!(f, "Append Failed"),
+            Error::OutOfMemory => write!(f, "Out Of Memory"),
+            Error::PeakFailed => write!(f, "Peak Failed"),
+            Error::PopFailed => write!(f, "Pop Failed"),
+        }
+    }
 }
 
 /// A trait representing a Write-Ahead Log (WAL) for ensuring data integrity.
@@ -43,11 +56,23 @@ pub trait WriteAheadLogTrait<T> where T: Sized {
     /// - `Result<Vec<u8>, Error>`: Ok containing the next log entry if successful, Err otherwise.
     fn peak(&self) -> Result<T, Error>;
 
+    /// Peeks at multiple entries in the write-ahead log without removing them.
+    /// 
+    /// Parameters:
+    /// - `count`: The number of entries to peek at. If count exceeds the number of available entries, all available entries are returned.
+    ///
+    /// Returns:
+    /// - `Result<Vec<T>, Error>`: Ok containing a vector of the next log entries if successful, Err otherwise.
+    fn peek_many(&self, count: usize) -> Result<Vec<T>, Error>;
+
     /// Pops the next entry from the write-ahead log, removing it from the log.
     /// 
     /// Returns:
     /// - `Result<Vec<u8>, Error>`: Ok containing the popped log entry if successful, Err otherwise.
     fn pop(&self) -> Result<T, Error>;
+
+    /// Pops multiple entries from the write-ahead log, removing them from the log without returning them.
+    fn pop_many(&self, count: usize) -> Result<(), Error>;
 
     /// Creates an iterator over the write-ahead log entries. (lifo order)
     /// 
@@ -195,6 +220,28 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         Ok(entry)
     }
 
+    fn peek_many(&self, count: usize) -> Result<Vec<T>, Error> {
+        let tail = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
+
+        let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
+        if length == 0 {
+            return Err(Error::PeakFailed);
+        }
+
+        let mut entries = Vec::new();
+        let mut current_index = tail;
+
+        let to_peek = std::cmp::min(count as u64, length);
+
+        for _ in 0..to_peek {
+            let entry = self.data.at(current_index as usize).deref().map_err(|_| Error::AppendFailed)?;
+            entries.push(entry);
+            current_index = (current_index + 1) % self.size as u64;
+        }
+
+        Ok(entries)
+    }
+
     fn pop(&self) -> Result<T, Error> {
         // Acquire read lock to allow concurrent appends and pops but block commits
         let _persist_guard = self.persist_lock.read();
@@ -229,6 +276,41 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         let entry = self.data.at(tail_val as usize).deref().map_err(|_| Error::AppendFailed)?;
 
         Ok(entry)
+    }
+
+    fn pop_many(&self, count: usize) -> Result<(), Error> {
+        // Acquire read lock to allow concurrent appends and pops but block commits
+        let _persist_guard = self.persist_lock.read();
+
+        // Make sure there is at least one entry to pop
+        loop {
+            let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
+            if length < count as u64 {
+                return Err(Error::PopFailed);
+            }
+
+            if let Ok(_) = self.length.compare_exchange(
+                length, 
+                length-count as u64, 
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+        }
+
+        let tail_val;
+        {
+            let tail_pointer = self.tail.write();
+            // Read tail, fetch entry, then advance tail
+            tail_val = self.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
+            let new_tail = (tail_val + count as u64) % self.size as u64;
+
+            tail_pointer.set(&new_tail).map_err(|_| Error::AppendFailed)?;
+            self.tail_cache.store(new_tail, std::sync::atomic::Ordering::SeqCst);
+        } // release lock on tail
+        
+
+        Ok(())
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {

@@ -1,13 +1,13 @@
-use std::{env, fmt::Write, net::SocketAddr, path::Path, process, sync::Arc};
+use std::{env, net::SocketAddr, path::Path, process};
 
 use tonic::{transport::Server};
 use tracing::{Level, debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use general::{concurrent_file_key_value_store::{ConcurrentFileKeyValueStore, ConcurrentKeyValueStore}, persistent_random_access_memory::PersistentRandomAccessMemory};
+use general::{concurrent_file_key_value_store::{ConcurrentFileKeyValueStore, ConcurrentKeyValueStore}};
 use veritas_client::veritas_client::VeritasClient;
 
-use crate::server::{MyDatabaseServer, noredb};
+use crate::{canvasdb::CanvasDB, server::{MyDatabaseServer, noredb}};
 
 mod server;
 mod canvasdb;
@@ -19,6 +19,12 @@ const PORT : u16 = 50051;
 const REGISTRATION_ATTEMPTS: usize = 4; // number of attempts to register service
 const REGISTRATION_BACKOFF_MS: u64 = 200; // milliseconds between attempts
 const REGISTRATION_BACKOFF_MULTIPLIER: u64 = 5; // exponential backoff multiplier
+
+const CANVAS_WIDTH: u16 = 3840;
+const CANVAS_HEIGHT: u16 = 2160;
+const CANVAS_DB_PATH: &str = "/data/canvasdb";
+const WRITE_AHEAD_LOG_SIZE: usize = 1024;
+const NUM_WORKER_THREADS: usize = 4;
 
 /// Parse a comma-separated list of hostnames/IPs (VERITAS_NODES) into a Vec<String>
 /// (preserve the original token so we can resolve DNS at connect time).
@@ -155,8 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("0.0.0.0:{}", PORT).parse()?;
 
     // Initialize database server components
+    let canvas_db = CanvasDB::new(CANVAS_WIDTH, CANVAS_HEIGHT, CANVAS_DB_PATH, WRITE_AHEAD_LOG_SIZE);
+    canvas_db.start_worker_threads(NUM_WORKER_THREADS);
 
-    let database = MyDatabaseServer::new(store);
+    let database = MyDatabaseServer::new(store, canvas_db);
 
     Server::builder()
         .add_service(noredb::database_server::DatabaseServer::new(database))

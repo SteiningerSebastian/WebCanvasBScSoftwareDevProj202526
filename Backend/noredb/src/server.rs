@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use general::concurrent_file_key_value_store::ConcurrentFileKeyValueStore;
-use general::persistent_random_access_memory::PersistentRandomAccessMemory;
-use general::pram_btree_index::{BTreeIndex, BTreeIndexPRAM};
-use general::write_ahead_log::{self, WriteAheadLog};
 use noredb::database_server::{Database};
 use noredb::{Data, DataRequest, DataResponse, GraveStone, Commit};
+
+use crate::canvasdb::{CanvasDB, CanvasDBTrait, Pixel, PixelEntry, TimeStamp};
+
+use tracing::{error, warn, debug};
 
 pub mod noredb {
     tonic::include_proto!("noredb");
@@ -13,12 +12,14 @@ pub mod noredb {
 
 pub struct MyDatabaseServer {
     config : ConcurrentFileKeyValueStore,
+    db: CanvasDB,
 }
 
 impl MyDatabaseServer {
-    pub fn new(config: ConcurrentFileKeyValueStore) -> Self {
+    pub fn new(config: ConcurrentFileKeyValueStore, db: CanvasDB) -> Self {
         MyDatabaseServer {
-            config
+            config,
+            db
         }
     }
 }
@@ -30,14 +31,53 @@ impl Database for MyDatabaseServer {
         &self,
         request: tonic::Request<Data>,
     ) -> Result<tonic::Response<Commit>, tonic::Status> {
-        let data = request.into_inner();
-        // TODO: persist `data`
-        let resp = Commit {
-            index: data.index,
-            status: 1, // success
+        let data: Data = request.into_inner();
+
+        // r,g,b values
+        let mut color = [0u8; 3];
+        color.copy_from_slice(&data.value[..3]);
+
+        // The timestamp of this entry as u128.
+        let mut time = [0u8; 16];
+        time.copy_from_slice(&data.timestamp[..16]);
+
+        let pixel = PixelEntry {
+            pixel: Pixel {
+                key: data.key,
+                color: color,
+            },
+            timestamp: TimeStamp {
+                bytes: time
+            },
         };
+
+        let wait = tokio::sync::oneshot::channel();
+        
+        self.db.set_pixel(pixel, Some(Box::new(|| {
+                wait.0.send(()).unwrap();
+        })));
+
+        // Wait for the pixel to be permanently stored
+        let res = wait.1.await;
+
+        let resp =match res {
+            Ok(_) => {
+                Commit {
+                    index: data.index,
+                    status: 0b0001, // success
+                }
+            }
+            Err(e) => {
+                warn!("Failed to persist pixel data: {:?}", e);
+                Commit {
+                    index: data.index,
+                    status: 0b0010, // success
+                }
+            }
+        };
+
         Ok(tonic::Response::new(resp))
-    }
+    } 
 
     async fn force_set(
         &self,
@@ -71,7 +111,20 @@ impl Database for MyDatabaseServer {
         request: tonic::Request<DataRequest>,
     ) -> Result<tonic::Response<DataResponse>, tonic::Status> {
         let req = request.into_inner();
-        // TODO: look up the entry by req.key and req.index
+        
+        let pixel_option = self.db.get_pixel(req.key);
+        if let Some(pixel_entry) = pixel_option {
+            let mut value = Vec::new();
+            value.extend_from_slice(&pixel_entry.0.color);
+
+            let resp = DataResponse {
+                index: req.index,
+                key: req.key,
+                value, // return actual value if found
+            };
+            return Ok(tonic::Response::new(resp));
+        }
+
         let resp = DataResponse {
             index: req.index,
             key: req.key,

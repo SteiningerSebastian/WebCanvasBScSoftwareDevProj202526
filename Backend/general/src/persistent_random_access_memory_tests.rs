@@ -41,13 +41,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Size must be a multiple of PAGE_SIZE (4096 bytes) -> Default for most OSes")]
-    fn test_new_panics_on_invalid_size() {
-        let path = unique_test_path("invalid_size");
-        PersistentRandomAccessMemory::new(100, &path);
-    }
-
-    #[test]
     fn test_malloc_basic() {
         let memory = create_test_memory();
         let result = memory.malloc::<u64>(std::mem::size_of::<u64>());

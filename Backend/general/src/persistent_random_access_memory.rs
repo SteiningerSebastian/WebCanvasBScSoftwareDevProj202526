@@ -1,6 +1,7 @@
-use std::{collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
+use std::{collections::BTreeSet, f32::consts::E, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
 use memmap2::{MmapMut};
 use parking_lot::{Mutex, RwLock};
+use tracing::error;
 
 #[derive(Debug)]
 pub enum Error {
@@ -15,11 +16,19 @@ pub enum Error {
     /// Data is fragmented across pages.
     PageFragmentationError,
     /// Error while swapping files.
-    SwapFileError(io::Error),
+    SwapFileError
+    {
+        inner:io::Error,
+        to: String,
+        from: String,
+    },
     /// Error reading from file.
     FileReadError(io::Error),
     /// Error opening file.
-    FileOpenError(io::Error),
+    FileOpenError{
+        inner: io::Error,
+        path: String,
+    },
     /// Error writing to file.
     FileWriteError(io::Error),
     /// Unexpected memory allocation error.
@@ -37,8 +46,8 @@ impl Display for Error {
             Error::FileReadError(e) => write!(f, "Unable to read file: {}", e),
             Error::OutOfMemoryError => write!(f, "Out of memory Error"),
             Error::PageFragmentationError => write!(f, "Data is fragmented across pages"),
-            Error::SwapFileError(e) => write!(f, "Error while swapping file: {}", e),
-            Error::FileOpenError(e) => write!(f, "Unable to open file: {}", e),
+            Error::SwapFileError { inner, from, to } => write!(f, "Error while swapping file from '{}' to '{}': {}", from, to, inner),
+            Error::FileOpenError{ inner, path }  => write!(f, "Unable to open file '{}': {}", path, inner),
             Error::FileWriteError(e) => write!(f, "Unable to write to file: {}", e),
             Error::MemoryAllocationError => write!(f, "Memory Allocation Error"),
             Error::SynchronizationError => write!(f, "Synchronization Error"),
@@ -208,9 +217,8 @@ impl PersistentRandomAccessMemory {
     /// - A atomic-reference-counted pointer to the newly created FilePersistentRandomAccessMemory instance.
     pub fn new(size: usize, path: &str) -> Arc<Self> {
         // Ensure size is a multiple of PAGE_SIZE.
-        if (size % PAGE_SIZE) != 0 {
-            panic!("Size must be a multiple of PAGE_SIZE ({} bytes) -> Default for most OSes", PAGE_SIZE);
-        }
+        let size = size + (PAGE_SIZE - (size % PAGE_SIZE)) % PAGE_SIZE;
+        assert!(size % PAGE_SIZE == 0, "Size must be a multiple of PAGE_SIZE (4096 bytes).");
 
         // Be aware that this is a very naive free slot management
         // and the free list will not be persisted across restarts.
@@ -394,6 +402,33 @@ impl PersistentRandomAccessMemory {
         Ok(())
     }
 
+    /// Atomically renames a file from one path to another with retries.
+    /// 
+    /// Parameters:
+    /// - from: The current file path.
+    /// - to: The new file path.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    fn atomic_rename(from: &str, to: &str) -> Result<(), Error> {
+        let rename_result = std::fs::rename(from, to);
+        if let Ok(()) =  rename_result {
+            return Ok(());
+        } 
+
+        // TODO: Somehow the rename fails even tough the files exist and are not locked.
+        // That is strange behavior, think of a solution for this...
+        if let Err(e) = rename_result {
+            error!("Failed to rename file from '{}' to '{}': {}", from, to, e);
+        }
+
+        return Err(Error::SwapFileError { 
+                    inner: io::Error::new(io::ErrorKind::Other, "Failed to rename persistent file to temporary file after multiple attempts."), 
+                    from: from.to_string(), 
+                    to: to.to_string(),
+                });
+    }
+
     /// Persist all data in memory.
     /// 
     /// Warning: This function must be called to ensure all data is written to persistent storage.
@@ -412,10 +447,13 @@ impl PersistentRandomAccessMemory {
         let _lock = self._swap_mmap_lock.write();
 
         // Flush the memory-mapped swap file to disk.
-        unsafe { (*self.swap_mmap.load(Ordering::SeqCst)).flush().map_err(|_| Error::FlushError)?; }
+        // Dereference is safe as we hold the lock preventing other threads from modifying the atomic pointer.
+        unsafe { 
+            (*self.swap_mmap.load(Ordering::Acquire)).flush().map_err(|_| Error::FlushError)?; 
+        }
 
         // Ensure all writes are completed before proceeding.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::Release);
 
         // Lock the swap file for writing during the persist operation.
         let mut swap_file = self.swap_file.write();
@@ -426,40 +464,51 @@ impl PersistentRandomAccessMemory {
         // Sync the swap file to ensure all data is written to disk.
         swap_file.sync_all().map_err(|_| Error::FlushError)?;
 
+        // Ensure all writes are completed before proceeding.
+        std::sync::atomic::fence(Ordering::Release);
+
         let swap_file_path_str = Self::get_swap_file_path(&self.path);
         let persistent_file_path_str = Self::get_persistent_file_path(&self.path);
 
-        let swap_file_path = std::path::Path::new(&swap_file_path_str);
-        let persistent_file_path = std::path::Path::new(&persistent_file_path_str);
-
         // Swap the files atomically -> the swap file has been fully written at this point
         // so we can just rename it to the persistent file.
-
+        
         // Swap procedure:
-        // Warning: This may leave temporary files on disk if the process crashes during the swap.
+        // WARN: This may leave temporary files on disk if the process crashes during the swap.
 
         // First move the current persistent file to a temporary location
-        std::fs::rename(persistent_file_path, format!("{}.tmp", persistent_file_path_str))
-            .map_err(Error::SwapFileError)?;
+        // These renames must be executed, else we are unable to recover and need to try to recover on startup.
+        
+        // Unfortunately, we can't recover from failed renames, so we retry a few times before giving up and making sure to exit.
+        if let Err(e) = Self::atomic_rename(&persistent_file_path_str, &format!("{}.tmp", persistent_file_path_str)) {
+            error!("Failed to rename persistent file to temporary file during persist: {}", e);
+            std::process::abort();
+        }
+
         // Then move the swap file to the persistent file location
-        std::fs::rename(swap_file_path, persistent_file_path)
-            .map_err(Error::SwapFileError)?;
+        if let Err(e) = Self::atomic_rename(&swap_file_path_str, &persistent_file_path_str) {
+            error!("Failed to rename swap file to persistent file during persist: {}", e);
+            std::process::abort();
+        }
+    
         // Finally move the temporary file to the swap file location
-        std::fs::rename(format!("{}.tmp", persistent_file_path_str), swap_file_path)
-            .map_err(Error::SwapFileError)?;
+        if let Err(e) = Self::atomic_rename(&format!("{}.tmp", persistent_file_path_str), &swap_file_path_str) {
+            error!("Failed to rename temporary file to swap file during persist: {}", e);
+            std::process::abort();
+        }
 
         // Reopen the swap file and persistent file handles after the swap
         new_swap_file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&swap_file_path_str)
-            .map_err(Error::FileOpenError)?;
+            .map_err(|e| Error::FileOpenError { inner: e, path: swap_file_path_str.clone() })?;
 
         new_persistent_file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&persistent_file_path_str)
-            .map_err(Error::FileOpenError)?;
+            .map_err(|e| Error::FileOpenError { inner: e, path: persistent_file_path_str.clone() })?;
 
         // The swap file is at this point stale, as it has been swapped with the persistent file.
         // We need to write the recorded dirty pages back to the new swap file.
@@ -476,10 +525,10 @@ impl PersistentRandomAccessMemory {
             if offset != current_cursor {
                 new_swap_file
                     .seek(std::io::SeekFrom::Start(offset))
-                    .map_err(Error::SwapFileError)?;
+                    .map_err(Error::FileReadError)?;
                 new_persistent_file
                     .seek(std::io::SeekFrom::Start(offset))
-                    .map_err(Error::SwapFileError)?;
+                    .map_err(Error::FileReadError)?;
                 current_cursor = offset;
             }
 
@@ -500,7 +549,7 @@ impl PersistentRandomAccessMemory {
         new_persistent_file.flush().map_err(|_| Error::FlushError)?;
 
         // Ensure all writes are completed before proceeding.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::Release);
 
         new_swap_file.sync_all().map_err(|_| Error::FlushError)?;
         new_persistent_file.sync_all().map_err(|_| Error::FlushError)?;
@@ -520,14 +569,12 @@ impl PersistentRandomAccessMemory {
 
         let new_arc_mmap_swap = Arc::new(new_mmap_swap);
         let new_ptr = Arc::into_raw(new_arc_mmap_swap) as *mut MmapMut;
-        let old_ptr = self.swap_mmap.swap(new_ptr, Ordering::SeqCst);
 
-        // Clean up the old mmap
-        if !old_ptr.is_null() {
-            unsafe {
-                Arc::from_raw(old_ptr);
-            }
-        }
+        // The old pointer is actually a null pointer as we swapped it out earlier.
+        let _ = self.swap_mmap.swap(new_ptr, Ordering::Release);
+
+        // fence to ensure mmap is fully replaced before releasing the lock
+        std::sync::atomic::fence(Ordering::Release);
 
         Ok(()) // the lock is released here
     }
