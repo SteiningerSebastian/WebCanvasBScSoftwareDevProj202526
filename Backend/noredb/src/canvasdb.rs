@@ -201,7 +201,7 @@ impl CanvasDB {
                 // TODO: Handle errors here instead of panicking.
                 let entries = wal_clone.peek_many(PERSIST_BATCH_SIZE);
                 if let Err(write_ahead_log::Error::PeakFailed) = entries {
-                    error!("Failed to peek entries from write-ahead log.");
+                    debug!("Failed to peek entries from write-ahead log.");
                     // Wait before trying again
                     std::thread::sleep(std::time::Duration::from_millis(PERSIST_LATENCY_MS));
                     continue; // try again in next iteration
