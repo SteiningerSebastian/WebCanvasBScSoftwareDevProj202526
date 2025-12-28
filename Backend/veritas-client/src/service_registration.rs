@@ -1,0 +1,1 @@
+//TODO: implement service registration handler using the veritas client.

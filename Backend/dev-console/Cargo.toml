@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 general = { path = "../general"}
 tempfile = "3"
+noredb = {path = "../noredb"}
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -21,4 +22,8 @@ harness = false
 
 [[bench]]
 name = "btree"
+harness = false
+
+[[bench]]
+name = "canvasdb"
 harness = false
