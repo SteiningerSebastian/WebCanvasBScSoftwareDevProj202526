@@ -124,8 +124,8 @@ pub struct CanvasDB {
 
 impl CanvasDB {
     pub fn new(
-        width: u16,
-        height: u16,
+        width: usize,
+        height: usize,
         path: &str,
         write_ahead_log_size: usize,
     ) -> Self {
@@ -134,7 +134,7 @@ impl CanvasDB {
         // *32 for each btree entry there is a u64 (8bytes) key a u64 (8bytes) value and some overhead (+1024bytes and *32 not *16)
         // *2 for non edge nodes
         let btree_pram: Arc<PersistentRandomAccessMemory> = PersistentRandomAccessMemory::new((width as usize * height as usize * 32 * 2) + 1024, &format!("{}.index.pram", path));
-        // *2 for alignment and heap fragmentation
+        // *2 for alignment and heap fragmentation +1024 for any overhead
         let data_store: Arc<PersistentRandomAccessMemory> = PersistentRandomAccessMemory::new((width as usize * height as usize * std::mem::size_of::<PixelEntry>()*2) + 1024, &format!("{}.store.pram", path));
 
         // Initialize the write-ahead log, B-tree index, and data store
@@ -511,9 +511,12 @@ impl CanvasDB {
                                     if let Err(e) = mem_free {
                                         error!("Failed to free memory for pixel entry after B-tree insertion failure: {}", e);
                                     }
+
                                     error!("Failed to insert new pixel into B-tree index.");
                                     panic!("Failed to insert new pixel into B-tree index.");
                                 }
+                                
+
                                 std::thread::sleep(std::time::Duration::from_millis(RETRY_BASE_DELAY_MS * EXPONENTIAL_BACKOFF_FACTOR.pow(retries as u32)));
                                 continue; // try again in next iteration
                             }                                    
@@ -522,7 +525,11 @@ impl CanvasDB {
 
                             if retries >= RETRY_LIMIT {
                                 error!("Failed to allocate memory for new pixel in data store.");
-                                panic!("Failed to allocate memory for new pixel in data store.");
+
+                                // A bit of debug info
+                                dbg!(data_store_clone);
+
+                                panic!("Failed to allocate memory for new pixel in data store. {}", new_pointer.err().unwrap());
                             }
                             std::thread::sleep(std::time::Duration::from_millis(RETRY_BASE_DELAY_MS * EXPONENTIAL_BACKOFF_FACTOR.pow(retries as u32)));
                             continue; // try again in next iteration

@@ -20,8 +20,8 @@ const REGISTRATION_ATTEMPTS: usize = 4; // number of attempts to register servic
 const REGISTRATION_BACKOFF_MS: u64 = 200; // milliseconds between attempts
 const REGISTRATION_BACKOFF_MULTIPLIER: u64 = 5; // exponential backoff multiplier
 
-const CANVAS_WIDTH: u16 = 3840;
-const CANVAS_HEIGHT: u16 = 2160;
+const CANVAS_WIDTH: usize = 3840;
+const CANVAS_HEIGHT: usize = 2160;
 const CANVAS_DB_PATH: &str = "/data/canvasdb";
 const WRITE_AHEAD_LOG_SIZE: usize = 1024;
 const NUM_WORKER_THREADS: usize = 4;

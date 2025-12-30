@@ -7,7 +7,7 @@ use noredb::canvasdb::{CanvasDB, Pixel, PixelEntry, TimeStamp, CanvasDBTrait};
 static mut TEST: u16 = 0;
 const PATH: &str = "D:/tmp/canvasdb/bench/";
 
-fn make_canvasdb(width: u16, height: u16, wal_size: usize) -> CanvasDB {
+fn make_canvasdb(width: usize, height: usize, wal_size: usize) -> CanvasDB {
     // wait a moment to avoid collisions in quick successive calls
     // Make sure previous threads have fully exited - the canvasdb has shutdown successfully
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -21,7 +21,7 @@ fn make_canvasdb(width: u16, height: u16, wal_size: usize) -> CanvasDB {
 
     let value = unsafe { TEST };
 
-    let path = format!("{}canvasdb_{}.pram", path, value);
+    let path = format!("{}canvasdb_{}", path, value);
     unsafe {
         TEST += 1;
     }
@@ -43,7 +43,7 @@ fn bench_canvasdb_set(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::from_parameter(cap), &cap, |b, &cap| {
             b.iter_batched(
                 || {
-                    let db = Arc::new(make_canvasdb(cap as u16, 1u16, cap * 2));
+                    let db = Arc::new(make_canvasdb(cap, 1usize, cap * 2));
                     db
                 },
                 |db| {
@@ -89,12 +89,12 @@ fn bench_canvasdb_get(c: &mut Criterion) {
 
     const NUM_THREADS: usize = 8;
 
-    for &cap in &[1<<15usize,1<<16usize,1<<17usize] {
+    for &cap in &[1<<15usize, 1<<16usize,1<<17usize] {
         g.throughput(Throughput::Elements(cap as u64));
         g.bench_with_input(BenchmarkId::from_parameter(cap), &cap, |b, &cap| {
             b.iter_batched(
                 || {
-                    let db = Arc::new(make_canvasdb(cap as u16, 1u16, cap * 2));
+                    let db = Arc::new(make_canvasdb(cap, 1usize, cap * 2));
                     // Pre-populate with data
                     for i in 0..cap as u32 {
                         let ts = TimeStamp { bytes: (i as u128).to_le_bytes() };
