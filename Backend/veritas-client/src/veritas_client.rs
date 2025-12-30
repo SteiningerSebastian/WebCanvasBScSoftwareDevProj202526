@@ -5,6 +5,8 @@
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, Error as ReqwestError, Method};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
@@ -42,6 +44,112 @@ pub struct VeritasClient {
     client: Client,
     current: Arc<AtomicUsize>, // Arc for sharing across tasks
     ws_nodes: Vec<String>, // reuse for websocket (same as nodes; kept for compatibility)
+}
+
+pub trait VeritasClientTrait: Send + Sync {
+    /// Get a variable by name (linearizable read through leader)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to get.
+    /// 
+    /// Returns:
+    /// - The value of the variable as stored in the leader.
+    fn get_variable<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<String, VeritasError>> + Send + 'a>>;
+
+    /// Get a variable with eventual consistency (faster, reads from quorum)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to get.
+    /// 
+    /// Returns:
+    /// - The value of the variable as stored in the quorum.
+    fn get_variable_eventual<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<String, VeritasError>> + Send + 'a>>;
+
+    /// Peek at a variable's raw value (local read, no consistency guarantee)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to peek.
+    /// 
+    /// Returns:
+    /// - The raw value of the variable as stored locally.
+    fn peek_variable<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<String, VeritasError>> + Send + 'a>>;
+
+    /// Set a variable (linearizable write through leader)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to set.
+    /// - `value`: The value to set.
+    /// 
+    /// Returns:
+    /// - `true` if the set was successful, `false` otherwise.
+    fn set_variable<'a>(&'a self, name: &'a str, value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>>;
+
+    /// Append to a variable (linearizable write through leader)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to modify.
+    /// - `value`: The value to append.
+    /// 
+    /// Returns:
+    /// - `true` if the append was successful, `false` otherwise.
+    fn append_variable<'a>(&'a self, name: &'a str, value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>>;
+
+    /// Replace old value with new value in a variable (linearizable write through leader)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to modify.
+    /// - `old_value`: The value to be replaced.
+    /// - `new_value`: The value to replace with.
+    /// 
+    /// Returns:
+    /// - `true` if the replacement was successful, `false` otherwise.
+    fn replace_variable<'a>(&'a self, name: &'a str, old_value: &'a str, new_value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>>;
+
+    /// Compare and set a variable (linearizable write through leader)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to modify.
+    /// - `expected_value`: The expected current value of the variable.
+    /// - `new_value`: The new value to set if the current value matches the expected value.
+    /// 
+    /// Returns:
+    /// - `true` if the variable was updated, `false` otherwise.
+    fn compare_and_set_variable<'a>(&'a self, name: &'a str, expected_value: &'a str, new_value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>>;
+
+    /// Get and increment a variable atomically (linearizable operation through leader)
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to increment.
+    /// 
+    /// Returns:
+    /// - The value of the variable before the increment.
+    fn get_and_add_variable<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<i64, VeritasError>> + Send + 'a>>;
+
+    /// Watch multiple variables for changes via WebSocket
+    /// 
+    /// Parameters:
+    /// - `variables`: A vector of variable names to watch. If empty, watches all variables.
+    /// 
+    /// Returns:
+    /// - An unbounded receiver channel that yields `UpdateNotification` structs on variable updates.
+    /// 
+    /// WARNING: The state update stream is lossy (notifications may be dropped) but maintains strict temporal integrity. 
+    /// While the set of notifications is non-exhaustive, the sequence is guaranteed to be strictly monotonic, 
+    /// ensuring that the observer never receives a stale or out-of-order historical version of the data.
+    fn watch_variables<'a>(&'a self, variables: Vec<String>) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<UpdateNotification>, VeritasError>> + Send + 'a>>;
+
+    /// Watch a single variable for changes
+    /// 
+    /// Parameters:
+    /// - `name`: The name of the variable to watch.
+    /// 
+    /// Returns:
+    /// - An unbounded receiver channel that yields `UpdateNotification` structs on variable updates.
+    /// 
+    /// WARNING: The state update stream is lossy (notifications may be dropped) but maintains strict temporal integrity.
+    /// While the set of notifications is non-exhaustive, the sequence is guaranteed to be strictly monotonic,
+    /// ensuring that the observer never receives a stale or out-of-order historical version of the data.
+    fn watch_variable<'a>(&'a self, name: String) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<UpdateNotification>, VeritasError>> + Send + 'a>>;
 }
 
 impl VeritasClient {
@@ -107,7 +215,9 @@ impl VeritasClient {
         }
         Err(VeritasError::WebSocketError("Exhausted nodes".into()))
     }
+}
 
+impl VeritasClientTrait for VeritasClient {
     /// Get a variable by name (linearizable read through leader)
     /// 
     /// Parameters:
@@ -115,9 +225,12 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - The value of the variable as stored in the leader.
-    pub async fn get_variable(&self, name: &str) -> Result<String, VeritasError> {
-        let resp = self.send_request(Method::GET, &format!("/get/{}", name), None).await?;
-        Ok(resp.text().await?)
+    fn get_variable<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<String, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let resp = self.send_request(Method::GET, &format!("/get/{}", name), None).await?;
+            Ok(resp.text().await?)
+        })
     }
 
     /// Get a variable with eventual consistency (faster, reads from quorum)
@@ -127,9 +240,12 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - The value of the variable as stored in the quorum.
-    pub async fn get_variable_eventual(&self, name: &str) -> Result<String, VeritasError> {
-        let resp = self.send_request(Method::GET, &format!("/get_eventual/{}", name), None).await?;
-        Ok(resp.text().await?)
+    fn get_variable_eventual<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<String, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let resp = self.send_request(Method::GET, &format!("/get_eventual/{}", name), None).await?;
+            Ok(resp.text().await?)
+        })
     }
 
     /// Peek at a variable's raw value (local read, no consistency guarantee)
@@ -139,9 +255,12 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - The raw value of the variable as stored locally.
-    pub async fn peek_variable(&self, name: &str) -> Result<String, VeritasError> {
-        let resp = self.send_request(Method::GET, &format!("/peek/{}", name), None).await?;
-        Ok(resp.text().await?)
+    fn peek_variable<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<String, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let resp = self.send_request(Method::GET, &format!("/peek/{}", name), None).await?;
+            Ok(resp.text().await?)
+        })
     }
 
     /// Set a variable (linearizable write through leader)
@@ -152,9 +271,13 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - `true` if the set was successful, `false` otherwise.
-    pub async fn set_variable(&self, name: &str, value: &str) -> Result<bool, VeritasError> {
-        let resp = self.send_request(Method::PUT, &format!("/set/{}", name), Some(value.to_string())).await?;
-        Ok(resp.text().await?.to_lowercase() == "true")
+    fn set_variable<'a>(&'a self, name: &'a str, value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        let value = value.to_string();
+        Box::pin(async move {
+            let resp = self.send_request(Method::PUT, &format!("/set/{}", name), Some(value)).await?;
+            Ok(resp.text().await?.to_lowercase() == "true")
+        })
     }
 
     /// Append to a variable (linearizable write through leader)
@@ -165,9 +288,13 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - `true` if the append was successful, `false` otherwise.
-    pub async fn append_variable(&self, name: &str, value: &str) -> Result<bool, VeritasError> {
-        let resp = self.send_request(Method::PUT, &format!("/append/{}", name), Some(value.to_string())).await?;
-        Ok(resp.text().await?.to_lowercase() == "true")
+    fn append_variable<'a>(&'a self, name: &'a str, value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        let value = value.to_string();
+        Box::pin(async move {
+            let resp = self.send_request(Method::PUT, &format!("/append/{}", name), Some(value)).await?;
+            Ok(resp.text().await?.to_lowercase() == "true")
+        })
     }
 
     /// Replace old value with new value in a variable (linearizable write through leader)
@@ -179,10 +306,15 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - `true` if the replacement was successful, `false` otherwise.
-    pub async fn replace_variable(&self, name: &str, old_value: &str, new_value: &str) -> Result<bool, VeritasError> {
-        let body = format!("{};{}{}", old_value.len(), old_value, new_value);
-        let resp = self.send_request(Method::PUT, &format!("/replace/{}", name), Some(body)).await?;
-        Ok(resp.text().await?.to_lowercase() == "true")
+    fn replace_variable<'a>(&'a self, name: &'a str, old_value: &'a str, new_value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        let old_value = old_value.to_string();
+        let new_value = new_value.to_string();
+        Box::pin(async move {
+            let body = format!("{};{}{}", old_value.len(), old_value, new_value);
+            let resp = self.send_request(Method::PUT, &format!("/replace/{}", name), Some(body)).await?;
+            Ok(resp.text().await?.to_lowercase() == "true")
+        })
     }
 
     /// Compare and set a variable (linearizable write through leader)
@@ -194,12 +326,16 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - `true` if the variable was updated, `false` otherwise.
-    pub async fn compare_and_set_variable(&self, name: &str, expected_value: &str, new_value: &str) -> Result<bool, VeritasError> {
-        let body = format!("{};{}{}", expected_value.len(), expected_value, new_value);
-        let resp = self.send_request(Method::PUT, &format!("/compare_set/{}", name), Some(body)).await?;
-        Ok(resp.text().await?.to_lowercase() == "true")
+    fn compare_and_set_variable<'a>(&'a self, name: &'a str, expected_value: &'a str, new_value: &'a str) -> Pin<Box<dyn Future<Output = Result<bool, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        let expected_value = expected_value.to_string();
+        let new_value = new_value.to_string();
+        Box::pin(async move {
+            let body = format!("{};{}{}", expected_value.len(), expected_value, new_value);
+            let resp = self.send_request(Method::PUT, &format!("/compare_set/{}", name), Some(body)).await?;
+            Ok(resp.text().await?.to_lowercase() == "true")
+        })
     }
-
     /// Get and increment a variable atomically (linearizable operation through leader)
     /// 
     /// Parameters:
@@ -207,11 +343,14 @@ impl VeritasClient {
     /// 
     /// Returns:
     /// - The value of the variable before the increment.
-    pub async fn get_and_add_variable(&self, name: &str) -> Result<i64, VeritasError> {
-        let resp = self.send_request(Method::GET, &format!("/get_add/{}", name), None).await?;
-        let value = resp.text().await?;
-        let num = value.parse::<i64>().map_err(|e| VeritasError::ParseError(e.to_string()))?;
-        Ok(num)
+    fn get_and_add_variable<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = Result<i64, VeritasError>> + Send + 'a>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let resp = self.send_request(Method::GET, &format!("/get_add/{}", name), None).await?;
+            let value = resp.text().await?;
+            let num = value.parse::<i64>().map_err(|e| VeritasError::ParseError(e.to_string()))?;
+            Ok(num)
+        })
     }
 
     /// Watch multiple variables for changes via WebSocket
@@ -225,98 +364,100 @@ impl VeritasClient {
     /// WARNING: The state update stream is lossy (notifications may be dropped) but maintains strict temporal integrity. 
     /// While the set of notifications is non-exhaustive, the sequence is guaranteed to be strictly monotonic, 
     /// ensuring that the observer never receives a stale or out-of-order historical version of the data.
-    pub async fn watch_variables(&self, variables: Vec<String>) -> Result<mpsc::UnboundedReceiver<UpdateNotification>, VeritasError> {
+    fn watch_variables<'a>(&'a self, variables: Vec<String>) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<UpdateNotification>, VeritasError>> + Send + 'a>> {
         use tokio_tungstenite::tungstenite::protocol::Message;
-        let candidates = if self.ws_nodes.is_empty() { self.nodes.clone() } else { self.ws_nodes.clone() };
-        if candidates.is_empty() {
-            return Err(VeritasError::WebSocketError("No websocket nodes available".into()));
-        }
-        // attempt connect starting from current then others
-        let start = self.current.load(Ordering::SeqCst);
-        let mut stream_opt = None;
-        for offset in 0..candidates.len() {
-            let idx = (start + offset) % candidates.len();
-            let base = &candidates[idx];
-            let ws_url = base.replace("http://", "ws://").replace("https://", "wss://");
-            let url = match Url::parse(&format!("{}/ws", ws_url)) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            match connect_async(url.as_str()).await {
-                Ok((stream, _)) => {
-                    if idx != start {
-                        self.update_current(idx);
+        Box::pin(async move {
+            let candidates = if self.ws_nodes.is_empty() { self.nodes.clone() } else { self.ws_nodes.clone() };
+            if candidates.is_empty() {
+                return Err(VeritasError::WebSocketError("No websocket nodes available".into()));
+            }
+            // attempt connect starting from current then others
+            let start = self.current.load(Ordering::SeqCst);
+            let mut stream_opt = None;
+            for offset in 0..candidates.len() {
+                let idx = (start + offset) % candidates.len();
+                let base = &candidates[idx];
+                let ws_url = base.replace("http://", "ws://").replace("https://", "wss://");
+                let url = match Url::parse(&format!("{}/ws", ws_url)) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                match connect_async(url.as_str()).await {
+                    Ok((stream, _)) => {
+                        if idx != start {
+                            self.update_current(idx);
+                        }
+                        stream_opt = Some(stream);
+                        break;
                     }
-                    stream_opt = Some(stream);
-                    break;
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
-        }
-        let stream = match stream_opt {
-            Some(s) => s,
-            None => return Err(VeritasError::WebSocketError("All websocket connection attempts failed".into())),
-        };
-        let (mut write, read) = stream.split();
-        let (tx, rx) = mpsc::unbounded_channel();
-        for var in &variables {
-            let watch_cmd = WatchCommand { command: "watch".into(), parameters: vec![var.clone()] };
-            if let Ok(msg) = serde_json::to_string(&watch_cmd) {
-                write.send(Message::Text(msg.into())).await.map_err(|e| VeritasError::WebSocketError(e.to_string()))?;
+            let stream = match stream_opt {
+                Some(s) => s,
+                None => return Err(VeritasError::WebSocketError("All websocket connection attempts failed".into())),
+            };
+            let (mut write, read) = stream.split();
+            let (tx, rx) = mpsc::unbounded_channel();
+                for var in &variables {
+                let watch_cmd = WatchCommand { command: "watch".into(), parameters: vec![var.clone()] };
+                if let Ok(msg) = serde_json::to_string(&watch_cmd) {
+                    write.send(Message::Text(msg.into())).await.map_err(|e| VeritasError::WebSocketError(e.to_string()))?;
+                }
             }
-        }
-        let vars_clone = variables.clone();
-        let nodes_clone = candidates.clone();
-        let current_atomic = self.current.clone(); // clone Arc instead of borrowing
-        tokio::spawn(async move {
-            let mut current_read = read;
-            loop {
-                while let Some(msg) = current_read.next().await {
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            if let Ok(notification) = serde_json::from_str::<UpdateNotification>(&text) {
-                                if notification.command == "update" {
-                                    if tx.send(notification).is_err() { return; }
+            let vars_clone = variables.clone();
+            let nodes_clone = candidates.clone();
+            let current_atomic = self.current.clone(); // clone Arc instead of borrowing
+            tokio::spawn(async move {
+                let mut current_read = read;
+                loop {
+                    while let Some(msg) = current_read.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                if let Ok(notification) = serde_json::from_str::<UpdateNotification>(&text) {
+                                    if notification.command == "update" {
+                                        if tx.send(notification).is_err() { return; }
+                                    }
                                 }
                             }
-                        }
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
-                    }
-                }
-                if tx.is_closed() { return; }
-                // reconnect rotation
-                let start_local = current_atomic.load(Ordering::SeqCst);
-                let mut success = None;
-                for offset in 0..nodes_clone.len() {
-                    let idx = (start_local + offset + 1) % nodes_clone.len(); // prefer different node
-                    let base = &nodes_clone[idx];
-                    let ws_url = base.replace("http://", "ws://").replace("https://", "wss://");
-                    let url = match Url::parse(&format!("{}/ws", ws_url)) { Ok(u) => u, Err(_) => continue };
-                    match connect_async(url.as_str()).await {
-                        Ok((stream, _)) => {
-                            current_atomic.store(idx, Ordering::SeqCst);
-                            success = Some(stream);
-                            break;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                            continue;
+                            Ok(Message::Close(_)) | Err(_) => break,
+                            _ => {}
                         }
                     }
-                }
-                let stream = match success { Some(s) => s, None => return };
-                let (mut new_write, new_read) = stream.split();
-                for var in &vars_clone {
-                    let watch_cmd = WatchCommand { command: "watch".into(), parameters: vec![var.clone()] };
-                    if let Ok(msg) = serde_json::to_string(&watch_cmd) {
-                        if new_write.send(Message::Text(msg.into())).await.is_err() { return; }
+                    if tx.is_closed() { return; }
+                    // reconnect rotation
+                    let start_local = current_atomic.load(Ordering::SeqCst);
+                    let mut success = None;
+                    for offset in 0..nodes_clone.len() {
+                        let idx = (start_local + offset + 1) % nodes_clone.len(); // prefer different node
+                        let base = &nodes_clone[idx];
+                        let ws_url = base.replace("http://", "ws://").replace("https://", "wss://");
+                        let url = match Url::parse(&format!("{}/ws", ws_url)) { Ok(u) => u, Err(_) => continue };
+                        match connect_async(url.as_str()).await {
+                            Ok((stream, _)) => {
+                                current_atomic.store(idx, Ordering::SeqCst);
+                                success = Some(stream);
+                                break;
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                                continue;
+                            }
+                        }
                     }
+                    let stream = match success { Some(s) => s, None => return };
+                    let (mut new_write, new_read) = stream.split();
+                    for var in &vars_clone {
+                        let watch_cmd = WatchCommand { command: "watch".into(), parameters: vec![var.clone()] };
+                        if let Ok(msg) = serde_json::to_string(&watch_cmd) {
+                            if new_write.send(Message::Text(msg.into())).await.is_err() { return; }
+                        }
+                    }
+                    current_read = new_read;
                 }
-                current_read = new_read;
-            }
-        });
-        Ok(rx)
+            });
+            Ok(rx)
+        })
     }
 
     /// Watch a single variable for changes
@@ -330,8 +471,10 @@ impl VeritasClient {
     /// WARNING: The state update stream is lossy (notifications may be dropped) but maintains strict temporal integrity.
     /// While the set of notifications is non-exhaustive, the sequence is guaranteed to be strictly monotonic,
     /// ensuring that the observer never receives a stale or out-of-order historical version of the data.
-    pub async fn watch_variable(&self, name: String) -> Result<mpsc::UnboundedReceiver<UpdateNotification>, VeritasError> {
-        self.watch_variables(vec![name]).await
+    fn watch_variable<'a>(&'a self, name: String) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<UpdateNotification>, VeritasError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.watch_variables(vec![name]).await
+        })
     }
 }
 

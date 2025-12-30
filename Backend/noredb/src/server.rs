@@ -35,6 +35,14 @@ impl Database for MyDatabaseServer {
     ) -> Result<tonic::Response<Commit>, tonic::Status> {
         let data: Data = request.into_inner();
 
+        // Validate payload sizes to prevent panics from short byte arrays
+        if data.value.len() < 3 {
+            return Err(tonic::Status::invalid_argument("value must contain at least 3 bytes for RGB"));
+        }
+        if data.timestamp.len() < 16 {
+            return Err(tonic::Status::invalid_argument("timestamp must contain at least 16 bytes"));
+        }
+
         // r,g,b values
         let mut color = [0u8; 3];
         color.copy_from_slice(&data.value[..3]);
@@ -54,9 +62,12 @@ impl Database for MyDatabaseServer {
         };
 
         let wait = tokio::sync::oneshot::channel();
-        
+
+        // Notify once the pixel has been persisted; avoid panicking if receiver is gone
         self.db.set_pixel(pixel, Some(Box::new(|| {
-                wait.0.send(()).unwrap();
+            if wait.0.send(()).is_err() {
+                warn!("set listener dropped before notification could be delivered");
+            }
         })));
 
         // Wait for the pixel to be permanently stored
@@ -114,13 +125,13 @@ impl Database for MyDatabaseServer {
     ) -> Result<tonic::Response<Self::GetAllStream>, tonic::Status> {
         // Return an empty stream for now; populate with real keys if CanvasDB provides an iterator.
         let (tx, rx) = mpsc::channel(4);
-
-        let mut iter = self.db.iterate_pixels().map_err(|_| {
+        
+        let iter = self.db.iterate_pixels().map_err(|_| {
             tonic::Status::internal("Failed to create pixel iterator")
         })?;
-        
+
         tokio::spawn(async move {
-            while let Some(pixel) = iter.next() {
+            for pixel in iter {
                 let resp = DataResponse {
                     index: 0, // index is not relevant here
                     key: pixel.key,

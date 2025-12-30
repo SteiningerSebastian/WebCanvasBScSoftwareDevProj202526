@@ -1,0 +1,18 @@
+# Only for exposing noredb service via LoadBalancer for testing purposes. 
+# In production, we use a partition controller to distribute traffic according to keys.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: noredb-loadbalancer
+  labels:
+    app: noredb
+spec:
+  type: LoadBalancer
+  selector:
+    app: noredb
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP

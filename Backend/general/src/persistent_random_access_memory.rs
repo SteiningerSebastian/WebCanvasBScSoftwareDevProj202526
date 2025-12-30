@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt::Display, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
+use std::{collections::BTreeSet, fmt::{Debug, Display}, fs::{File, OpenOptions}, io::{self, Read, Seek, Write}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicPtr, Ordering}}};
 use memmap2::{MmapMut};
 use parking_lot::{Mutex, RwLock};
 use tracing::error;
@@ -933,5 +933,21 @@ impl PersistentRandomAccessMemory {
         file.write_all(&bytes[0..length]).map_err(Error::FileWriteError)?;
         
         Ok(())
+    }
+}
+
+impl Debug for PersistentRandomAccessMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentRandomAccessMemory")
+            .field("path", &self.path)
+            .field("size", &self.size)
+            .field("free", &{
+                let free_slots = self.free_slots.lock();
+                let free_bytes: usize = free_slots.iter().map(|(_, len)| *len).sum();
+                free_bytes
+            })
+            .field("free_slots_len", &self.free_slots.lock().len())
+            .field("malloc_called", &self.malloc_called.load(Ordering::SeqCst))
+            .finish()
     }
 }

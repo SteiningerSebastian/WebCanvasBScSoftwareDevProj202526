@@ -164,6 +164,16 @@ pub struct BTreeIndexPRAM {
     lock: Arc<RwLock<()>>, // For concurrent access
 }
 
+impl Clone for BTreeIndexPRAM {
+    fn clone(&self) -> Self {
+        BTreeIndexPRAM {
+            pram: Arc::clone(&self.pram),
+            root: self.root.clone(),
+            lock: Arc::clone(&self.lock),
+        }
+    }
+}
+
 struct BTreeNodeRemovePointerCache{
     pointer: Pointer<BTreeNode>,
     node: BTreeNode,
@@ -1175,45 +1185,44 @@ impl BTreeIndex for BTreeIndexPRAM {
 }
 
 pub struct BTreeIndexPRAMIterator {
-    current_node: BTreeNode,
-    current_node_ptr: Pointer<BTreeNode>,
-    current_pos: u64,
-    pram: Arc<PersistentRandomAccessMemory>,
+    index: BTreeIndexPRAM,
+    lock: Arc<RwLock<()>>,
+    next_key: u64,
 }
 
 impl Iterator for BTreeIndexPRAMIterator {
-    type Item = (u64, u64);
+    // We are actually batching the itmes as it allows for more efficient sequential access.
+    type Item = Vec<(u64, u64)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_pos < self.current_node.length as u64 {
-            let key = self.current_node.keys[self.current_pos as usize];
-            let value = self.current_node.values[self.current_pos as usize];
-            self.current_pos += 1;
-            Some((key, value))
+        let _guard: parking_lot::lock_api::RwLockReadGuard<'_, parking_lot::RawRwLock, ()> = self.lock.read(); // Acquire read lock as we are only reading the structure. (Locked until dropped)
+
+        let current_node = self.index.find_leaf_node(self.next_key, &mut self.index.root.clone()).ok()?;
+        let current_node: BTreeNode = current_node.deref().ok()?;
+
+        // Now return the first element of the new leaf
+        let res = Some(current_node.keys.iter().zip(current_node.values.iter())
+            // The filter is needed in case a concurrent merge or borrow happened and the next_key is in the previous iterated node now.
+            // without it we may return keys that have already been returned.
+            .filter(|(k, _)| **k >= self.next_key)
+            .take(current_node.length as usize)
+            .map(|(&k, &v)| (k, v))
+            .collect());
+
+        let max_key = if current_node.length > 0 {
+            current_node.keys[current_node.length as usize - 1]
         } else {
-            // Move to next leaf node
-            let next_leaf_ptr = Pointer::from_address(self.current_node.values[BTREE_ORDER - 1], self.pram.clone());
+            return None; // No more keys or broken state.
+        };
 
-            let next_node: BTreeNode = next_leaf_ptr.deref().ok()?;
-            if next_node.length == 0 {
-                return None; // No more elements
-            }
-
-            self.current_node = next_node;
-            self.current_node_ptr = next_leaf_ptr;
-            self.current_pos = 0;
-
-            // If we reach the root again then we are done.
-            if self.current_node.is_leaf == false {
-                return None; 
-            }
-
-            // Now return the first element of the new leaf
-            let key = self.current_node.keys[self.current_pos as usize];
-            let value = self.current_node.values[self.current_pos as usize];
-            self.current_pos += 1;
-            Some((key, value))
+        if max_key < self.next_key {
+            return None; // No more keys or broken state.
+        } else {
+            // Set next key to one more than the maximum key in the current node.
+            self.next_key = max_key +1;
         }
+
+        res
     }
 }
 
@@ -1222,17 +1231,13 @@ impl BTreeIndexPRAM {
     /// 
     /// Returns:
     /// - `BTreeIndexPRAMIterator`: An iterator over the key-value pairs in the B-tree.
-    pub fn iter(&self) -> Result<BTreeIndexPRAMIterator, Error> {
-        // Start at leftmost node.
-        let first = self.find_leaf_node(0, &mut self.root.clone())?;
-
-        let first_node = first.deref().map_err(Error::UnspecifiedMemoryError)?;
-        
+    pub fn iter(&self) -> Result<BTreeIndexPRAMIterator, Error> {      
+        let me = self.clone(); 
+        let lock = Arc::clone(&self.lock); 
         Ok(BTreeIndexPRAMIterator {
-            current_node: first_node,
-            current_node_ptr: first,
-            current_pos: 0,
-            pram: self.pram.clone(),
+            index: me,
+            lock: lock,
+            next_key: 0,
         })
     }
 }
@@ -1498,12 +1503,34 @@ mod tests {
         println!("Expected length: {}", expected.len());
         println!("Index length: {}", idx.iter().unwrap().count());
         let mut last_key = 0;
-        for (k, v) in idx.iter().unwrap() {
+        for (k, v) in idx.iter().unwrap().flatten() {
             assert_eq!(expected.get(&k).unwrap(), &v);
 
             // Check ordering
             assert!(k >= last_key);
             last_key = k;
         }
+    }
+
+    #[test]
+    fn iterator_returns_sorted_and_latest_values() {
+        let idx = new_index("iterator_returns_sorted_and_latest_values");
+
+        let inputs = vec![
+            (9u64, 90u64),
+            (3, 30),
+            (7, 70),
+            (1, 10),
+            (3, 33), // update existing key to ensure latest value is surfaced
+        ];
+
+        for (k, v) in inputs.iter().copied() {
+            idx.set(k, v).unwrap();
+        }
+
+        let collected: Vec<(u64, u64)> = idx.iter().unwrap().flatten().collect();
+        let expected = vec![(1u64, 10u64), (3, 33), (7, 70), (9, 90)];
+
+        assert_eq!(collected, expected);
     }
 }

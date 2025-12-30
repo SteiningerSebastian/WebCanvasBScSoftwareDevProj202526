@@ -98,7 +98,7 @@ pub trait CanvasDBTrait {
     /// 
     /// Returns:
     /// - `Box<dyn Iterator<Item = Pixel>>`: An iterator that yields Pixel entries.
-    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = Pixel> + Send>, Error>;
+    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = Pixel> + Send + 'static>, Error>;
 }
 
 pub struct CanvasDB {
@@ -121,6 +121,7 @@ pub struct CanvasDB {
     /// Handles to worker threads for joining on shutdown
     worker_handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
+// Be aware that clone is not a good idea as dropping any clone will shutdown the DB.
 
 impl CanvasDB {
     pub fn new(
@@ -130,12 +131,12 @@ impl CanvasDB {
         write_ahead_log_size: usize,
     ) -> Self {
         // +1024 for any necessary pointers, implementation overhead, etc.
-        let wal_pram = PersistentRandomAccessMemory::new(write_ahead_log_size*std::mem::size_of::<PixelEntry>() + 1024,&format!("{}.wal.pram", path));
+        let wal_pram = PersistentRandomAccessMemory::new(write_ahead_log_size*std::mem::size_of::<PixelEntry>() + 1024,&format!("{}.wal", path));
         // *32 for each btree entry there is a u64 (8bytes) key a u64 (8bytes) value and some overhead (+1024bytes and *32 not *16)
         // *2 for non edge nodes
-        let btree_pram: Arc<PersistentRandomAccessMemory> = PersistentRandomAccessMemory::new((width as usize * height as usize * 32 * 2) + 1024, &format!("{}.index.pram", path));
+        let btree_pram: Arc<PersistentRandomAccessMemory> = PersistentRandomAccessMemory::new((width as usize * height as usize * 32 * 2) + 1024, &format!("{}.index", path));
         // *2 for alignment and heap fragmentation +1024 for any overhead
-        let data_store: Arc<PersistentRandomAccessMemory> = PersistentRandomAccessMemory::new((width as usize * height as usize * std::mem::size_of::<PixelEntry>()*2) + 1024, &format!("{}.store.pram", path));
+        let data_store: Arc<PersistentRandomAccessMemory> = PersistentRandomAccessMemory::new((width as usize * height as usize * std::mem::size_of::<PixelEntry>()*2) + 1024, &format!("{}.store", path));
 
         // Initialize the write-ahead log, B-tree index, and data store
         let write_ahead_log = Arc::new(WriteAheadLog::new(wal_pram, write_ahead_log_size));
@@ -649,12 +650,12 @@ impl CanvasDBTrait for CanvasDB {
         None
     }
     
-    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = Pixel> + Send>, Error> {
+    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = Pixel> + Send + 'static>, Error> {
         // Iterate over all pixels in the B-tree index and data store
         let btree_iter = self.btree_index.iter().map_err(|e| Error::BTreeIndexError { inner: e })?;
         let data_store_clone = self.data_store.clone();
 
-        let iter = btree_iter.filter_map(move |(_key, address)| {
+        let iter = btree_iter.flatten().filter_map(move |(_key, address)| {
             let pointer:Pointer<PixelEntry> = Pointer::from_address(address, data_store_clone.clone());
             match pointer.deref() {
                 Ok(entry) => Some(entry.pixel),

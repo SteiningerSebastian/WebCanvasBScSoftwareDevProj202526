@@ -1,11 +1,13 @@
-use std::{env, net::SocketAddr, path::Path, process};
+use std::{collections::HashMap, env, path::Path, process, time::Duration};
 
+use chrono::Utc;
 use tonic::{transport::Server};
+use tonic_health::server::health_reporter;
 use tracing::{Level, debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use general::{concurrent_file_key_value_store::{ConcurrentFileKeyValueStore, ConcurrentKeyValueStore}};
-use veritas_client::veritas_client::VeritasClient;
+use veritas_client::{service_registration::{ServiceEndpoint, ServiceRegistration, ServiceRegistrationHandler, ServiceRegistrationTrait}, veritas_client::{VeritasClient, VeritasClientTrait}};
 
 use crate::{canvasdb::CanvasDB, server::{MyDatabaseServer, noredb}};
 
@@ -14,17 +16,19 @@ mod canvasdb;
 
 const CONFIG_PATH: &str = "/data/noredb.config";
 const UNIQUE_ID_KEY: &str = "noredb.unique_id";
-const SERVICE_REGISTRATION_KEY: &str = "noredb.registered_instances";
+const SERVICE_REGISTRATION_KEY: &str = "service-noredb";
 const PORT : u16 = 50051;
 const REGISTRATION_ATTEMPTS: usize = 4; // number of attempts to register service
 const REGISTRATION_BACKOFF_MS: u64 = 200; // milliseconds between attempts
 const REGISTRATION_BACKOFF_MULTIPLIER: u64 = 5; // exponential backoff multiplier
+const REGISTRATION_INTERVAL_MS: u64 = 10_000; // interval between registration refreshes
 
 const CANVAS_WIDTH: usize = 3840;
 const CANVAS_HEIGHT: usize = 2160;
 const CANVAS_DB_PATH: &str = "/data/canvasdb";
 const WRITE_AHEAD_LOG_SIZE: usize = 1024;
 const NUM_WORKER_THREADS: usize = 4;
+
 
 /// Parse a comma-separated list of hostnames/IPs (VERITAS_NODES) into a Vec<String>
 /// (preserve the original token so we can resolve DNS at connect time).
@@ -147,16 +151,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("NoReDB unique id: {}", unique_id);
 
-    // Register this instance in the shared set of registered instances
-    // First lets look up existing registered instances id:ip;id:ip;...
-    let mut delay = REGISTRATION_BACKOFF_MS;
-    for _ in 0..REGISTRATION_ATTEMPTS {
-        if try_register_instance(&client, unique_id).await.is_ok() {
-            break;
+    let unique_id_clone = unique_id.clone();
+    tokio::spawn( async move{    // Attempt to register service with retries and exponential backoff
+        let mut registration_handler = ServiceRegistrationHandler::new(client, SERVICE_REGISTRATION_KEY).await.unwrap();
+    
+        let mut service = ServiceRegistration {
+            id: SERVICE_REGISTRATION_KEY.to_string(),
+            endpoints: Vec::new(),
+            meta: HashMap::<String, String>::new(),
+        };
+
+        let mut service_endpoint = 
+            ServiceEndpoint {
+                address: format!("{}", gethostname::gethostname().to_string_lossy()),
+                port: PORT,
+                id: unique_id_clone.to_string(),
+                timestamp: Utc::now(),
+            };
+
+        service.endpoints.push(service_endpoint.clone());
+            
+        for i in 0..REGISTRATION_ATTEMPTS {
+            let old_service = registration_handler.resolve_service().await; 
+            if let Ok(s) = old_service {
+                // Service already registered
+                service = s;
+            } else {
+                if let Ok(_) = registration_handler.register_or_update_service(&service, None).await {
+                    info!("Service registered successfully on attempt {}", i + 1);
+                    break;
+                }else {
+                    if i == REGISTRATION_ATTEMPTS - 1 {
+                        error!("Failed to register service after {} attempts, exiting", REGISTRATION_ATTEMPTS);
+                    }
+                }
+            };
+
+            tokio::time::sleep(Duration::from_millis(REGISTRATION_BACKOFF_MS * REGISTRATION_BACKOFF_MULTIPLIER.pow(i as u32))).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        delay *= REGISTRATION_BACKOFF_MULTIPLIER;
-    }
+
+        loop {
+            // Update timestamp
+            service_endpoint.timestamp = Utc::now();
+
+            if let Err(e) = registration_handler.register_or_update_endpoint(&service_endpoint).await {
+                warn!("Failed to refresh endpoint registration: {:?}", e);
+            } else {
+                debug!("Endpoint registration refreshed");
+            }
+
+            // Periodically refresh registration
+            tokio::time::sleep(Duration::from_millis(REGISTRATION_INTERVAL_MS)).await; 
+        }
+    });
 
     let addr = format!("0.0.0.0:{}", PORT).parse()?;
 
@@ -166,80 +213,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database = MyDatabaseServer::new(canvas_db);
 
+    // Set up health reporting
+    let (health_reporter, health_service) = health_reporter();
+    health_reporter
+        .set_serving::<noredb::database_server::DatabaseServer<MyDatabaseServer>>()
+        .await;
+
     Server::builder()
+        .add_service(health_service)
         .add_service(noredb::database_server::DatabaseServer::new(database))
         .serve(addr)
         .await?;
 
     Ok(())
-}
-
-async fn try_register_instance(client: &VeritasClient, unique_id: u32) -> Result<(), &'static str> {
-    let current_value;
-    let mut registered_instances = match client.get_variable(SERVICE_REGISTRATION_KEY).await {
-        Ok(val) => {
-            current_value = val.clone(); // keep a copy of current value
-            let instances: Vec<(usize, SocketAddr)> = if val.is_empty() {
-                Vec::new()
-            } else {
-                val.split(';')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.split(':').map(|x| x.to_string()).collect::<Vec<String>>())
-                    .map(|s: Vec<String>| (s[0].parse::<usize>().unwrap(), format!("{}:{}", s[1], PORT).parse::<SocketAddr>().unwrap()))
-                    .collect()
-            };
-            instances
-        }
-        Err(e) => {
-            panic!("Failed to look up registered instances: {:?}", e);
-        }
-    };
-
-    // Look for our id in the existing set
-    registered_instances.iter().for_each(|(id, addr)| {
-        info!("Registered instance - id: {}, addr: {}", id, addr);
-    });
-
-    let mut existing_registration: Option<&mut (usize, SocketAddr)> = registered_instances.iter_mut().find(|(id, _)| *id == unique_id as usize);
-
-    // If not found, add ourselves
-    if let None = existing_registration {
-        registered_instances.push((unique_id as usize, format!("0.0.0.0:{}", PORT).parse().unwrap()));
-        existing_registration = registered_instances.iter_mut().find(|(id, _)| *id == unique_id as usize);
-    }
-
-    // Get our own ip address
-    let my_ip = local_ip_address::local_ip();
-
-    if let Err(e) = my_ip {
-        panic!("Failed to obtain local IP address: {}", e);
-    }
-
-    let my_ip = my_ip.unwrap().to_string();
-
-    if let Some((_, addr)) = existing_registration {
-        *addr = format!("{}:{}", my_ip, PORT).parse().unwrap();
-    }else{
-        panic!("Failed to register this instance, could not find own registration after adding.");
-    }
-
-    // Persist updated registered instances back to Veritas
-    let new_value = registered_instances.iter()
-        .map(|(id, addr)| format!("{}:{}", id, addr.ip()))
-        .collect::<Vec<String>>()
-        .join(";");
-
-    if let Ok(has_been_set) = client.compare_and_set_variable(SERVICE_REGISTRATION_KEY, 
-    &current_value, 
-    &new_value).await {
-        if has_been_set {
-            info!("Successfully registered instance with id {} at {}", unique_id, my_ip);
-            return Ok(()); // success
-        } else {
-            warn!("Compare-and-set failed, another instance may have modified the registered instances concurrently.");
-        }
-    }
-
-    return Err("Failed to register instance after compare-and-set attempts");
 }

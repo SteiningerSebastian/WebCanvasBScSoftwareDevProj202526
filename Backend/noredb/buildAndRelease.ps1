@@ -28,8 +28,8 @@ docker push $tag1
 docker push $tag2
 
 # Deploy to Kubernetes
-kubectl set image statefulset/noredb-canvasdb noredb-canvasdb=sebastiansteininger/noredb-canvasdb:alpha -n default
-kubectl rollout restart statefulset/noredb-canvasdb -n default
+kubectl set image statefulset/noredb noredb-canvasdb=sebastiansteininger/noredb-canvasdb:alpha -n default
+kubectl rollout restart statefulset/noredb -n default
 
 # Wait for rollout to complete
-kubectl rollout status statefulset/veritas -n default
+kubectl rollout status statefulset/noredb -n default

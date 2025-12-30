@@ -1,17 +1,30 @@
 use noredb::canvasdb::{CanvasDB, CanvasDBTrait, Pixel, PixelEntry, TimeStamp};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread;
 
+static TEST: AtomicU64 = AtomicU64::new(0);
+
 /// Helper function to create a test CanvasDB instance
-fn create_test_canvas_db() -> CanvasDB {
+fn create_test_canvas_db(name: &str) -> CanvasDB {
     // Use a unique path for each test to avoid conflicts
-    let test_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = format!("D:/tmp/canvasdb/test_canvas_db_{}", test_id);
-    
+    let test_id = TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = format!("D:/tmp/canvasdb/{}_test_canvas_db_{}", test_id, name);
+
+    // If any file with a matching name name* exists, delete it
+    // list all files matching the pattern
+    for enty in std::fs::read_dir("D:/tmp/canvasdb/").unwrap() {
+        let entry = enty.unwrap();
+        let file_name = entry.file_name().into_string().unwrap();
+        if file_name.starts_with(&path) {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    // Let filesystem settle
+    thread::sleep(Duration::from_millis(100));
+
     CanvasDB::new(
         1920, // width
         1080, // height
@@ -45,14 +58,14 @@ fn create_pixel_entry(key: u32, r: u8, g: u8, b: u8, timestamp: u128) -> PixelEn
 
 #[test]
 fn test_canvas_db_creation() {
-    let _canvas_db = create_test_canvas_db();
+    let _canvas_db = create_test_canvas_db("creation");
     // If we get here, the CanvasDB was created successfully
     assert!(true);
 }
 
 #[test]
 fn  test_set_and_get_single_pixel() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("set_and_get_single_pixel");
     canvas_db.start_worker_threads(2); 
     
     let pixel_entry = create_pixel_entry(100, 255, 0, 0, 1000);
@@ -84,7 +97,7 @@ fn  test_set_and_get_single_pixel() {
 
 #[test]
 fn test_get_nonexistent_pixel() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("get_nonexistent_pixel");
     canvas_db.start_worker_threads(2);
     
     // Try to get a pixel that doesn't exist
@@ -94,7 +107,7 @@ fn test_get_nonexistent_pixel() {
 
 #[test]
 fn test_update_pixel_with_newer_timestamp() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("update_pixel_with_newer_timestamp");
     canvas_db.start_worker_threads(2);
     
     // Set initial pixel
@@ -120,7 +133,7 @@ fn test_update_pixel_with_newer_timestamp() {
 
 #[test]
 fn test_update_pixel_with_older_timestamp_ignored() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("update_pixel_with_older_timestamp_ignored");
     canvas_db.start_worker_threads(2);
     
     // Set initial pixel with newer timestamp
@@ -146,7 +159,7 @@ fn test_update_pixel_with_older_timestamp_ignored() {
 
 #[test]
 fn test_multiple_pixels() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("multiple_pixels");
     canvas_db.start_worker_threads(4);
     
     // Set multiple pixels
@@ -170,8 +183,45 @@ fn test_multiple_pixels() {
 }
 
 #[test]
+fn test_iterate_pixels_returns_persisted_entries() {
+    let canvas_db = create_test_canvas_db("iterate_pixels_returns_persisted_entries");
+    canvas_db.start_worker_threads(4);
+
+    let entries = vec![
+        create_pixel_entry(1000, 10, 20, 30, 12000),
+        create_pixel_entry(1001, 40, 50, 60, 12001),
+        create_pixel_entry(1002, 70, 80, 90, 12002),
+        create_pixel_entry(1003, 100, 110, 120, 12003),
+    ];
+
+    for entry in entries.iter() {
+        canvas_db.set_pixel(entry.clone(), None);
+    }
+
+    // Allow worker threads to move WAL entries into the B-tree before iterating.
+    thread::sleep(Duration::from_millis(400));
+
+    let mut iterated: Vec<(u32, [u8; 3])> = canvas_db
+        .iterate_pixels()
+        .expect("iterate_pixels should succeed")
+        .map(|pixel| (pixel.key, pixel.color))
+        .collect();
+
+    iterated.sort_by_key(|(key, _)| *key);
+
+    let mut expected: Vec<(u32, [u8; 3])> = entries
+        .iter()
+        .map(|e| (e.pixel.key, e.pixel.color))
+        .collect();
+
+    expected.sort_by_key(|(key, _)| *key);
+
+    assert_eq!(iterated, expected);
+}
+
+#[test]
 fn test_listener_callback() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("listener_callback");
     canvas_db.start_worker_threads(2);
     
     let callback_called = Arc::new(Mutex::new(false));
@@ -186,7 +236,7 @@ fn test_listener_callback() {
     canvas_db.set_pixel(pixel_entry, Some(listener));
     
     // Wait for listener to be called (listener latency is 100ms)
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(1000));
     
     let called = *callback_called.lock().unwrap();
     assert!(called);
@@ -194,7 +244,7 @@ fn test_listener_callback() {
 
 #[test]
 fn test_multiple_listeners() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("multiple_listeners");
     canvas_db.start_worker_threads(2);
     
     let counter = Arc::new(Mutex::new(0));
@@ -212,7 +262,7 @@ fn test_multiple_listeners() {
     }
     
     // Wait for all listeners to be called
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(1000));
     
     let count = *counter.lock().unwrap();
     assert_eq!(count, 5);
@@ -220,7 +270,7 @@ fn test_multiple_listeners() {
 
 #[test]
 fn test_concurrent_pixel_updates() {
-    let canvas_db = Arc::new(create_test_canvas_db());
+    let canvas_db = Arc::new(create_test_canvas_db("concurrent_pixel_updates"));
     canvas_db.start_worker_threads(4);
     
     let mut handles = vec![];
@@ -244,7 +294,7 @@ fn test_concurrent_pixel_updates() {
     }
     
     // Wait for worker threads to process
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(1000));
     
     // Verify all pixels were set correctly
     for thread_id in 0..10 {
@@ -263,7 +313,7 @@ fn test_concurrent_pixel_updates() {
 
 #[test]
 fn test_timestamp_ordering() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("timestamp_ordering");
     canvas_db.start_worker_threads(2);
     
     let key = 600;
@@ -295,7 +345,7 @@ fn test_timestamp_ordering() {
 
 #[test]
 fn test_get_pixel_from_wal_before_persistence() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("get_pixel_from_wal_before_persistence");
     // Don't start worker threads to keep data in WAL
     
     let pixel_entry = create_pixel_entry(700, 200, 100, 50, 8000);
@@ -313,7 +363,7 @@ fn test_get_pixel_from_wal_before_persistence() {
 
 #[test]
 fn test_high_volume_pixel_updates() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("high_volume_pixel_updates");
     canvas_db.start_worker_threads(8);
     
     // Set a large number of pixels
@@ -339,7 +389,7 @@ fn test_high_volume_pixel_updates() {
 
 #[test]
 fn test_pixel_color_values() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("pixel_color_values");
     canvas_db.start_worker_threads(2);
     
     // Test edge cases for color values
@@ -370,7 +420,7 @@ fn test_pixel_color_values() {
 
 #[test]
 fn test_same_pixel_rapid_updates() {
-    let canvas_db = create_test_canvas_db();
+    let canvas_db = create_test_canvas_db("same_pixel_rapid_updates");
     canvas_db.start_worker_threads(4);
     
     let key = 900;
@@ -391,3 +441,4 @@ fn test_same_pixel_rapid_updates() {
     assert_eq!(pixel.color, [(49 * 5) as u8, (49 * 3) as u8, (49 * 2) as u8]);
     assert_eq!(timestamp.bytes, create_timestamp(11000 + 49).bytes);
 }
+
