@@ -2,7 +2,7 @@ use std::{fmt::Display, sync::{Arc}, u64};
 
 use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 
-use crate::persistent_random_access_memory::{Error as PRAMError, PersistentRandomAccessMemory, Pointer};
+use crate::persistent_random_access_memory::{self, Error as PRAMError, PersistentRandomAccessMemory, Pointer};
 
 #[derive(Debug)]
 pub enum Error {
@@ -14,6 +14,11 @@ pub enum Error {
     SynchronizationError,
     RecursiveChangedNeeded,
     KeyAlreadyExists,
+
+    /// A fatal error that cannot be recovered from.
+    /// The caller must abort the process when encountering this error to prevent data corruption.
+    /// After a FatalError, all guarantees about the state of the persistent memory are void.
+    FatalError(Box<Error>),
 }
 
 impl Display for Error {
@@ -27,6 +32,7 @@ impl Display for Error {
             Error::SynchronizationError => write!(f, "Synchronization error"),
             Error::RecursiveChangedNeeded => write!(f, "Recursive change needed but prohibeded."),
             Error::KeyAlreadyExists => write!(f, "Key already exists"),
+            Error::FatalError(e) => write!(f, "Fatal Error: {}", e),
         }
     }
 }
@@ -1160,7 +1166,11 @@ impl BTreeIndex for BTreeIndexPRAM {
     fn persist(&self) -> Result<(), Error> {
         // Acquire write lock as we are persisting the structure. (Locked until dropped)
         let _read_lock = self.lock.read();
-        self.pram.persist().map_err(Error::PersistenceError)
+        let error = self.pram.persist();
+        if let Err(persistent_random_access_memory::Error::FatalError(e)) = error {
+            return Err(Error::FatalError(Box::new(Error::PersistenceError(*e))));
+        }
+        error.map_err(Error::PersistenceError)
     }
 }
 

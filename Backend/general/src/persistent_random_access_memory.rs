@@ -35,6 +35,11 @@ pub enum Error {
     MemoryAllocationError,
     /// Error during synchronization of access to persistent memory.
     SynchronizationError,
+
+    /// A fatal error that cannot be recovered from.
+    /// The caller must abort the process when encountering this error to prevent data corruption.
+    /// After a FatalError, all guarantees about the state of the persistent memory are void.
+    FatalError(Box<Error>),
 }
 
 impl Display for Error {
@@ -51,6 +56,7 @@ impl Display for Error {
             Error::FileWriteError(e) => write!(f, "Unable to write to file: {}", e),
             Error::MemoryAllocationError => write!(f, "Memory Allocation Error"),
             Error::SynchronizationError => write!(f, "Synchronization Error"),
+            Error::FatalError(e) => write!(f, "Fatal Error: {}", e),
         }
     }
 }
@@ -150,6 +156,30 @@ impl<T> Pointer<T> where T: Sized {
     pub fn deref(&self) -> Result<T, Error> where T: Sized {
         let pram = self.memory.upgrade().ok_or(Error::MemoryAllocationError)?;
         pram.read::<T>(self.address)
+    }
+
+    /// Dereferences the pointer to get multiple values of type T.
+    /// 
+    /// Returns:
+    /// - Result containing a vector of values of type T on success or Error on failure.
+    pub fn deref_many(&self, count: usize) -> Result<Vec<T>, Error> where T: Sized {
+        let pram = self.memory.upgrade().ok_or(Error::MemoryAllocationError)?;
+        let mut buf = vec![0u8; count * std::mem::size_of::<T>()];
+        pram.read_exact(self.address, &mut buf)?;
+
+        // Convert the byte buffer into a vector of T
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = i * std::mem::size_of::<T>();
+            let end = start + std::mem::size_of::<T>();
+            let t_bytes = &buf[start..end];
+            let t: T = unsafe {
+                std::ptr::read(t_bytes.as_ptr() as *const T)
+            };
+            result.push(t);
+        }
+
+        Ok(result)
     }
 }
 
@@ -416,7 +446,7 @@ impl PersistentRandomAccessMemory {
             return Ok(());
         } 
 
-        // TODO: Somehow the rename fails even tough the files exist and are not locked.
+        // TODO: Somehow the rename fails even though the files exist and are not locked.
         // That is strange behavior, think of a solution for this...
         if let Err(e) = rename_result {
             error!("Failed to rename file from '{}' to '{}': {}", from, to, e);
@@ -451,7 +481,6 @@ impl PersistentRandomAccessMemory {
         unsafe { 
             (*self.swap_mmap.load(Ordering::Acquire)).flush().map_err(|_| Error::FlushError)?; 
         }
-
         // Ensure all writes are completed before proceeding.
         std::sync::atomic::fence(Ordering::Release);
 
@@ -480,21 +509,22 @@ impl PersistentRandomAccessMemory {
         // These renames must be executed, else we are unable to recover and need to try to recover on startup.
         
         // Unfortunately, we can't recover from failed renames, so we retry a few times before giving up and making sure to exit.
+        
         if let Err(e) = Self::atomic_rename(&persistent_file_path_str, &format!("{}.tmp", persistent_file_path_str)) {
             error!("Failed to rename persistent file to temporary file during persist: {}", e);
-            std::process::abort();
+            return Err(Error::FatalError(Box::new(e)));
         }
 
         // Then move the swap file to the persistent file location
         if let Err(e) = Self::atomic_rename(&swap_file_path_str, &persistent_file_path_str) {
             error!("Failed to rename swap file to persistent file during persist: {}", e);
-            std::process::abort();
+            return Err(Error::FatalError(Box::new(e)));
         }
     
         // Finally move the temporary file to the swap file location
         if let Err(e) = Self::atomic_rename(&format!("{}.tmp", persistent_file_path_str), &swap_file_path_str) {
             error!("Failed to rename temporary file to swap file during persist: {}", e);
-            std::process::abort();
+            return Err(Error::FatalError(Box::new(e)));
         }
 
         // Reopen the swap file and persistent file handles after the swap
@@ -600,6 +630,32 @@ impl PersistentRandomAccessMemory {
         };
 
         Ok(value)
+    }
+
+    /// Reads data from the specified pointer into the provided buffer.
+    ///
+    /// Parameters:
+    /// - pointer: The memory address as a u64.
+    /// - buf: The buffer to read data into.
+    /// 
+    /// Returns:
+    /// - Result indicating success or failure.
+    fn read_exact(&self, pointer: u64, buf: &mut [u8]) -> Result<(), Error> {
+        let len = buf.len();
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        let bytes = unsafe {
+            (&mut (*self.swap_mmap.load(Ordering::SeqCst)))
+                .get(pointer as usize..(pointer as usize + len))
+                .ok_or(Error::ReadError)?
+        };
+
+        buf.copy_from_slice(bytes);
+
+        Ok(())
     }
     
     /// Writes data from the provided buffer to the specified pointer.

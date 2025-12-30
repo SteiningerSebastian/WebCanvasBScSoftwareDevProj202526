@@ -1566,6 +1566,7 @@ dependencies = [
  "local-ip-address",
  "prost",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

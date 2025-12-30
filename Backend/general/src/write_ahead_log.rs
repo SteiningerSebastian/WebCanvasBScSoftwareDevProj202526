@@ -1,6 +1,6 @@
-use std::{fmt::Display, sync::{Arc, atomic::{AtomicI64, AtomicU64}}};
+use std::{fmt::Display, sync::{Arc, atomic::{AtomicU64}}};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::persistent_random_access_memory::{self, PersistentRandomAccessMemory, Pointer};
 
@@ -15,9 +15,13 @@ pub enum Error {
     /// Error when the WAL is out of memory
     OutOfMemory,
     /// Error peaking at the next entry in the WAL
-    PeakFailed,
+    PeekFailed,
     /// Error popping the next entry from the WAL
     PopFailed,
+
+    /// A fatal error that cannot be recovered from.
+    /// The caller must abort the process when encountering this error to prevent data corruption.
+    FatalError(Box<Error>),
 }
 
 impl Display for Error {
@@ -27,8 +31,9 @@ impl Display for Error {
             Error::CommitError(e) => write!(f, "Commit Error: {}", e),
             Error::AppendFailed => write!(f, "Append Failed"),
             Error::OutOfMemory => write!(f, "Out Of Memory"),
-            Error::PeakFailed => write!(f, "Peak Failed"),
+            Error::PeekFailed => write!(f, "Peak Failed"),
             Error::PopFailed => write!(f, "Pop Failed"),
+            Error::FatalError(e) => write!(f, "Fatal Error: {}", e),
         }
     }
 }
@@ -76,12 +81,15 @@ pub trait WriteAheadLogTrait<T> where T: Sized {
 
     /// Creates an iterator over the write-ahead log entries. (lifo order)
     /// 
+    /// Parameters:
+    /// - `batch_size`: The number of entries to fetch in each iteration batch.
+    /// 
     /// Returns:
-    /// - `WALIterator<'_, T>`: An iterator over the log entries.
+    /// - `WALIterator<'_, [T]>`: An iterator over the log entries.
     /// 
     /// Warning: The iterator does not guarantee consistency if the WAL is modified during iteration.
     /// If modifications occur, the iterator may yield already removed entries.
-    fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized;
+    fn iter(&self, batch_size: usize) -> Box<dyn Iterator<Item = Vec<T>> + '_> where Self: Sized;
 }
 
 pub struct WriteAheadLog<T> where T: Sized{
@@ -163,7 +171,7 @@ impl<T> WriteAheadLog<T> where T: Sized {
     }
 }
 
-impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
+impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized + Clone {
     fn append(&self, entry: &T) -> Result<(), Error> {
         // Acquire read lock to allow concurrent appends and pops but block commits
         let _persist_guard = self.persist_lock.read();
@@ -204,7 +212,11 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
     fn commit(&self) -> Result<(), Error> {
         // Acquire write lock to prevent appends/pops during commit
         let _persist_guard = self.persist_lock.write();
-        self.pram.persist().map_err(Error::CommitError)
+        let error = self.pram.persist();
+        if let Err(persistent_random_access_memory::Error::FatalError(e)) = error{
+            return Err(Error::FatalError(Box::new(Error::CommitError(*e))));
+        }
+        error.map_err(Error::CommitError)// map other errors
     }
 
     fn peak(&self) -> Result<T, Error> {
@@ -212,7 +224,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
         let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
         if length == 0 {
-            return Err(Error::PeakFailed);
+            return Err(Error::PeekFailed);
         }
 
         // Read tail index
@@ -225,7 +237,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
         let length = self.length.load(std::sync::atomic::Ordering::SeqCst);
         if length == 0 {
-            return Err(Error::PeakFailed);
+            return Err(Error::PeekFailed);
         }
 
         let mut entries = Vec::new();
@@ -313,7 +325,7 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
         Ok(())
     }
 
-    fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> where Self: Sized {
+    fn iter(&self, batch_size: usize) -> Box<dyn Iterator<Item = Vec<T>> + '_> where Self: Sized {
         // Read head and tail indices from cache
         let head = self.head_cache.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -322,57 +334,88 @@ impl<T> WriteAheadLogTrait<T> for WriteAheadLog<T> where T: Sized {
 
         Box::new(WALIterator {
             wal: self.clone(),
-            current_index: Arc::new(AtomicI64::new(current)),
+            current_index: Arc::new(Mutex::new(current)),
+            batch_size,
         })
     }
 }
 
-struct WALIterator<T> where T: Sized {
+
+struct WALIterator<T> where T: Sized + Clone {
     wal: WriteAheadLog<T>,
-    current_index: Arc<AtomicI64>,
+    current_index: Arc<Mutex<i64>>,
+    batch_size: usize,
 }
 
-impl<T> Iterator for WALIterator<T> where T: Sized {
-    type Item = T;
+impl<T> Iterator for WALIterator<T> where T: Sized + Clone {
+    type Item = Vec<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current_not_wrapped = self.current_index.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-
-        // Wrap around if needed
-        let current = if current_not_wrapped < 0 {
-            self.wal.size as i64 + current_not_wrapped
-        }else {
-            current_not_wrapped
-        } as u64;
-
         // Need to aquire both locks, to ensure consistency (else head and tail may change during check)
-        let tail;
-        let head;
+        let head= self.wal.head_cache.load(std::sync::atomic::Ordering::Acquire);
+        let tail: u64 = self.wal.tail_cache.load(std::sync::atomic::Ordering::Acquire);
+
+        let current;
+        let mut batch_size;
         {
-            let _head_guard = self.wal.head.read();
-            let _tail_guard = self.wal.tail.read();
+            let mut ci = self.current_index.lock();
+            let current_not_wrapped = *ci;
 
-            tail = self.wal.tail_cache.load(std::sync::atomic::Ordering::SeqCst);
-            head = self.wal.head_cache.load(std::sync::atomic::Ordering::SeqCst);
-        } // release locks
+            // Wrap around if needed
+            current = if current_not_wrapped < 0 {
+                self.wal.size as i64 + current_not_wrapped
+            }else {
+                current_not_wrapped
+            } as u64;
 
+            let length = if head > tail {
+                // Normal case
+                if current < tail || current >= head {
+                    return None;
+                }
+                current - tail + 1
+            } else if head < tail {
+                // Wrapped case
+                if current < tail && current >= head {
+                    return None;
+                }
 
-        if head > tail {
-            // Normal case
-            if current < tail || current >= head {
+                if current >= tail {
+                    current - tail + 1
+                } else {
+                    current + (self.wal.size as u64 - tail) + 1
+                }
+            } else {
+                // head == tail: could be empty or full
+                let wal_length = self.wal.length.load(std::sync::atomic::Ordering::SeqCst);
+                if wal_length == 0 {
+                    return None; // truly empty
+                }
+                // Full case: all positions are valid
+                if current >= tail {
+                    current - tail + 1
+                } else {
+                    current + (self.wal.size as u64 - tail) + 1
+                }
+            };
+
+            batch_size = self.batch_size.min(length as usize);
+            batch_size = batch_size.min((current + 1) as usize); // cannot read past 0
+            
+            if batch_size == 0 {
                 return None;
             }
-        } else if head < tail {
-            // Wrapped case
-            if current < tail && current >= head {
-                return None;
-            }
-        } else {
-            // head == tail, empty
-            return None;
+
+            *ci -= batch_size as i64;
+            drop(ci); // release lock
         }
-
-        let entry = self.wal.data.at(current as usize).deref().ok()?;
+ 
+        // Calculate start position: start = current - (batch_size - 1)
+        // Safe because batch_size <= current + 1, so current >= batch_size - 1
+        let start_pos = current - (batch_size as u64 - 1);
+        
+        let mut entry = self.wal.data.at(start_pos as usize).deref_many(batch_size).ok()?;
+        entry.reverse(); // reverse to maintain LIFO order - can only read in ascending order
         Some(entry)
     }
 }
@@ -432,7 +475,7 @@ mod tests {
     #[test]
     fn test_peak_empty_error() {
         let wal = new_wal::<Medium>(3, "peak_empty_error");
-        assert!(matches!(wal.peak(), Err(Error::PeakFailed)));
+        assert!(matches!(wal.peak(), Err(Error::PeekFailed)));
     }
 
     #[test]
@@ -441,7 +484,7 @@ mod tests {
         wal.append(&Medium { a: 1, b: 2 }).unwrap();
         // Current implementation peaks at tail index which is initially 0 (likely default memory)
         let val = wal.peak();
-        assert!(val.is_ok() || matches!(val, Err(Error::PeakFailed)));
+        assert!(val.is_ok() || matches!(val, Err(Error::PeekFailed)));
     }
 
     #[test]
@@ -475,6 +518,7 @@ mod tests {
 
     #[test]
     fn test_wal_iterator() {
+        // Test 1: Basic iteration with wrap-around
         let wal = new_wal::<Small>(5, "test_wal_iterator");
         wal.append(&Small(1)).unwrap();
         wal.append(&Small(2)).unwrap();
@@ -486,9 +530,92 @@ mod tests {
 
         // Use the internal length to know how many items to take (avoids infinite iteration issues)
         let len = wal.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        assert_eq!(len, 3);
 
         // Reverse iteration should yield reversed order
-        let items_reverse: Vec<Small> = wal.iter().take(len).collect();
+        let items_reverse: Vec<Small> = wal.iter(2).flatten().take(len).collect();
         assert_eq!(items_reverse, vec![Small(5), Small(4), Small(3)]);
+
+        // Test 2: Empty WAL iteration should yield nothing
+        let wal2 = new_wal::<Small>(5, "test_wal_iterator_empty");
+        let items_empty: Vec<Small> = wal2.iter(1).flatten().collect();
+        assert_eq!(items_empty, vec![]);
+
+        // Test 3: Nearly full WAL iteration (size-1 to avoid head==tail ambiguity)
+        let wal3 = new_wal::<Small>(6, "test_wal_iterator_full");
+        for i in 1..=5 {
+            wal3.append(&Small(i)).unwrap();
+        }
+        let len3 = wal3.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        assert_eq!(len3, 5);
+        let items_full: Vec<Small> = wal3.iter(2).flatten().take(len3).collect();
+        assert_eq!(items_full, vec![Small(5), Small(4), Small(3), Small(2), Small(1)]);
+
+        // Test 4: Different batch sizes
+        let wal4 = new_wal::<Small>(10, "test_wal_iterator_batch");
+        for i in 1..=7 {
+            wal4.append(&Small(i)).unwrap();
+        }
+        let len4 = wal4.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        
+        // Batch size 1
+        let items_batch1: Vec<Small> = wal4.iter(1).flatten().take(len4).collect();
+        assert_eq!(items_batch1, vec![Small(7), Small(6), Small(5), Small(4), Small(3), Small(2), Small(1)]);
+        
+        // Batch size 3
+        let items_batch3: Vec<Small> = wal4.iter(3).flatten().take(len4).collect();
+        assert_eq!(items_batch3, vec![Small(7), Small(6), Small(5), Small(4), Small(3), Small(2), Small(1)]);
+        
+        // Batch size larger than content
+        let items_batch10: Vec<Small> = wal4.iter(10).flatten().take(len4).collect();
+        assert_eq!(items_batch10, vec![Small(7), Small(6), Small(5), Small(4), Small(3), Small(2), Small(1)]);
+
+        // Test 5: Wrap-around with multiple cycles
+        let wal5 = new_wal::<Small>(4, "test_wal_iterator_wraparound");
+        for i in 1..=4 {
+            wal5.append(&Small(i)).unwrap();
+        }
+        // Pop 2, append 2 more (causes wrap)
+        wal5.pop().unwrap();
+        wal5.pop().unwrap();
+        wal5.append(&Small(5)).unwrap();
+        wal5.append(&Small(6)).unwrap();
+        
+        let len5 = wal5.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        assert_eq!(len5, 4);
+        let items_wrap: Vec<Small> = wal5.iter(2).flatten().take(len5).collect();
+        assert_eq!(items_wrap, vec![Small(6), Small(5), Small(4), Small(3)]);
+
+        // Test 6: Single element
+        let wal6 = new_wal::<Small>(5, "test_wal_iterator_single");
+        wal6.append(&Small(42)).unwrap();
+        let len6 = wal6.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        assert_eq!(len6, 1);
+        let items_single: Vec<Small> = wal6.iter(1).flatten().take(len6).collect();
+        assert_eq!(items_single, vec![Small(42)]);
+
+        // Test 7: Multiple complete iterations over same WAL
+        let wal7 = new_wal::<Small>(5, "test_wal_iterator_multi");
+        for i in 1..=3 {
+            wal7.append(&Small(i)).unwrap();
+        }
+        let len7 = wal7.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        
+        let iter1: Vec<Small> = wal7.iter(2).flatten().take(len7).collect();
+        let iter2: Vec<Small> = wal7.iter(2).flatten().take(len7).collect();
+        assert_eq!(iter1, iter2);
+        assert_eq!(iter1, vec![Small(3), Small(2), Small(1)]);
+
+        // Test 8: Completely full WAL (head == tail but length > 0)
+        let wal8 = new_wal::<Small>(5, "test_wal_iterator_completely_full");
+        for i in 1..=5 {
+            wal8.append(&Small(i)).unwrap();
+        }
+        let len8 = wal8.length.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        assert_eq!(len8, 5);
+        let items_completely_full: Vec<Small> = wal8.iter(2).flatten().take(len8).collect();
+        assert_eq!(items_completely_full, vec![Small(5), Small(4), Small(3), Small(2), Small(1)]);
     }
+
+
 }
