@@ -7,6 +7,9 @@ service Database {
     
     // Retrieves a data entry from the database by key
     rpc Get(DataRequest) returns (DataResponse) {}
+
+    // Streams all keys in the database
+    rpc GetAll(Empty) returns (stream DataResponse) {}
 }
 
 message Data {
@@ -37,3 +40,5 @@ message Commit {
     // 0b0110 = rolled back
     int32 status = 2; 
 }
+
+message Empty {}
