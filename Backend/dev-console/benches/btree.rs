@@ -150,7 +150,7 @@ fn bench_btree_iter(c: &mut Criterion) {
 				let _keep = dir;
 				let mut acc = 0u64;
 				if let Ok(iter) = idx.iter() {
-					for (k, v) in iter { acc = acc.wrapping_add(k ^ v); }
+					for (k, v) in iter.flatten() { acc = acc.wrapping_add(k ^ v); }
 				}
 				black_box(acc);
 			},
