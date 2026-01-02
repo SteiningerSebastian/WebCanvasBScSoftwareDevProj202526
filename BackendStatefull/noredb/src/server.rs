@@ -1,5 +1,5 @@
 use noredb::database_server::{Database};
-use noredb::{Data, DataRequest, DataResponse, Commit, Empty};
+use noredb::{Data, DataRequest, DataResponse, Commit, StreamRequest};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc;
 
@@ -121,8 +121,11 @@ impl Database for MyDatabaseServer {
 
     async fn get_all(
         &self,
-        _request: tonic::Request<Empty>,
+        request: tonic::Request<StreamRequest>,
     ) -> Result<tonic::Response<Self::GetAllStream>, tonic::Status> {
+        let req = request.into_inner();
+        let id = req.index;
+
         // Return an empty stream for now; populate with real keys if CanvasDB provides an iterator.
         let (tx, rx) = mpsc::channel(4);
         
@@ -133,7 +136,7 @@ impl Database for MyDatabaseServer {
         tokio::spawn(async move {
             for pixel in iter {
                 let resp = DataResponse {
-                    index: 0, // index is not relevant here
+                    index: id, // index is not relevant here
                     key: pixel.key,
                     value: pixel.color.to_vec(), 
                 };
