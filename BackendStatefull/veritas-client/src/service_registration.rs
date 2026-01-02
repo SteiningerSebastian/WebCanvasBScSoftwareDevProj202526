@@ -284,13 +284,14 @@ mod tests {
     use std::pin::Pin;
     use std::future::Future;
     use tokio::sync::mpsc;
+    use veritas_messages::messages::UpdateNotification;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
     // Mock VeritasClient for testing
     struct MockVeritasClient {
         storage: Arc<TokioMutex<HashMap<String, String>>>,
-        watch_channels: Arc<TokioMutex<Vec<mpsc::UnboundedSender<veritas_client::UpdateNotification>>>>,
+        watch_channels: Arc<TokioMutex<Vec<mpsc::UnboundedSender<UpdateNotification>>>>,
     }
 
     impl MockVeritasClient {
@@ -303,10 +304,10 @@ mod tests {
 
         async fn _trigger_watch_update(&self, key: String, new_value: String) {
             let channels = self.watch_channels.lock().await;
-            let notification = veritas_client::UpdateNotification {
-                command: "update".to_string(),
+            let notification = UpdateNotification {
                 key,
                 new_value,
+                old_value: "".to_string(),
             };
             for sender in channels.iter() {
                 let _ = sender.send(notification.clone());
@@ -386,7 +387,7 @@ mod tests {
             })
         }
 
-        fn watch_variables<'a>(&'a self, _variables: Vec<String>) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<veritas_client::UpdateNotification>, veritas_client::VeritasError>> + Send + 'a>> {
+        fn watch_variables<'a>(&'a self, _variables: Vec<String>) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<UpdateNotification>, veritas_client::VeritasError>> + Send + 'a>> {
             Box::pin(async move {
                 let (tx, rx) = mpsc::unbounded_channel();
                 let mut channels = self.watch_channels.lock().await;
@@ -395,7 +396,7 @@ mod tests {
             })
         }
 
-        fn watch_variable<'a>(&'a self, _name: String) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<veritas_client::UpdateNotification>, veritas_client::VeritasError>> + Send + 'a>> {
+        fn watch_variable<'a>(&'a self, _name: String) -> Pin<Box<dyn Future<Output = Result<mpsc::UnboundedReceiver<UpdateNotification>, veritas_client::VeritasError>> + Send + 'a>> {
             Box::pin(async move {
                 let (tx, rx) = mpsc::unbounded_channel();
                 let mut channels = self.watch_channels.lock().await;

@@ -2814,11 +2814,13 @@ dependencies = [
  "lazy-regex",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "threadpool",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "veritas-messages",
 ]
 
 [[package]]
@@ -2834,7 +2836,15 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "url",
+ "veritas-messages",
  "wiremock",
+]
+
+[[package]]
+name = "veritas-messages"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

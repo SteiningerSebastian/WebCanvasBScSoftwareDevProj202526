@@ -4,12 +4,12 @@ use regex::Regex;
 use reqwest::Client;
 // NOTE: For scratch build without OpenSSL set in Cargo.toml:
 // reqwest = { version = "0.12", default-features = false, features = ["rustls-tls","json"] }
-use serde_json::Value;
 use tokio::{task::JoinSet, sync::{Semaphore}};
 use tracing::{debug, error, info, trace, warn};
 use std::{collections::HashMap, fmt::Display, sync::{Mutex, RwLock, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::Duration};
 use lazy_regex::{Lazy, lazy_regex};
 use actix_ws::{AggregatedMessage};
+use veritas_messages::messages::{WebsocketCommand, WebsocketResponse, UpdateNotification};
 
 const VERITAS_TIME_KEY: &str = "VERITAS::TIME";
 const CLUSTER_TIMEOUT_MS: u64 = 500;
@@ -27,7 +27,6 @@ pub enum Error {
     ParseIntError(std::num::ParseIntError),
     UnexpectedSettingValueError,
     WebSocketHandshakeError(actix_web::Error),
-    JSONParseError(serde_json::Error),
     SemaphoreAcquireError,
 }
 
@@ -61,7 +60,6 @@ impl Display for Error {
             Error::ParseIntError(e) => write!(f, "ParseIntError: Parse int error: {}", e),
             Error::UnexpectedSettingValueError => write!(f, "SettingValueError: Error setting value"),
             Error::WebSocketHandshakeError(e) => write!(f, "WebSocketHandshakeError: WebSocket handshake error: {}", e),
-            Error::JSONParseError(e) => write!(f, "JSONParseError: JSON parse error: {}", e),
             Error::SemaphoreAcquireError => write!(f, "SemaphoreAcquireError: Failed to acquire semaphore permit."),
         }
     }
@@ -96,12 +94,12 @@ static LAST_ID: AtomicUsize = AtomicUsize::new(0);
 
 // A listener gets the value of the new.
 struct Listener {
-    callback: Box<dyn Fn(usize, &str) + Send + Sync>,
+    callback: Box<dyn Fn(usize, &str, &str) + Send + Sync>,
     id: usize,
 } 
 
 impl Listener {
-    fn new(callback: Box<dyn Fn(usize, &str) + Send + Sync>) -> Self {
+    fn new(callback: Box<dyn Fn(usize, &str, &str) + Send + Sync>) -> Self {
         let id = LAST_ID.fetch_add(1, Ordering::SeqCst);
 
         Listener {
@@ -110,8 +108,8 @@ impl Listener {
         }
     }
 
-    fn call(&self, new_value: &str) {
-        (self.callback)(self.id, new_value);
+    fn call(&self, new_value: &str, old_value: &str) {
+        (self.callback)(self.id, new_value, old_value);
     }
 }
 
@@ -883,7 +881,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             .to_string();
 
         let sender_id = sender.parse::<usize>().unwrap_or(usize::MAX);
-        trace!("Notify by leader handler called from sender ID: {}", sender_id);
+        trace!("Notify by leader handler called from sender ID: {} message {}", sender_id, String::from_utf8(bytes.to_vec()).unwrap_or("".to_string()));
         if sender_id != data.leader_id.load(Ordering::SeqCst) {
             warn!("Received notify value changed from non-leader sender ID: {}. Current leader ID: {}", sender_id, data.leader_id.load(Ordering::SeqCst));
             return Err(Error::UnauthorizedSetError);
@@ -894,10 +892,25 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             .to_string();
 
         let value = String::from_utf8(bytes.to_vec()).unwrap_or("".to_string());
+        let split_n = value.find(";").unwrap_or(0);
+        let value_len = value[..split_n].parse::<usize>().unwrap_or(0);
+
+        // Extract the new value and old value based on the length prefix
+        let value_str =  if value_len > 0 {
+            &value[split_n+1..split_n+1+value_len]
+        } else {
+            ""
+        };
+
+        let old_value = if split_n + 1 + value_len > value.len() {
+           ""
+        } else {
+            &value[split_n+1+value_len..]
+        };
 
         trace!("Notify handler called with key: {} and value: {}", key, value);
 
-        Self::call_listeners(&key, &value, data.clone());
+        Self::call_listeners(&key, &value_str, &old_value, data.clone());
 
         Ok(())
     }
@@ -956,6 +969,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// Parameters:
     /// - key: The key to set in the key-value store
     /// - value: The value to set in the key-value store
+    /// - old_value: The old value before the change
     /// - data: Shared application state
     /// 
     /// Returns:
@@ -965,7 +979,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// ```ignore
     /// let success = controller.broadcast_notify_to_followers("my_key", "my_value", data).await?;
     /// ```
-    async fn broadcast_notify_to_followers(key: &str, value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
+    async fn broadcast_notify_to_followers(key: &str, value: &str, old_value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
         trace!("Broadcasting notify for key: {} with value: {} to followers.", key, value);
 
         let join_set = Self::broadcast_and_collect_responses(
@@ -975,7 +989,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             &data.dns_lookup, 
             Duration::from_millis(CLUSTER_TIMEOUT_MS),
             reqwest::Method::PUT,
-            Some(value.to_string())
+            Some(format!("{};{}{}", value.len(), value, old_value))
         ).await;
 
         // No need to wait for the responses - best effort
@@ -1005,13 +1019,23 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         let sync_permit_future;
         let value;
-
+        let mut old_value;
         // This code segment is single-threaded and synchronously blocks the entire web server thread. 
         // Keep it to the absolute minimum execution time.
         {
             let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
             trace!("Beginning transaction for set operation on key: {}", key);
-            
+
+            // Get the current value
+            old_value = transaction.get(key).unwrap_or("".to_string());
+
+            // split of the time prefix
+            old_value = if let Some((_, v)) = old_value.split_once(";") {
+                            v.to_string()
+                        } else {
+                            old_value
+                        };
+                        
             // Prepend the current time to the value for versioning
             value = format!("{};{}", data.time.fetch_add(1, Ordering::SeqCst), time_value);
 
@@ -1055,10 +1079,10 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         // Before the transaction ends, notify the listeners of the change
         // The websocket does gurantee total order of messages so lineraliziability is preserved
-        Self::call_listeners(key, &value, data.clone());
+        Self::call_listeners(key, &value, &old_value, data.clone());
 
         // Broadcast notify to all flollowers
-        let _ = Self::broadcast_notify_to_followers(key, &time_value, data.clone()).await;
+        let _ = Self::broadcast_notify_to_followers(key, &time_value, &old_value, data.clone()).await;
 
         Ok(true)
     }
@@ -1106,6 +1130,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         let sync_permit_future;
         let commit_value: String;
+        let old_value: String;
         let new_value: String;
         {
             // From here on out we are single threaded - the whole webserver waits for this to complete.
@@ -1121,7 +1146,9 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 v.to_string()
             } else {
                 current_value
-            };
+            };            
+            
+            old_value = current_value.clone();
 
             // Append the new value to the current value
             new_value = if current_value.is_empty() {
@@ -1168,10 +1195,10 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         }
 
         // Before the transaction ends, notify the listeners of the change
-        Self::call_listeners(key, &commit_value, data.clone());
+        Self::call_listeners(key, &commit_value, &old_value, data.clone());
 
         // Broadcast notify to all flollowers
-        let _ = Self::broadcast_notify_to_followers(key, &new_value, data.clone()).await;
+        let _ = Self::broadcast_notify_to_followers(key, &new_value, &old_value, data.clone()).await;
 
         Ok(true)
     }
@@ -1221,6 +1248,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
 
         let sync_permit_future;
         let value: String;
+        let previous_value: String;
         let mut new_value: String = new_value.to_string();
         {
             // From here on out we are single threaded - the whole webserver waits for this to complete.
@@ -1237,6 +1265,8 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
             } else {
                 current_value
             };
+
+            previous_value = current_value.clone();
 
             // Replace the given old_value with new_value in the current value
             new_value = current_value.replace(old_value, &new_value);
@@ -1279,10 +1309,10 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         }
 
         // Before the transaction ends, notify the listeners of the change
-        Self::call_listeners(key, &value, data.clone());
+        Self::call_listeners(key, &value, &previous_value, data.clone());
 
         // Broadcast notify to all flollowers
-        let _ = Self::broadcast_notify_to_followers(key, &new_value, data.clone()).await;
+        let _ = Self::broadcast_notify_to_followers(key, &new_value, &&previous_value,data.clone()).await;
 
         Ok(true)
     }
@@ -1337,10 +1367,15 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     async fn compare_and_set_for_leader(key: &str, expected_value: &str, new_value: &str, data: web::Data<AppState<F>>) -> Result<bool, Error> {
         debug!("Compare-and-set handler called with key: {}, expected_value: {}, new_value: {}", key, expected_value, new_value);
 
+        // Ensure we have the latest value before comparing and setting
+        let current_value = Self::get_for_leader(key, data.clone()).await?;
+        Self::set_if_newer(key, &current_value, &data.kv_store)?;
+
         // We have to do a read-modify-write cycle here - the transaction ensures atomicity
 
         let sync_permit_future;
         let value: String;
+        let old_value: String;
         {
             // From here on out we are single threaded - the whole webserver waits for this to complete.
             let mut transaction = data.kv_store.begin_transaction().map_err(Error::TransactionBeginError)?;
@@ -1357,9 +1392,11 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                 current_value
             };
 
+            old_value = current_value.clone();
+
             // Check if the current value matches the expected value
             if current_value != expected_value {
-                warn!("Current value: {} does not match expected value: {} for key: {}", current_value, expected_value, key);
+                trace!("Current value: {} does not match expected value: {} for key: {}", current_value, expected_value, key);
                 return Ok(false); // Do not update if the current value does not match the expected value
                 // Transaction ends with the life of transaction variable
             }
@@ -1400,10 +1437,10 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         }
 
         // Before the transaction ends, notify the listeners of the change
-        Self::call_listeners(key, &value, data.clone());
+        Self::call_listeners(key, &value, &old_value, data.clone());
 
         // Broadcast notify to all flollowers
-        let _ = Self::broadcast_notify_to_followers(key, &new_value, data.clone()).await;
+        let _ = Self::broadcast_notify_to_followers(key, &new_value, &old_value, data.clone()).await;
 
         Ok(true)
     }
@@ -1531,10 +1568,10 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
         }
 
         // Before the transaction ends, notify the listeners of the change
-        Self::call_listeners(key, &value, data.clone());
+        Self::call_listeners(key, &value, &old_value.to_string(), data.clone());
 
         // Broadcast notify to all flollowers
-        let _ = Self::broadcast_notify_to_followers(key, &new_value.to_string(), data.clone()).await;
+        let _ = Self::broadcast_notify_to_followers(key, &new_value.to_string(), &old_value.to_string(), data.clone()).await;
 
         Ok(old_value.to_string())
     }
@@ -1867,14 +1904,14 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
     /// - key: The key whose listeners should be called
     /// - new_value: The new value to pass to the listeners
     /// - data: Shared application state    
-    fn call_listeners(key: &str, new_value: &str, data: web::Data<AppState<F>>) {
+    fn call_listeners(key: &str, new_value: &str, old_value: &str, data: web::Data<AppState<F>>) {
         let listeners = data.listeneres.lock().unwrap();
 
         if listeners.contains_key(key) {
             let at = listeners.get(key);
             if let Some(at) = at {
                 for listener in at {
-                    listener.call(new_value);
+                    listener.call(new_value, old_value);
                 }
             }
         }
@@ -1898,58 +1935,51 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                     Ok(AggregatedMessage::Text(text)) => {
                         let text = text.trim();
                         
-                        // Expecting a Json in the following format:
-                        /*
-                        {
-                            "command": "get",
-                            "parameters": ["key"]
-                        }
+                        // Parse the incoming message as JSON
+                        let command: Result<WebsocketCommand, _> = serde_json::from_str(text);
 
-                        {
-                            "command": "set",
-                            "parameters": ["key", "value"]
-                        }
+                        debug!("WebSocket message received: {}", text);
                         
-                        */
-                        let parsed: Result<Value, Error> = serde_json::from_str(text).map_err(Error::JSONParseError);
-                        
-                        if let Err(e) = parsed {
-                            warn!("Failed to parse JSON from websocket message: {}", e);
+                        if let Err(e) = command {
+                            warn!("Failed to parse JSON from websocket message: {} {}", e, text);
                             session.text("Error: Invalid JSON format").await.unwrap();
                             continue;
                         }
+                        let command = command.unwrap();
 
-                        let parsed = parsed.unwrap();
-                        let command = parsed["command"].as_str().unwrap_or("");
-                        let parameters: Vec<String> = parsed["parameters"].as_array().unwrap_or(&vec![])
-                            .iter()
-                            .map(|v| v.as_str()
-                            .unwrap_or("")
-                            .to_string())
-                            .collect();
+                        if command.command == "WatchCommand" {
+                            trace!("Processing WatchCommand from WebSocket.");
 
-                        if command == "watch"{
-                            let key = parameters.get(0);
-                            if key.is_none() {
-                                session.text("Error: Missing key parameter for watch command").await.unwrap();
-                                continue;   
+                            let watch_command = command.to_watch_command();
+                            if let Err(e) = watch_command {
+                                warn!("Invalid watch command received: {:?}", e);
+                                session.text(format!("Error: Invalid watch command format. {:?}", e)).await.unwrap();
+                                continue;
                             }
+                            let watch_command = watch_command.unwrap();
 
-                            let key  = key.unwrap();
-                            let key_for_listener = key.to_string();
-                            debug!("WebSocket watch command received for key: {}", key);
+                            let key_for_listener = watch_command.key.clone();
+                            debug!("WebSocket watch command received for key: {}", watch_command.key);
 
                             let session_for_listener = session.clone();
                             let data_for_listener = data.clone();
 
-                            let listener = Listener::new(Box::new(move |id: usize, new_value: &str| {
+                            let listener = Listener::new(Box::new(move |id: usize, new_value: &str, old_value: &str| {
                                 let key = key_for_listener.clone();
                                 let new_value = new_value.to_string();
+                                let old_value = old_value.to_string();
 
                                 let mut session = session_for_listener.clone();
                                 let data = data_for_listener.clone();
                                 rt::spawn(async move {
-                                    let msg = format!("{{\"command\":\"update\",\"key\":\"{}\",\"new_value\":\"{}\"}}", key, new_value);
+                                    let update_notification = UpdateNotification {
+                                        key: key.clone(),
+                                        new_value: new_value.clone(),
+                                        old_value: old_value.clone(),
+                                    };
+                                    let response = WebsocketResponse::from_update_notification(&update_notification);
+
+                                    let msg = serde_json::to_string(&response).unwrap_or("Error: Failed to serialize update notification.".to_string());
                                     let res = session.text(msg).await;
 
                                     if let Err(_) = res {
@@ -1960,7 +1990,7 @@ impl<F> VeritasController<F> where F: ConcurrentKeyValueStore + Clone + Send + S
                             }));
 
 
-                            Self::add_listener(key.clone(), listener, data.clone());
+                            Self::add_listener(watch_command.key.clone(), listener, data.clone());
                         }   
                     }
 

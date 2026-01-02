@@ -3,4 +3,5 @@ go 1.25.5
 use (
 	./general
 	./partitioning-controller
+	./veritas-client
 )

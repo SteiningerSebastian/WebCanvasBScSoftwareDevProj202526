@@ -5,6 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Launch Partitioning Controller",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/BackendStateless/partitioning-controller",
+            "cwd": "${workspaceFolder}/BackendStateless/partitioning-controller"
+        },
+        {
             "name": "Launch",
             "type": "lldb",
             "request": "launch",

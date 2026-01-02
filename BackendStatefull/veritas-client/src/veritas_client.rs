@@ -4,7 +4,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, Error as ReqwestError, Method};
-use serde::{Deserialize, Serialize};
+use veritas_messages::messages::{UpdateNotification, WatchCommand, WebsocketCommand, WebsocketResponse};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc};
@@ -12,19 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async};
 use url::Url;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchCommand {
-    pub command: String,
-    pub parameters: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateNotification {
-    pub command: String,
-    pub key: String,
-    pub new_value: String,
-}
 
 #[derive(Debug)]
 pub enum VeritasError {
@@ -399,9 +386,11 @@ impl VeritasClientTrait for VeritasClient {
             };
             let (mut write, read) = stream.split();
             let (tx, rx) = mpsc::unbounded_channel();
-                for var in &variables {
-                let watch_cmd = WatchCommand { command: "watch".into(), parameters: vec![var.clone()] };
-                if let Ok(msg) = serde_json::to_string(&watch_cmd) {
+            for var in &variables {
+                let watch_cmd = WatchCommand { key: var.clone() };
+                let cmd = WebsocketCommand::from_watch_command(&watch_cmd);
+                if let Ok(msg) = serde_json::to_string(&cmd) {
+                    println!("Sending watch command: {}", msg);
                     write.send(Message::Text(msg.into())).await.map_err(|e| VeritasError::WebSocketError(e.to_string()))?;
                 }
             }
@@ -414,9 +403,17 @@ impl VeritasClientTrait for VeritasClient {
                     while let Some(msg) = current_read.next().await {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                if let Ok(notification) = serde_json::from_str::<UpdateNotification>(&text) {
-                                    if notification.command == "update" {
-                                        if tx.send(notification).is_err() { return; }
+                                if let Ok(rsp) = serde_json::from_str::<WebsocketResponse>(&text) {
+                                    if rsp.command != "UpdateNotification" { continue; } // ignore other commands
+
+                                    let notification = rsp.to_update_notification();
+
+                                    if let Ok(notification) = notification {
+                                        if tx.send(notification).is_err() {
+                                            return; // receiver dropped
+                                        }
+                                    }else {
+                                        continue; // parse error, ignore
                                     }
                                 }
                             }
@@ -448,8 +445,9 @@ impl VeritasClientTrait for VeritasClient {
                     let stream = match success { Some(s) => s, None => return };
                     let (mut new_write, new_read) = stream.split();
                     for var in &vars_clone {
-                        let watch_cmd = WatchCommand { command: "watch".into(), parameters: vec![var.clone()] };
-                        if let Ok(msg) = serde_json::to_string(&watch_cmd) {
+                        let watch_cmd = WatchCommand { key: var.clone() };
+                        let cmd = WebsocketCommand::from_watch_command(&watch_cmd);
+                        if let Ok(msg) = serde_json::to_string(&cmd) {
                             if new_write.send(Message::Text(msg.into())).await.is_err() { return; }
                         }
                     }
@@ -871,7 +869,7 @@ mod integration_tests {
         let mut rx = client.watch_variable(test_key.clone()).await.unwrap();
         
         // Give websocket time to connect
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         
         // Set a value (should trigger notification)
         client.set_variable(&test_key, "watched_value").await.unwrap();

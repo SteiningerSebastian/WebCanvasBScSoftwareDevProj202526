@@ -9,14 +9,3 @@ pub mod keyed_lock;
 
 #[cfg(test)]
 mod persistent_random_access_memory_tests;
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[test]
-//     fn it_works() {
-//         let result = add(2, 2);
-//         assert_eq!(result, 4);
-//     }
-// }
