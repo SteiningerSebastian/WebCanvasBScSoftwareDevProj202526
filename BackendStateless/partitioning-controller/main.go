@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	pixelhasher "general"
+	pixelhasher "general/pixel_hasher"
 	"time"
 	veritasclient "veritas-client"
 )
@@ -18,7 +18,7 @@ func main() {
 	fmt.Println("Hello, Partitioning Controller!")
 
 	// Try the veritas client
-	client, err := veritasclient.NewVeritasClient([]string{"localhost:8080"}, 500*time.Second)
+	client, err := veritasclient.NewVeritasClient([]string{"localhost:8080"}, 200*time.Millisecond, 3, 2, 5*time.Second)
 	if err != nil {
 		fmt.Printf("Error creating Veritas client: %v\n", err)
 		return
@@ -35,7 +35,11 @@ func main() {
 	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Second)
 	defer cancel()
 	// Watch a variable
-	updateChan, errorChan := client.WatchVariables(ctx, []string{"service-noredb"})
+	updateChan, errorChan, err := client.WatchVariables(ctx, []string{"service-noredb"})
+	if err != nil {
+		fmt.Printf("Error watching variables: %v\n", err)
+		return
+	}
 
 	go func() {
 		for {

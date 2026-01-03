@@ -27,7 +27,8 @@ message DataRequest {
 message DataResponse {
     uint32 index = 1; // The index of the transaction
     uint32 key = 2;  // The key for the data entry
-    bytes value = 3; // The value of the data entry
+    bytes timestamp = 3; // The timestamp of the data entry
+    bytes value = 4; // The value of the data entry
 }
 
 message Commit {

@@ -204,7 +204,7 @@ fn test_iterate_pixels_returns_persisted_entries() {
     let mut iterated: Vec<(u32, [u8; 3])> = canvas_db
         .iterate_pixels()
         .expect("iterate_pixels should succeed")
-        .map(|pixel| (pixel.key, pixel.color))
+        .map(|pixel| (pixel.0.key, pixel.0.color))
         .collect();
 
     iterated.sort_by_key(|(key, _)| *key);

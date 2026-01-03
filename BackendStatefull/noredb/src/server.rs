@@ -106,6 +106,7 @@ impl Database for MyDatabaseServer {
             let resp = DataResponse {
                 index: req.index,
                 key: req.key,
+                timestamp: pixel_entry.1.bytes.to_vec(),
                 value, // return actual value if found
             };
             return Ok(tonic::Response::new(resp));
@@ -114,6 +115,7 @@ impl Database for MyDatabaseServer {
         let resp = DataResponse {
             index: req.index,
             key: req.key,
+            timestamp: Vec::new(),
             value: Vec::new(), // return actual value if found
         };
         Ok(tonic::Response::new(resp))
@@ -137,8 +139,9 @@ impl Database for MyDatabaseServer {
             for pixel in iter {
                 let resp = DataResponse {
                     index: id, // index is not relevant here
-                    key: pixel.key,
-                    value: pixel.color.to_vec(), 
+                    key: pixel.0.key,
+                    timestamp: pixel.1.bytes.to_vec(),
+                    value: pixel.0.color.to_vec(), 
                 };
                 if let Err(_) = tx.send(Ok(resp)).await {
                     // Receiver dropped

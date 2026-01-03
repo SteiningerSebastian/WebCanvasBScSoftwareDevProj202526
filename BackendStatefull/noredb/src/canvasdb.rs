@@ -97,8 +97,8 @@ pub trait CanvasDBTrait {
     /// Because the write-ahead log is not temporally ordered, merging the two sources during iteration would be memory and computationally intensive and slow.
     /// 
     /// Returns:
-    /// - `Box<dyn Iterator<Item = Pixel>>`: An iterator that yields Pixel entries.
-    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = Pixel> + Send + 'static>, Error>;
+    /// - `Box<dyn Iterator<Item = (Pixel, TimeStamp)>>`: An iterator that yields Pixel entries along with their timestamps.
+    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = (Pixel, TimeStamp)> + Send + 'static>, Error>;
 }
 
 pub struct CanvasDB {
@@ -650,7 +650,7 @@ impl CanvasDBTrait for CanvasDB {
         None
     }
     
-    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = Pixel> + Send + 'static>, Error> {
+    fn iterate_pixels(&self) -> Result<Box<dyn Iterator<Item = (Pixel, TimeStamp)> + Send + 'static>, Error> {
         // Iterate over all pixels in the B-tree index and data store
         let btree_iter = self.btree_index.iter().map_err(|e| Error::BTreeIndexError { inner: e })?;
         let data_store_clone = self.data_store.clone();
@@ -658,7 +658,7 @@ impl CanvasDBTrait for CanvasDB {
         let iter = btree_iter.flatten().filter_map(move |(_key, address)| {
             let pointer:Pointer<PixelEntry> = Pointer::from_address(address, data_store_clone.clone());
             match pointer.deref() {
-                Ok(entry) => Some(entry.pixel),
+                Ok(entry) => Some((entry.pixel, entry.timestamp)),
                 Err(e) => {
                     error!("Failed to deref pixel pointer during iteration: {}", e);
                     None
