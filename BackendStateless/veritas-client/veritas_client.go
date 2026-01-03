@@ -54,7 +54,7 @@ type VeritasClientInterface interface {
 	// If a disconnection occurse, it can't automatically reconnect as updates between disconnection and reconnection are lost and
 	// the linearizability guarantee would be violated.
 	// The returned channels are closed when the context is cancelled.
-	WatchVariables(ctx context.Context, names []string) (<-chan UpdateNotification, <-chan error)
+	WatchVariables(ctx context.Context, names []string) (<-chan UpdateNotification, <-chan error, error)
 
 	// Watch for changes to a variable by name with automatic reconnection. The callback is called lineralizably whenever the variable changes.
 	// If a disconnection occurse, it will automatically try to reconnect.
@@ -541,7 +541,7 @@ func (vc *VeritasClient) WatchVariables(ctx context.Context, names []string) (<-
 	return valueChan, errorChan, nil
 }
 
-func (vc *VeritasClient) WatchVariableAutoReconnect(ctx context.Context, names []string) (<-chan UpdateNotification, <-chan error) {
+func (vc *VeritasClient) WatchVariablesAutoReconnect(ctx context.Context, names []string) (<-chan UpdateNotification, <-chan error) {
 	valueChan := make(chan UpdateNotification)
 	errorChan := make(chan error)
 

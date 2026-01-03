@@ -35,7 +35,7 @@ func main() {
 	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Second)
 	defer cancel()
 	// Watch a variable
-	updateChan, errorChan, err := client.WatchVariables(ctx, []string{"service-noredb"})
+	updateChan, errorChan, err := client.WatchVariables(ctx, []string{"service-partitioning-controller-001"})
 	if err != nil {
 		fmt.Printf("Error watching variables: %v\n", err)
 		return
@@ -62,6 +62,28 @@ func main() {
 		}
 	}()
 
+	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Second)
+	defer cancel()
+	// Load service registrations
+	handler, err := veritasclient.NewServiceRegistrationHandler(ctx, client, "service-noredb")
+	if err != nil {
+		fmt.Printf("Error creating service registration handler: %v\n", err)
+		return
+	}
+
+	handler.AddListener(func(sr veritasclient.ServiceRegistration) {
+		fmt.Printf("New Service Registration update: %s\n", sr.ID)
+		fmt.Printf("Endpoints:\n")
+		for _, ep := range sr.Endpoints {
+			fmt.Printf(" - ID: %s, Address: %s, Port: %d, Timestamp: %s\n", ep.ID, ep.Address, ep.Port, ep.Timestamp.String())
+		}
+		fmt.Printf("Meta:\n")
+		for k, v := range sr.Meta {
+			fmt.Printf(" - %s: %s\n", k, v)
+		}
+	})
+
 	// Keep the main function alive for a while to receive updates
 	time.Sleep(60 * time.Second)
+
 }
