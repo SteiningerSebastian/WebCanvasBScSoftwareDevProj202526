@@ -1,0 +1,45 @@
+syntax = "proto3";
+package partitioningcontroller;
+
+option go_package = "github.com/SteiningerSebastian/webcanvas/grpc-general;partitioningcontroller";
+
+service Database {
+    // Sets a data entry in the database
+    rpc Set(Data) returns (Commit) {}
+    
+    // Retrieves a data entry from the database by key
+    rpc Get(DataRequest) returns (DataResponse) {}
+
+    // Streams all keys in the database
+    rpc GetAll(StreamRequest) returns (stream DataResponse) {}
+}
+
+message Data {
+    uint32 key = 1;  // The key for the data entry
+    bytes value = 2; // The value of the data entry
+}
+
+message DataRequest {
+    uint32 key = 1;  // The key for the data entry
+}
+
+message DataResponse {
+    uint32 key = 1;  // The key for the data entry
+    bytes value = 2; // The value of the data entry
+
+    // 0 = success, 1 = not found, 2 = error
+    int32 status = 3; // Status of the retrieval
+}
+
+message Commit {
+    uint32 index = 1; // The index of the transaction
+    // 0b0000 = pending,
+    // 0b0001 = success,
+    // 0b0010 = failure, 
+    // 0b0011 = unknown,
+    // 0b0100 = aborted,
+    // 0b0110 = rolled back
+    int32 status = 2; 
+}
+
+message StreamRequest {}
