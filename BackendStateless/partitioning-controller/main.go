@@ -3,87 +3,148 @@ package main
 import (
 	"context"
 	"fmt"
-	pixelhasher "general/pixel_hasher"
+	"log/slog"
+	"os"
+	"strings"
 	"time"
 	veritasclient "veritas-client"
 )
 
-func main() {
-	hashA := pixelhasher.PixelToKey(123, 456)
-	hashB := pixelhasher.PixelToKey(124, 456)
-	hashC := pixelhasher.PixelToKey(123, 457)
-	fmt.Printf("Pixel hash A: %d\n", hashA)
-	fmt.Printf("Pixel hash B: %d\n", hashB)
-	fmt.Printf("Pixel hash C: %d\n", hashC)
-	fmt.Println("Hello, Partitioning Controller!")
+const VERITAS_PORT = 80
+const VERITAS_TIMEOUT = 5 * time.Second
+const VERITAS_FAILURE_THRESH int32 = 3
+const VERITAS_SUCCESS_THRESH int32 = 2
+const VERITAS_OPENTIME time.Duration = 10 * time.Second
+const SERVICE_REGISTRATION_KEY = "service-partitioning-controller"
+const SERVICE_REGISTRATION_INTERVAL = 10 * time.Second
+const SERVICE_REGISTRATION_TIMEOUT = 30 * time.Second
 
-	// Try the veritas client
-	client, err := veritasclient.NewVeritasClient([]string{"localhost:8080"}, 200*time.Millisecond, 3, 2, 5*time.Second)
-	if err != nil {
-		fmt.Printf("Error creating Veritas client: %v\n", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
-	defer cancel()
-	value, err := client.GetVariable(ctx, "service-noredb")
-	if err != nil {
-		fmt.Printf("Error getting variable: %v\n", err)
-		return
-	}
-	fmt.Printf("Value of variable 'service-noredb': %s\n", value)
+// handleServiceRegistration manages the registration and periodic endpoint updates for the service.
+func handleServiceRegistration(ctx context.Context, handler *veritasclient.ServiceRegistrationHandler) (chan<- error, error) {
+	errorChan := make(chan error)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Second)
-	defer cancel()
-	// Watch a variable
-	updateChan, errorChan, err := client.WatchVariables(ctx, []string{"service-partitioning-controller-001"})
+	// Get hostname
+	hostname, err := os.Hostname()
 	if err != nil {
-		fmt.Printf("Error watching variables: %v\n", err)
-		return
+		slog.Error(fmt.Sprintf("Unable to register service, error getting hostname: %v\n", err))
+		return nil, err
 	}
 
+	// Create service description
+	serviceDescription := veritasclient.ServiceRegistration{
+		ID:        SERVICE_REGISTRATION_KEY,
+		Endpoints: make([]veritasclient.ServiceEndpoint, 0),
+		Meta:      map[string]string{"version": "1.0.0"},
+	}
+
+	// Register the service if not already registered
+	handler.RegisterOrUpdateService(ctx, &serviceDescription, nil)
+
+	// Start updating service endpoints
 	go func() {
 		for {
 			select {
-			case update, ok := <-updateChan:
-				if !ok {
-					fmt.Println("Update channel closed.")
-					cancel()
-					return
+			case <-ctx.Done():
+				slog.Info("Service registration handler context done, exiting endpoint update loop.")
+				return
+			default:
+				time.Sleep(SERVICE_REGISTRATION_INTERVAL)
+				// Update service endpoints
+				endpoint := veritasclient.ServiceEndpoint{
+					ID:        hostname,
+					Address:   hostname,
+					Port:      50051,
+					Timestamp: time.Now(),
 				}
-				fmt.Printf("Received update: key=%s, value=%s\n", update.Key, update.NewValue)
-			case err, ok := <-errorChan:
-				if !ok {
-					fmt.Println("Error channel closed.")
-					cancel()
-					return
+				err := handler.RegisterOrUpdateEndpoint(ctx, &endpoint)
+
+				if err != nil {
+					slog.Error(fmt.Sprintf("Error updating service endpoint: %v\n", err))
+					errorChan <- err
 				}
-				fmt.Printf("Error while watching: %v\n", err)
+
+				slog.Debug(fmt.Sprintf("Service endpoint updated successfully: %s\n", endpoint.String()))
 			}
 		}
 	}()
 
-	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Second)
-	defer cancel()
-	// Load service registrations
-	handler, err := veritasclient.NewServiceRegistrationHandler(ctx, client, "service-noredb")
+	return errorChan, nil
+}
+
+func main() {
+	// From the environment load the log level and the veritas nodes
+	logLevelstr := os.Getenv("LOG_LEVEL")
+	if logLevelstr == "" {
+		logLevelstr = "INFO" // Default log level
+	}
+
+	// Set up logging
+	var logLevel slog.Level
+	switch strings.ToUpper(logLevelstr) {
+	case "DEBUG":
+		logLevel = slog.LevelDebug
+	case "INFO":
+		logLevel = slog.LevelInfo
+	case "WARN":
+		logLevel = slog.LevelWarn
+	case "ERROR":
+		logLevel = slog.LevelError
+	default:
+		logLevel = slog.LevelInfo
+	}
+
+	// Initialize the logger
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
+	slog.SetDefault(logger)
+
+	slog.Info(fmt.Sprintf("Log level set to: %s\n", logLevel))
+
+	// Load Veritas nodes from environment variable
+	veritasNodesEnv := os.Getenv("VERITAS_NODES")
+	if veritasNodesEnv == "" {
+		slog.Error("No Veritas nodes specified.")
+		return
+	} else {
+		slog.Info(fmt.Sprintf("Veritas nodes: %s\n", veritasNodesEnv))
+	}
+
+	// Initialize Veritas client
+	veritasNodes := strings.Split(veritasNodesEnv, ",")
+	endpoints := make([]string, len(veritasNodes))
+	for _, node := range veritasNodes {
+		strings.TrimSpace(node)
+		if node != "" {
+			slog.Info(fmt.Sprintf("Adding Veritas node endpoint: %s\n", node))
+		}
+
+		endpoints = append(endpoints, fmt.Sprintf("%s:%d", node, VERITAS_PORT))
+	}
+
+	slog.Info(fmt.Sprintf("Final Veritas endpoints: %v\n", endpoints))
+	veritasClient, err := veritasclient.NewVeritasClient(endpoints, VERITAS_TIMEOUT, VERITAS_FAILURE_THRESH, VERITAS_SUCCESS_THRESH, VERITAS_OPENTIME)
+
 	if err != nil {
-		fmt.Printf("Error creating service registration handler: %v\n", err)
+		slog.Error(fmt.Sprintf("Error initializing Veritas client: %v\n", err))
 		return
 	}
 
-	handler.AddListener(func(sr veritasclient.ServiceRegistration) {
-		fmt.Printf("New Service Registration update: %s\n", sr.ID)
-		fmt.Printf("Endpoints:\n")
-		for _, ep := range sr.Endpoints {
-			fmt.Printf(" - ID: %s, Address: %s, Port: %d, Timestamp: %s\n", ep.ID, ep.Address, ep.Port, ep.Timestamp.String())
-		}
-		fmt.Printf("Meta:\n")
-		for k, v := range sr.Meta {
-			fmt.Printf(" - %s: %s\n", k, v)
-		}
-	})
+	// Initialize the service registration handler
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Keep the main function alive for a while to receive updates
-	time.Sleep(60 * time.Second)
+	serviceHandler, err := veritasclient.NewServiceRegistrationHandler(ctx, veritasClient, SERVICE_REGISTRATION_KEY)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error initializing service registration handler: %v\n", err))
+		return
+	}
 
+	// Start handling service registration and endpoints
+	go handleServiceRegistration(ctx, serviceHandler)
+
+	// TODO: Handle the partitioning logic, service discovery of noredb nodes, etc.
+
+	// Block forever
+	select {}
 }

@@ -27,6 +27,10 @@ type ServiceEndpoint struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+func (se *ServiceEndpoint) String() string {
+	return fmt.Sprintf("%s:%d", se.Address, se.Port)
+}
+
 // Equals checks if two ServiceEndpoints are equal (by address and port)
 func (se *ServiceEndpoint) Equals(other *ServiceEndpoint) bool {
 	return se.Address == other.Address && se.Port == other.Port
