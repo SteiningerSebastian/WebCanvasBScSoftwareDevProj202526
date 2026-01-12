@@ -15,6 +15,14 @@ func PixelToKey(x uint16, y uint16) uint32 {
 	return key
 }
 
+// KeyToPixel converts a uint32 key back into pixel coordinates (x, y).
+func KeyToPixel(key uint32) (uint16, uint16) {
+	// Inverse permutation to retrieve original key
+	key = inversePermute32Bitwise(key)
+
+	return uint16(key >> 16), uint16(key & 0xFFFF)
+}
+
 // Bijective permutation of uint32_t values.
 // This function is a composition of invertible (bijective) operations
 // over Z / 2^32 Z, therefore the whole function is bijective.
@@ -69,6 +77,71 @@ func permute32Bitwise(x uint32) uint32 {
 	// Step 5: Final XOR-shift to fold high bits into low bits again
 	//
 	// This ensures high-order input bits influence all output bits.
+	//
+	// Inverse: x ^= x >> 16;
+	x ^= x >> 16
+
+	// Since each step above is bijective, and a composition of
+	// bijections is itself a bijection, this function is a
+	// permutation of all 2^32 uint32_t values.
+	return x
+}
+
+// Bijective permutation of uint32_t values.
+// This function is a composition of invertible (bijective) operations
+// over Z / 2^32 Z, therefore the whole function is bijective.
+//
+// Purpose:
+//  - Strongly scramble bit patterns
+//  - Destroy locality (near inputs -> far outputs)
+//  - Suitable for partitioning / sharding
+//
+// NOTE:
+//  - This is NOT a cryptographic hash
+//  - Every step has a well-defined inverse
+//
+// Author: Implementation and comments by ChatGPT-5
+func inversePermute32Bitwise(x uint32) uint32 {
+	// Step 5: Final XOR-shift to fold high bits into low bits again
+	//
+	// This ensures high-order input bits influence all output bits.
+	//
+	// Inverse: x ^= x >> 16;
+	x ^= x >> 16
+
+	// Step 4: Second odd multiplication for additional diffusion
+	//
+	// Same reasoning as Step 2.
+	//
+	// Inverse: x *= 0xf6e5c5df;
+	x *= 0x43021123
+
+	// Step 3: XOR-shift to further mix bits
+	//
+	// Again, higher bits influence lower bits.
+	// This is a linear, triangular transform over GF(2),
+	// and is therefore invertible.
+	//
+	// Inverse: x ^= x >> 15; x ^= x >> 30;
+	x ^= x >> 15
+	x ^= x >> 30
+
+	// Step 2: Multiply by an odd constant modulo 2^32
+	//
+	// Multiplication by an odd number is invertible in Z / 2^32 Z
+	// because gcd(constant, 2^32) = 1.
+	//
+	// This spreads bit dependencies across many bit positions.
+	//
+	// Inverse: x *= 0x1f123bb5;
+	x *= 0x1D69E2A5
+
+	// Step 1: XOR upper 16 bits into lower 16 bits
+	//
+	// x = [H | L]  ->  [H | L ⊕ H]
+	//
+	// This mixes high bits into low bits.
+	// Invertible because XOR is its own inverse:
 	//
 	// Inverse: x ^= x >> 16;
 	x ^= x >> 16

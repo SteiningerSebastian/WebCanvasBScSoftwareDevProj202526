@@ -401,7 +401,6 @@ impl VeritasClientTrait for VeritasClient {
                 let watch_cmd = WatchCommand { key: var.clone() };
                 let cmd = WebsocketCommand::from_watch_command(&watch_cmd);
                 if let Ok(msg) = serde_json::to_string(&cmd) {
-                    println!("Sending watch command: {}", msg);
                     write.send(Message::Text(msg.into())).await.map_err(|e| VeritasError::WebSocketError(e.to_string()))?;
                 }
             }

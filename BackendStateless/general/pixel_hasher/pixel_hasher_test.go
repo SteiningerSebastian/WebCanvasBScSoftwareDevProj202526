@@ -56,3 +56,15 @@ func TestPermute32Bitwise_ChangesBits(t *testing.T) {
 		t.Errorf("permute32Bitwise(%v) = %v, want different value", x, y)
 	}
 }
+
+func TestKeyToPixel_Inverse(t *testing.T) {
+	for x := uint16(0); x < 256; x++ {
+		for y := uint16(0); y < 256; y++ {
+			key := PixelToKey(x, y)
+			x2, y2 := KeyToPixel(key)
+			if x != x2 || y != y2 {
+				t.Errorf("KeyToPixel(PixelToKey(%d,%d)) = (%d,%d), want (%d,%d)", x, y, x2, y2, x, y)
+			}
+		}
+	}
+}

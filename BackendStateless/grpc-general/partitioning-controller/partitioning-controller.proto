@@ -15,16 +15,16 @@ service Database {
 }
 
 message Data {
-    uint32 key = 1;  // The key for the data entry
+    uint32 key = 1;  // The key for the data entry key&FFFF = y, key>>16 = x
     bytes value = 2; // The value of the data entry
 }
 
 message DataRequest {
-    uint32 key = 1;  // The key for the data entry
+    uint32 key = 1;  // The key for the data entry key&FFFF = y, key>>16 = x
 }
 
 message DataResponse {
-    uint32 key = 1;  // The key for the data entry
+    uint32 key = 1;  // The key for the data entry key&FFFF = y, key>>16 = y
     bytes value = 2; // The value of the data entry
 
     // 0 = success, 1 = not found, 2 = error

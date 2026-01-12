@@ -43,6 +43,18 @@ type ServiceRegistration struct {
 	Meta      map[string]string `json:"meta"`
 }
 
+// / Clone creates a deep copy of the ServiceRegistration
+func (sr *ServiceRegistration) Clone() ServiceRegistration {
+	clone := *sr
+	clone.Meta = make(map[string]string)
+	for k, v := range sr.Meta {
+		clone.Meta[k] = v
+	}
+	clone.Endpoints = make([]ServiceEndpoint, len(sr.Endpoints))
+	copy(clone.Endpoints, sr.Endpoints)
+	return clone
+}
+
 // ServiceEndpointsUpdate represents changes in service endpoints
 type ServiceEndpointsUpdate struct {
 	AddedEndpoints   []ServiceEndpoint

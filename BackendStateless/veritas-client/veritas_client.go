@@ -315,6 +315,7 @@ func (vc *VeritasClient) CompareAndSetVariable(ctx context.Context, name string,
 	return strings.ToLower(rsp) == "true", err
 }
 
+// GetAndAddVariable atomically adds 1 to the integer variable by name lineralizably and returns the old value.
 func (vc *VeritasClient) GetAndAddVariable(ctx context.Context, name string) (int64, error) {
 	if !isValidName(name) {
 		return 0, &InvalidName{name: name}
@@ -562,6 +563,21 @@ func (vc *VeritasClient) WatchVariablesAutoReconnect(ctx context.Context, names 
 			if err != nil {
 				errorChan <- err
 				return
+			}
+
+			// Initial fetch of variable values (if something changed between disconnection and reconnection, we make sure we don't miss it here)
+			for _, variable := range names {
+				value, err := vc.GetVariable(ctx, variable)
+
+				errorChan <- err
+
+				if err == nil {
+					valueChan <- UpdateNotification{
+						Key:      variable,
+						NewValue: value,
+						OldValue: value, // OldValue is the same as NewValue since we are just fetching the current value
+					}
+				}
 			}
 
 			is_connected := true
