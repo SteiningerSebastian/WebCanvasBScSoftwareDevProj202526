@@ -33,6 +33,17 @@ pub struct VeritasClient {
     ws_nodes: Vec<String>, // reuse for websocket (same as nodes; kept for compatibility)
 }
 
+impl Clone for VeritasClient {
+    fn clone(&self) -> Self {
+        VeritasClient {
+            nodes: self.nodes.clone(),
+            client: Client::new(),
+            current: Arc::new(AtomicUsize::new(self.current.load(Ordering::SeqCst))),
+            ws_nodes: self.ws_nodes.clone(),
+        }
+    }
+}
+
 pub trait VeritasClientTrait: Send + Sync {
     /// Get a variable by name (linearizable read through leader)
     /// 

@@ -152,9 +152,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("NoReDB unique id: {}", unique_id);
 
     let unique_id_clone = unique_id.clone();
-    tokio::spawn( async move{    // Attempt to register service with retries and exponential backoff
-        let mut registration_handler = ServiceRegistrationHandler::new(client, SERVICE_REGISTRATION_KEY).await.unwrap();
-    
+
+     // Spawn a task to handle service registration and periodic refresh
+    tokio::spawn( async move {    // Attempt to register service with retries and exponential backoff
+        let mut registration_handler;
+        loop {
+            registration_handler = ServiceRegistrationHandler::new(client.clone(), SERVICE_REGISTRATION_KEY).await;
+            if let Err(e) = &registration_handler {
+                error!("Failed to create service registration handler: {:?}, retrying...", e);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            } else {
+                break;
+            }
+        }
+        let mut registration_handler = registration_handler.unwrap(); // safe to unwrap
+
         let mut service = ServiceRegistration {
             id: SERVICE_REGISTRATION_KEY.to_string(),
             endpoints: Vec::new(),
