@@ -103,8 +103,8 @@ func (c *NoreDBClient) Set(ctx context.Context, index uint32, key uint32, pixelD
 	return nil
 }
 
-func (c *NoreDBClient) GetAll(ctx context.Context, index uint32) (chan<- *PixelResponse, chan<- error, error) {
-	rspChan := make(chan *PixelResponse)
+func (c *NoreDBClient) GetAll(ctx context.Context, index uint32) (<-chan *PixelResponse, <-chan error, error) {
+	rspChan := make(chan *PixelResponse, 64) // Buffered channel for responses
 	errChan := make(chan error)
 
 	stream, err := c.client.GetAll(ctx, &noredb.StreamRequest{
@@ -123,7 +123,7 @@ func (c *NoreDBClient) GetAll(ctx context.Context, index uint32) (chan<- *PixelR
 			if err != nil {
 				slog.Error(fmt.Sprintf("Error receiving from GetAll stream: %v\n", err))
 				errChan <- err
-				return
+				return // Exit the goroutine on error
 			}
 			pixelResponse := &PixelResponse{
 				Index:     rsp.Index,

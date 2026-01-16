@@ -244,8 +244,88 @@ func (pc *PartitioningController) startFollowerDuties(ctx context.Context) error
 	return nil
 }
 
-// GetPartition retrieves the partition ID for given pixel coordinates.
-func (pc *PartitioningController) GetPartition(x uint16, y uint16) (uint32, error) {
+// getClients retrieves clients for all active NoReDB services.
+func (pc *PartitioningController) getClients(ctx context.Context) ([]noredbclient.NoreDBClient, [][]int, error) {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
+	replicaIDs, err := pc.getActiveNoReDBServices(ctx)
+	if err != nil {
+		return nil, nil, &NoReplicaAvailable{}
+	}
+
+	clients := make([]noredbclient.NoreDBClient, 0)
+	partitions := make([][]int, 0)
+
+	for _, replicaID := range replicaIDs {
+		clientPartitions := make([]int, 0)
+		client, ok := pc.noredb_clients[replicaID]
+		if ok {
+			clients = append(clients, client)
+		} else {
+			slog.Debug("No NoreDB client found for replica ID: " + replicaID)
+
+			// Creating a new client for this replica
+			pc.mu.RUnlock() // Unlock read lock before acquiring write lock
+			pc.mu.Lock()
+			// Check again to avoid race condition
+			client, ok = pc.noredb_clients[replicaID]
+			if ok {
+				clients = append(clients, client)
+				pc.mu.Unlock()
+				pc.mu.RLock() // Reacquire read lock
+			} else {
+
+				// Get service endpoint for this replica
+				nordb_services, err := pc.noredb_service_handler.ResolveService(ctx)
+				if err != nil {
+					slog.Error("Failed to resolve NoreDB service for replica ID: "+replicaID, "error", err)
+					pc.mu.Unlock()
+					return nil, nil, err
+				}
+
+				var found_endpoint *veritasclient.ServiceEndpoint
+				for _, endpoint := range nordb_services.Endpoints {
+					if endpoint.ID == replicaID {
+						found_endpoint = &endpoint
+						break
+					}
+				}
+
+				if found_endpoint == nil {
+					slog.Error("No endpoint found for NoreDB replica ID: " + replicaID)
+					return nil, nil, &ServiceNotFound{}
+				}
+
+				new_client := noredbclient.NewNoreDBClient(fmt.Sprintf("%s:%d", found_endpoint.Address, found_endpoint.Port))
+				if new_client != nil {
+					pc.noredb_clients[replicaID] = *new_client
+					clients = append(clients, *new_client)
+					pc.mu.Unlock()
+					pc.mu.RLock() // Reacquire read lock
+				}
+			}
+		}
+
+		// Find partitions for this replica
+		for partitionID, serviceIDs := range pc.config.mServicePartition {
+			// Check if this replica is assigned to the partition
+			for _, serviceID := range serviceIDs {
+				if serviceID == replicaID {
+					clientPartitions = append(clientPartitions, int(partitionID))
+					break
+				}
+			}
+		}
+
+		partitions = append(partitions, clientPartitions)
+	}
+
+	return clients, partitions, nil
+}
+
+// getPartition retrieves the partition ID for given pixel coordinates.
+func (pc *PartitioningController) getPartition(x uint16, y uint16) (uint32, error) {
 	key := pixelhasher.PixelToKey(x, y)
 
 	pc.mu.RLock()
@@ -257,8 +337,8 @@ func (pc *PartitioningController) GetPartition(x uint16, y uint16) (uint32, erro
 	return partitionID, nil
 }
 
-// GetPartitionReplicas retrieves the list of replicas for a given partition ID.
-func (pc *PartitioningController) GetPartitionReplicas(partitionID uint32) []string {
+// getPartitionReplicas retrieves the list of replicas for a given partition ID.
+func (pc *PartitioningController) getPartitionReplicas(partitionID uint32) []string {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
 	replicas, ok := pc.config.mServicePartition[partitionID]
@@ -280,7 +360,7 @@ func (e *NoReplicaAvailable) Error() string {
 	return "No replica available for partition."
 }
 
-func (pc *PartitioningController) GetClientsForPartition(ctx context.Context, partitionID uint32) ([]noredbclient.NoreDBClient, error) {
+func (pc *PartitioningController) getClientsForPartition(ctx context.Context, partitionID uint32) ([]noredbclient.NoreDBClient, error) {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
 
@@ -666,11 +746,11 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 	slog.Debug(fmt.Sprintf("Starting Get operation %d for pixel (%d, %d).", index, x, y))
 
 	// Get clients for the partition
-	partitionID, err := pc.GetPartition(x, y)
+	partitionID, err := pc.getPartition(x, y)
 	if err != nil {
 		return nil, err
 	}
-	clients, err := pc.GetClientsForPartition(context.Background(), partitionID)
+	clients, err := pc.getClientsForPartition(context.Background(), partitionID)
 	if err != nil {
 		return nil, err
 	}
@@ -817,11 +897,11 @@ func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, v
 	index := pc.op_index.Add(1) // Get a new operation index
 
 	// Get clients for the partition
-	partitionID, err := pc.GetPartition(x, y)
+	partitionID, err := pc.getPartition(x, y)
 	if err != nil {
 		return err
 	}
-	clients, err := pc.GetClientsForPartition(context.Background(), partitionID)
+	clients, err := pc.getClientsForPartition(context.Background(), partitionID)
 	if err != nil {
 		return err
 	}
@@ -877,12 +957,170 @@ func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, v
 	return nil
 }
 
-// GetAll retrieves all data across partitions.
-func (pc *PartitioningController) GetAll() (<-chan Data, error) {
-	// TODO Placeholder for getting all data across partitions
-	dataChan := make(chan Data)
+type errorWithIndex struct {
+	err   error
+	index int
+}
+
+// mergeDataChannels merges multiple data channels into a single channel.
+func mergeErrorChannels(channels []<-chan error) <-chan errorWithIndex {
+	merged := make(chan errorWithIndex)
 	go func() {
-		close(dataChan)
+		defer close(merged)
+		var wg sync.WaitGroup
+		wg.Add(len(channels))
+		for i, ch := range channels {
+			go func(c <-chan error, idx int) {
+				defer wg.Done()
+				for err := range c {
+					merged <- errorWithIndex{err: err, index: idx}
+				}
+			}(ch, i)
+		}
+		wg.Wait()
 	}()
-	return dataChan, nil
+	return merged
+}
+
+// mergeDataChannels merges multiple data channels into a single channel.
+func mergeDataChannels(channels []<-chan *noredbclient.PixelResponse) <-chan *noredbclient.PixelResponse {
+	merged := make(chan *noredbclient.PixelResponse)
+	go func() {
+		defer close(merged)
+		var wg sync.WaitGroup
+		wg.Add(len(channels))
+		for _, ch := range channels {
+			go func(c <-chan *noredbclient.PixelResponse) {
+				defer wg.Done()
+				for data := range c {
+					merged <- data
+				}
+			}(ch)
+		}
+		wg.Wait()
+	}()
+	return merged
+}
+
+// GetAll retrieves all data across partitions. (Does not guarantee order or consistency)
+func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-chan error, error) {
+	dataChan := make(chan Data)
+	errorChan := make(chan error)
+
+	clients, paritionsAsignments, err := pc.getClients(ctx)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	channels := make([]<-chan *noredbclient.PixelResponse, 0)
+	errChannels := make([]<-chan error, 0)
+	for _, client := range clients {
+		dataChanClient, errChan, err := client.GetAll(context.Background(), pc.op_index.Add(1))
+		if err != nil {
+			continue
+		}
+		channels = append(channels, dataChanClient)
+		errChannels = append(errChannels, errChan)
+	}
+
+	// Get read lock
+	pc.mu.RLock()
+
+	availableReplicasForPartition := make(map[uint32]int, 0)
+	// Determine available replicas for each partition
+	for partitionID := uint32(0); partitionID < pc.config.nPartitions; partitionID++ {
+		replicas := pc.getPartitionReplicas(partitionID)
+		availableReplicasForPartition[partitionID] = len(replicas)
+	}
+
+	// Release read lock
+	pc.mu.RUnlock()
+
+	responses := make(map[uint16][]*noredbclient.PixelResponse, 0)
+	done := make(map[uint16]bool, 0)
+
+	go func() {
+		defer close(dataChan)
+
+		// Merge data from all clients for this partition
+		for {
+			select {
+			case errorWithIndex := <-mergeErrorChannels(errChannels):
+				err := errorWithIndex.err
+				idx := errorWithIndex.index
+
+				slog.Error("Error received from NoReDB client during GetAll.", "error", err)
+
+				// If an error occurs, we close and remove the client
+				pc.mu.Lock()
+
+				// Find and delete the client from the map
+				for replicaID, c := range pc.noredb_clients {
+					if c == clients[idx] {
+						clients[idx].Close()
+						delete(pc.noredb_clients, replicaID)
+						break
+					}
+				}
+
+				// Note that all partitions that this client was responsible for now have one less available replica
+				for _, partitionID := range paritionsAsignments[idx] {
+					availableReplicasForPartition[uint32(partitionID)] -= 1
+
+					// If available replicas for this partition fall below read quorum, we can not continue
+					if uint32(availableReplicasForPartition[uint32(partitionID)]) < pc.config.nReads {
+						slog.Error("Not enough replicas available for partition during GetAll, aborting.", "partition_id", partitionID)
+						errorChan <- &QuorumNotReached{}
+						// Release lock
+						pc.mu.Unlock()
+						return
+					}
+				}
+
+				// Release lock
+				pc.mu.Unlock()
+			case resp, ok := <-mergeDataChannels(channels):
+				if !ok {
+					// All channels are closed
+					slog.Info("All NoReDB client data channels closed during GetAll.")
+					return
+				}
+
+				// Process the received response if we haven't already completed it (multiple clients may return the same pixel)
+				if !done[uint16(resp.Key)] {
+					// Accumulate responses for each pixel
+					responses[uint16(resp.Key)] = append(responses[uint16(resp.Key)], resp)
+
+					// Check if we have enough responses for this pixel to reach read quorum
+					if uint32(len(responses[uint16(resp.Key)])) >= pc.config.nReads {
+						done[uint16(resp.Key)] = true
+
+						// Find the value with the latest timestamp
+						var latestValue *noredbclient.PixelResponse
+						for _, val := range responses[uint16(resp.Key)] {
+							if latestValue == nil {
+								latestValue = val
+							} else {
+								ts_current := TimestampFromBytes(val.Timestamp)
+								ts_latest := TimestampFromBytes(latestValue.Timestamp)
+								if ts_current.Cmp(&ts_latest) > 0 {
+									latestValue = val
+								}
+							}
+						}
+						if latestValue != nil {
+							x, y := pixelhasher.KeyToPixel(latestValue.Key)
+							dataChan <- Data{x: x, y: y, val: ColorFromBytes(latestValue.PixelData)}
+						}
+
+						// Remove accumulated responses for this pixel to free memory
+						delete(responses, uint16(resp.Key))
+					}
+				}
+			}
+		}
+	}()
+
+	return dataChan, errorChan, nil
 }

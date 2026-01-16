@@ -143,8 +143,6 @@ func main() {
 	// Start handling service registration and endpoints
 	go handleServiceRegistration(ctx, serviceHandler)
 
-	// TODO: Handle the partitioning logic, service discovery of noredb nodes, etc.
-
 	// Block forever
 	select {}
 }
