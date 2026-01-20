@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	grpcserver "partitioning-controller/grpc-server"
+	partitioningcontroller "partitioning-controller/partitioning-controller"
 	"strings"
 	"time"
 	veritasclient "veritas-client"
@@ -49,10 +51,19 @@ func handleServiceRegistration(ctx context.Context, handler *veritasclient.Servi
 				return
 			default:
 				time.Sleep(SERVICE_REGISTRATION_INTERVAL)
+
+				namespace := os.Getenv("NAMESPACE")
+				serviceName := os.Getenv("SERVICE_NAME")
+				serviceID := fmt.Sprintf("%s.%s.%s.svc.cluster.local",
+					hostname,
+					serviceName,
+					namespace, // e.g., "default"
+				)
+
 				// Update service endpoints
 				endpoint := veritasclient.ServiceEndpoint{
 					ID:        hostname,
-					Address:   hostname,
+					Address:   serviceID,
 					Port:      50051,
 					Timestamp: time.Now(),
 				}
@@ -143,6 +154,30 @@ func main() {
 	// Start handling service registration and endpoints
 	go handleServiceRegistration(ctx, serviceHandler)
 
-	// Block forever
-	select {}
+	hostname, err := os.Hostname()
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error getting hostname: %v\n", err))
+		return
+	}
+
+	// Initialize Partitioning Controller
+	controller, errPartitioningChan, err := partitioningcontroller.NewPartitioningController(hostname, veritasClient, serviceHandler)
+
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error initializing Partitioning Controller: %v\n", err))
+		return
+	}
+
+	// Start gRPC server
+	go func() {
+		err := grpcserver.StartServer(50051, controller)
+		if err != nil {
+			slog.Error(fmt.Sprintf("gRPC server error: %v\n", err))
+		}
+	}()
+
+	// Block forever / until channel error is closed
+	for err := range errPartitioningChan {
+		slog.Error(fmt.Sprintf("Partitioning Controller error: %v\n", err))
+	}
 }

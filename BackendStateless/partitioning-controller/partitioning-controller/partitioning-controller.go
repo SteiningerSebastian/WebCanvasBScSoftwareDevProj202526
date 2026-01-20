@@ -25,6 +25,9 @@ const NOREDB_SERVICE_REGISTRATION_KEY = "service-noredb"
 // (If it's not back in time, the leader will reassign its partitions to other active NoReDB services. This is to ensure availability.)
 const NOREDB_SERVICE_REGISTRATION_TIMEOUT_PARTITIONING = 5 * time.Minute
 
+// Threshold for partition imbalance between NoReDB services before rebalancing is triggered
+const NOREDB_PARTITION_INBALANCE_THRESHOLD = 16 // Max allowed partition imbalance between NoReDB services before rebalancing is triggered
+
 const SERVICE_REGISTRATION_TIMEOUT = 30 * time.Second
 const LEADER_ELECTION_INTERVAL = 5 * time.Second
 
@@ -36,13 +39,21 @@ const RETRY_INTERVAL = 200 * time.Millisecond
 const RETRY_BACKOFF_FACTOR = 2
 
 const PARTITIONING_INTERVAL = 10 * time.Second
+const REPARTITIONING_INTERVAL = 100 * time.Millisecond // Time between repartitioning checks (shorter than partitioning interval to allow quick reaction to changes)
+
+const MAX_CLOCK_TICK = 100 * time.Millisecond // Time between queries to update the global clock
+
+const LEADERSHIP_COOLDOWN = 128 * time.Second // Time to wait before repartitioning etc. after gaining leadership (allow system to stabilize)
+
+const READ_TIMEOUT = 5 * time.Second  // Timeout for read operations to NoReDB services
+const WRITE_TIMEOUT = 5 * time.Second // Timeout for write operations to NoReDB services
 
 type PartitioningControllerConfig struct {
-	nPartitions       uint32              // Total number of partitions - must not change else data consistency breaks
-	nReplicas         uint32              // Number of replicas for each partition (This is for quorum read/writes, failover is implemented but takes longer and loosing quorum while reconstructing can lead to data loss)
-	nReads            uint32              // Number of replicas to read from for quorum reads
-	nWrites           uint32              // Number of replicas to write to for quorum writes
-	mServicePartition map[uint32][]string // Map partition ID to list of NoReDB service IDs responsible for that partition
+	NPartitions       uint32              // Total number of partitions - must not change else data consistency breaks
+	NReplicas         uint32              // Number of replicas for each partition (This is for quorum read/writes, failover is implemented but takes longer and loosing quorum while reconstructing can lead to data loss)
+	NReads            uint32              // Number of replicas to read from for quorum reads
+	NWrites           uint32              // Number of replicas to write to for quorum writes
+	MServicePartition map[uint32][]string // Map partition ID to list of NoReDB service IDs responsible for that partition
 }
 
 type PartitioningController struct {
@@ -61,21 +72,23 @@ type PartitioningController struct {
 }
 
 // getActiveNoReDBServices retrieves the list of currently active NoReDB services based on their id.
-func (pc *PartitioningController) getActiveNoReDBServices(ctx context.Context) ([]string, error) {
+func (pc *PartitioningController) getActiveNoReDBServices(ctx context.Context) ([]string, bool, error) {
 	service_reg, err := pc.noredb_service_handler.ResolveService(ctx)
 	if err != nil {
 		slog.Error("Error resolving NoReDB service.", "error", err)
-		return nil, err
+		return nil, false, err
 	}
 
 	active_services := make([]string, 0)
 	for _, endpoint := range service_reg.Endpoints {
-		if time.Since(endpoint.Timestamp) < SERVICE_REGISTRATION_TIMEOUT {
+		if time.Since(endpoint.Timestamp) < NOREDB_SERVICE_REGISTRATION_TIMEOUT_PARTITIONING {
 			active_services = append(active_services, endpoint.ID)
+		} else {
+			slog.Info("NoReDB service endpoint considered inactive for partitioning: " + endpoint.ID)
 		}
 	}
 
-	return active_services, nil
+	return active_services, len(active_services) == len(service_reg.Endpoints), nil
 }
 
 // dropLeadershipDuties removes leadership duties from this instance, if it is currently the leader.
@@ -115,7 +128,81 @@ func (pc *PartitioningController) dropLeadershipDuties() {
 	}
 }
 
+// transferPartition transfers all data for a given partition from the old service to the new service.
+func (pc *PartitioningController) transferPartition(ctx context.Context, partitionId uint32, old string, new string) error {
+	if old == new {
+		return nil
+	}
+
+	// Stream everything from old to new
+	clients, err := pc.getClientsForPartition(context.Background(), partitionId)
+	if err != nil {
+		slog.Error("Error getting clients for partition during transfer.", "error", err)
+		return err
+	}
+
+	replicaIDs, ok := pc.config.MServicePartition[partitionId]
+
+	if !ok {
+		slog.Error("No replicas found for partition during transfer.", "partitionId", partitionId)
+		return &NoReplicaAvailable{}
+	}
+
+	var oldClient *noredbclient.NoreDBClient
+	var newClient *noredbclient.NoreDBClient
+
+	for i, replicaID := range replicaIDs {
+		if replicaID == old {
+			oldClient = &clients[i]
+		}
+		if replicaID == new {
+			newClient = &clients[i]
+		}
+	}
+
+	if oldClient == nil || newClient == nil {
+		slog.Error("Old or new client not found for partition during transfer.", "partitionId", partitionId, "old", old, "new", new)
+		return &ServiceNotFound{}
+	}
+
+	dataChan, errChan, err := oldClient.GetAll(ctx, 0)
+
+	if err != nil {
+		slog.Error("Error starting GetAll for partition transfer.", "error", err)
+		return err
+	}
+
+	for {
+		select {
+		case data, ok := <-dataChan:
+			if !ok {
+				slog.Info("Completed data transfer for partition.", "partitionId", partitionId, "old", old, "new", new)
+				return nil
+			}
+
+			// Check if key is in the partition
+			partition := data.Key % pc.config.NPartitions
+
+			// If not, skip
+			if partition != partitionId {
+				continue
+			}
+
+			// Write data to new client
+			newClient.Set(ctx, 0, data.Key, data.PixelData, data.Timestamp)
+		case err := <-errChan:
+			if err != nil {
+				slog.Error("Error during data transfer for partition.", "partitionId", partitionId, "old", old, "new", new, "error", err)
+				return err
+			}
+		}
+	}
+}
+
 func (pc *PartitioningController) startLeadershipDuties(ctx context.Context) error {
+	// Make sure that everything is started up and working before starting leadership duties
+	time.Sleep(LEADERSHIP_COOLDOWN)
+
 	var current_config PartitioningControllerConfig
 	i := 0
 	time_retry := RETRY_INTERVAL
@@ -132,7 +219,20 @@ func (pc *PartitioningController) startLeadershipDuties(ctx context.Context) err
 		// Make sure we have the latest config at start of leadership duties
 		slog.Info("PartitioningController starting leadership duties with current config.")
 		if err := json.Unmarshal([]byte(config), &current_config); err == nil {
-			slog.Info("PartitioningController lead working config updated.")
+			// Initialize map if nil
+			if current_config.MServicePartition == nil {
+				current_config.MServicePartition = make(map[uint32][]string)
+			}
+
+			// Copy nPartitions from controller config if not set
+			if current_config.NPartitions == 0 {
+				current_config.NPartitions = pc.config.NPartitions
+				current_config.NReplicas = pc.config.NReplicas
+				current_config.NReads = pc.config.NReads
+				current_config.NWrites = pc.config.NWrites
+			}
+			slog.Info("PartitioningController leader initialized working config.", "nPartitions", current_config.NPartitions, "nReplicas", current_config.NReplicas, "nReads", current_config.NReads, "nWrites", current_config.NWrites)
+
 			break // Exit loop on success
 		} else {
 			slog.Error("PartitioningController leader failed to unmarshal current config.", "error", err)
@@ -146,42 +246,90 @@ func (pc *PartitioningController) startLeadershipDuties(ctx context.Context) err
 		return nil // Exit leadership duties
 	}
 
+	partitioningCheckTimeout := time.After(PARTITIONING_INTERVAL)
 	// Main leadership loop
-	for {
+	for lc := 0; ; lc++ {
 		select {
 		case <-ctx.Done():
 			slog.Info("PartitioningController leader duties context done, exiting.")
 			return nil
-		case <-time.After(PARTITIONING_INTERVAL): // Periodic partitioning check
+		case <-partitioningCheckTimeout: // Periodic partitioning check
+			partitioningCheckTimeout = time.After(PARTITIONING_INTERVAL) // Reset timer
+			slog.Info(fmt.Sprintf("PartitioningController leader performing partitioning check. Loop count: %d", lc))
 			updated_config := false
 
 			// Find all currently registered and active NoReDB services
-			active_services, err := pc.getActiveNoReDBServices(ctx)
+			active_services, _, err := pc.getActiveNoReDBServices(ctx)
 			if err != nil {
 				slog.Error("PartitioningController leader failed to get active NoReDB services.", "error", err)
 				continue
 			}
 
+			if len(active_services) < int(current_config.NReplicas) {
+				slog.Warn("PartitioningController leader found insufficient active NoReDB services for partitioning.", "active_services", len(active_services), "required_replicas", current_config.NReplicas)
+				continue
+			}
+
 			slog.Debug("Found active services: " + strings.Join(active_services, ", "))
+
+			// Count the number of partitions assigned to each active NoReDB service
+			partition_count := make(map[string]int)
+			for partitionID := uint32(0); partitionID < current_config.NPartitions; partitionID++ {
+				val, ok := current_config.MServicePartition[partitionID]
+				if ok {
+					for _, serviceID := range val {
+						partition_count[serviceID]++
+					}
+				}
+			}
+
+			// Check for partition imbalance
+			rebalanceNeeded := false
+			min := int(^uint(0) >> 1) // Max int
+			minService := ""
+			max := 0
+			maxService := ""
+			for _, serviceID := range active_services {
+				count, ok := partition_count[serviceID]
+				if !ok {
+					count = 0
+				}
+				if count < min {
+					min = count
+					minService = serviceID
+				}
+				if count > max {
+					max = count
+					maxService = serviceID
+				}
+			}
+			if max-min > NOREDB_PARTITION_INBALANCE_THRESHOLD {
+				slog.Info(fmt.Sprintf("PartitioningController leader detected partition imbalance (max: %d, min: %d), rebalancing partitions.", max, min))
+				updated_config = true
+				rebalanceNeeded = true
+			}
 
 			i := 0
 			// Iterate over all partitions and assign them to active NoReDB services
-			for partitionID := uint32(0); partitionID < pc.config.nPartitions; partitionID++ {
+			for partitionID := uint32(0); partitionID < current_config.NPartitions; partitionID++ {
 				// Simple round-robin assignment if no existing assignments
-				val, ok := current_config.mServicePartition[partitionID]
+				val, ok := current_config.MServicePartition[partitionID]
 
 				// If no existing assignment
 				if !ok || len(val) == 0 {
+					slog.Info(fmt.Sprintf("Assigning partition to active services. Partition ID: %d", partitionID))
 					updated_config = true
 					// Assign partition
 					assigned_services := make([]string, 0)
-					for r := uint32(0); r < pc.config.nReplicas; r++ {
+					for r := uint32(0); r < current_config.NReplicas; r++ {
 						assigned_services = append(assigned_services, active_services[i%len(active_services)])
 						i++
 					}
+
+					current_config.MServicePartition[partitionID] = assigned_services
 				} else {
 					// Check existing assignments and reassign if any assigned service is no longer active
-					for i, serviceID := range val {
+					for j, serviceID := range val {
 						found := false
 						// Check if assigned service is still active
 						for _, activeServiceID := range active_services {
@@ -194,13 +342,50 @@ func (pc *PartitioningController) startLeadershipDuties(ctx context.Context) err
 						// If the assigned service is not found among active services - reassign a new service endpoint to the partition
 						if !found {
 							updated_config = true // Updated config as we had to reassign some partitions
-							slog.Info("Reassigning partition to a new active service.")
+							slog.Info(fmt.Sprintf("Reassigning partition from inactive service. Partition ID: %d, Inactive Service ID: %s", partitionID, serviceID))
+
+							k := i
+							for ; k < i+len(active_services); k++ {
+								// Find the next active service that is not already assigned to this partition
+								already_assigned := false
+								for _, assignedServiceID := range val {
+									if active_services[k%len(active_services)] == assignedServiceID {
+										already_assigned = true
+										break
+									}
+								}
+								if !already_assigned {
+									break
+								}
+							}
 
 							// Assign a new active service
-							val[i] = active_services[i%len(active_services)]
+							val[j] = active_services[k%len(active_services)]
 							i++
+						}
 
-							break
+						// Rebalance partitions if needed
+						if rebalanceNeeded {
+							// If the max service is assigned this partition, and the min service is not assigned, swap them
+							if serviceID == maxService {
+								already_assigned := false
+								for _, assignedServiceID := range val {
+									if assignedServiceID == minService {
+										already_assigned = true
+										break
+									}
+								}
+								if !already_assigned {
+									slog.Debug(fmt.Sprintf("Rebalancing partition assignment. Partition ID: %d, From Service ID: %s, To Service ID: %s", partitionID, maxService, minService))
+									pc.transferPartition(ctx, partitionID, maxService, minService)
+
+									// Only swap once every leader loop to avoid excessive data transfer and timeouts / keep system stable
+									val[j] = minService
+								}
+							}
+
+							// Set the timeout for next repartitioning check (shorter than partitioning interval to allow quick reaction to changes / new services)
+							partitioningCheckTimeout = time.After(REPARTITIONING_INTERVAL)
 						}
 					}
 				}
@@ -208,6 +393,7 @@ func (pc *PartitioningController) startLeadershipDuties(ctx context.Context) err
 
 			// If configuration was updated, write it back to Veritas
 			if updated_config {
+				slog.Info("PartitioningController leader detected configuration changes, updating Veritas.")
 				i := 0
 				time_retry := RETRY_INTERVAL
 				for ; i < RETRY_COUNT; i++ { // Retry loop for updating config
@@ -247,10 +433,11 @@ func (pc *PartitioningController) startFollowerDuties(ctx context.Context) error
 // getClients retrieves clients for all active NoReDB services.
 func (pc *PartitioningController) getClients(ctx context.Context) ([]noredbclient.NoreDBClient, [][]int, error) {
 	pc.mu.RLock()
-	defer pc.mu.RUnlock()
 
-	replicaIDs, err := pc.getActiveNoReDBServices(ctx)
+	replicaIDs, _, err := pc.getActiveNoReDBServices(ctx)
 	if err != nil {
+		slog.Error("Error resolving NoReDB service.", "error", err)
+		pc.mu.RUnlock()
 		return nil, nil, &NoReplicaAvailable{}
 	}
 
@@ -268,12 +455,12 @@ func (pc *PartitioningController) getClients(ctx context.Context) ([]noredbclien
 			// Creating a new client for this replica
 			pc.mu.RUnlock() // Unlock read lock before acquiring write lock
 			pc.mu.Lock()
+
 			// Check again to avoid race condition
 			client, ok = pc.noredb_clients[replicaID]
 			if ok {
 				clients = append(clients, client)
 				pc.mu.Unlock()
-				pc.mu.RLock() // Reacquire read lock
 			} else {
 
 				// Get service endpoint for this replica
@@ -294,6 +481,7 @@ func (pc *PartitioningController) getClients(ctx context.Context) ([]noredbclien
 
 				if found_endpoint == nil {
 					slog.Error("No endpoint found for NoreDB replica ID: " + replicaID)
+					pc.mu.Unlock()
 					return nil, nil, &ServiceNotFound{}
 				}
 
@@ -301,14 +489,15 @@ func (pc *PartitioningController) getClients(ctx context.Context) ([]noredbclien
 				if new_client != nil {
 					pc.noredb_clients[replicaID] = *new_client
 					clients = append(clients, *new_client)
-					pc.mu.Unlock()
-					pc.mu.RLock() // Reacquire read lock
 				}
+				pc.mu.Unlock()
 			}
+
+			pc.mu.RLock() // Reacquire read lock
 		}
 
 		// Find partitions for this replica
-		for partitionID, serviceIDs := range pc.config.mServicePartition {
+		for partitionID, serviceIDs := range pc.config.MServicePartition {
 			// Check if this replica is assigned to the partition
 			for _, serviceID := range serviceIDs {
 				if serviceID == replicaID {
@@ -321,6 +510,8 @@ func (pc *PartitioningController) getClients(ctx context.Context) ([]noredbclien
 		partitions = append(partitions, clientPartitions)
 	}
 
+	pc.mu.RUnlock()
+
 	return clients, partitions, nil
 }
 
@@ -331,9 +522,15 @@ func (pc *PartitioningController) getPartition(x uint16, y uint16) (uint32, erro
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
 
+	// Ensure configuration is initialized
+	if pc.config.NPartitions == 0 {
+		slog.Error("nPartitions is 0, configuration not initialized properly")
+		return 0, fmt.Errorf("nPartitions is 0, configuration not initialized")
+	}
+
 	// Simple modulo-based partitioning (this is safe because the number of partitions is fixed in the config and can not change)
 	// What changes is the mapping of partitions to actual database instances, which is handled elsewhere.
-	partitionID := key % pc.config.nPartitions
+	partitionID := key % pc.config.NPartitions
 	return partitionID, nil
 }
 
@@ -341,7 +538,7 @@ func (pc *PartitioningController) getPartition(x uint16, y uint16) (uint32, erro
 func (pc *PartitioningController) getPartitionReplicas(partitionID uint32) []string {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
-	replicas, ok := pc.config.mServicePartition[partitionID]
+	replicas, ok := pc.config.MServicePartition[partitionID]
 	if !ok {
 		return nil
 	}
@@ -362,9 +559,8 @@ func (e *NoReplicaAvailable) Error() string {
 
 func (pc *PartitioningController) getClientsForPartition(ctx context.Context, partitionID uint32) ([]noredbclient.NoreDBClient, error) {
 	pc.mu.RLock()
-	defer pc.mu.RUnlock()
 
-	replicaIDs, ok := pc.config.mServicePartition[partitionID]
+	replicaIDs, ok := pc.config.MServicePartition[partitionID]
 	if !ok {
 		return nil, &NoReplicaAvailable{}
 	}
@@ -385,9 +581,7 @@ func (pc *PartitioningController) getClientsForPartition(ctx context.Context, pa
 			if ok {
 				clients = append(clients, client)
 				pc.mu.Unlock()
-				pc.mu.RLock() // Reacquire read lock
 			} else {
-
 				// Get service endpoint for this replica
 				nordb_services, err := pc.noredb_service_handler.ResolveService(ctx)
 				if err != nil {
@@ -406,6 +600,7 @@ func (pc *PartitioningController) getClientsForPartition(ctx context.Context, pa
 
 				if found_endpoint == nil {
 					slog.Error("No endpoint found for NoreDB replica ID: " + replicaID)
+					pc.mu.Unlock()
 					return nil, &ServiceNotFound{}
 				}
 
@@ -414,12 +609,13 @@ func (pc *PartitioningController) getClientsForPartition(ctx context.Context, pa
 					pc.noredb_clients[replicaID] = *new_client
 					clients = append(clients, *new_client)
 					pc.mu.Unlock()
-					pc.mu.RLock() // Reacquire read lock
 				}
 			}
+			pc.mu.RLock() // Reacquire read lock
 		}
 	}
 
+	pc.mu.RUnlock()
 	return clients, nil
 }
 
@@ -437,8 +633,10 @@ func (pc *PartitioningController) switchRoles(newRole uint8, ctx context.Context
 		pc.cancel_duties = cancel_duties
 		pc.role = newRole
 		if newRole == ROLE_LEADER {
+			slog.Info("Taking over leadership duties.")
 			go pc.startLeadershipDuties(ctx_duties)
 		} else {
+			slog.Info("Starting follower duties.")
 			go pc.startFollowerDuties(ctx_duties)
 		}
 	}
@@ -447,107 +645,111 @@ func (pc *PartitioningController) switchRoles(newRole uint8, ctx context.Context
 
 func (pc *PartitioningController) startLeaderElection(ctx context.Context) error {
 	go func() {
-		select {
-		case <-ctx.Done():
-			slog.Info("PartitioningController leader election context done, exiting.")
-			return
-		default:
-			// Wait before next election attempt
-			time.Sleep(LEADER_ELECTION_INTERVAL)
-			retry := true
-			for retry {
-				retry = false // Assume no retry unless needed
-				// If I am the leader, try to revalidate leadership
-				if pc.role == ROLE_LEADER {
-					service_reg, err := pc.service_handler.ResolveService(ctx)
-					if err != nil {
-						slog.Error("Error resolving service during leader election.", "error", err)
-						pc.switchRoles(ROLE_FOLLOWER, ctx)
-					} else {
-						// Check if I am still the leader
-						if service_reg.Meta["leader_id"] != pc.id && pc.role == ROLE_LEADER {
-							slog.Info("Lost leadership, switching to follower role.")
-
-							// Switch to follower role
+		for {
+			select {
+			case <-ctx.Done():
+				slog.Info("PartitioningController leader election context done, exiting.")
+				return
+			default:
+				// Wait before next election attempt
+				time.Sleep(LEADER_ELECTION_INTERVAL)
+				retry := true
+				for retry {
+					retry = false // Assume no retry unless needed
+					// If I am the leader, try to revalidate leadership
+					if pc.role == ROLE_LEADER {
+						service_reg, err := pc.service_handler.ResolveService(ctx)
+						if err != nil {
+							slog.Error("Error resolving service during leader election.", "error", err)
 							pc.switchRoles(ROLE_FOLLOWER, ctx)
 						} else {
-							slog.Debug("Retained leadership.")
-						}
-					}
-				} else {
-					service_reg, err := pc.service_handler.ResolveService(ctx)
-					current_service_reg := (*service_reg).Clone()
+							// Check if I am still the leader
+							if service_reg.Meta["leader_id"] != pc.id && pc.role == ROLE_LEADER {
+								slog.Info("Lost leadership, switching to follower role.")
 
-					if err != nil {
-						slog.Error("Error resolving service during leader election.", "error", err)
-					} else {
-						// Check if I am the leader
-						if service_reg.Meta["leader_id"] == pc.id {
-							slog.Info("Gained leadership, switching to leader role.")
-							pc.switchRoles(ROLE_LEADER, ctx)
-							// Sleep breifly to avoid concurrent leaders (In this case no leader is acceptable for even a few seconds as leadership is only
-							// responsible for config updates and normal operation can continue without it).
-							time.Sleep(LEADER_ELECTION_INTERVAL)
-						} else {
-							slog.Debug("Remaining follower.")
-
-							// Check if current leader is alive
-							leader := service_reg.Meta["leader_id"]
-							leader_alive := false
-							for _, endpoint := range service_reg.Endpoints {
-								if endpoint.ID == leader && time.Since(endpoint.Timestamp) < SERVICE_REGISTRATION_TIMEOUT {
-									leader_alive = true
-									break
-								}
+								// Switch to follower role
+								pc.switchRoles(ROLE_FOLLOWER, ctx)
+							} else {
+								slog.Debug("Retained leadership.")
 							}
+						}
+					} else {
+						service_reg, err := pc.service_handler.ResolveService(ctx)
+						current_service_reg := (*service_reg).Clone()
 
-							// If leader is not alive, attempt to become leader
-							if !leader_alive {
-								slog.Info("Current leader appears down, attempting to become leader.")
-								service_reg.Meta["leader_id"] = pc.id
-								err := pc.service_handler.RegisterOrUpdateService(ctx, service_reg, &current_service_reg)
+						if err != nil {
+							slog.Error("Error resolving service during leader election.", "error", err)
+						} else {
+							// Check if I am the leader
+							if service_reg.Meta["leader_id"] == pc.id {
+								slog.Info("Gained leadership, switching to leader role.")
+								pc.switchRoles(ROLE_LEADER, ctx)
+								// Sleep breifly to avoid concurrent leaders (In this case no leader is acceptable for even a few seconds as leadership is only
+								// responsible for config updates and normal operation can continue without it).
+								time.Sleep(LEADER_ELECTION_INTERVAL)
+							} else {
+								slog.Debug("Remaining follower.")
 
-								// The service registration has changed between our read and write, someone else has likely become leader
-								// in the meantime. But to be sure, we will check and retry if needed.
-								if err == veritasclient.ErrServiceRegistrationChanged {
-									slog.Info("Failed to become leader, another instance may have become leader first, checking...")
-
-									updated_service_reg, err := pc.service_handler.ResolveService(ctx)
-									if err != nil {
-										slog.Error("Error resolving service during leader election.", "error", err)
+								// Check if current leader is alive
+								leader := service_reg.Meta["leader_id"]
+								leader_alive := false
+								for _, endpoint := range service_reg.Endpoints {
+									if endpoint.ID == leader && time.Since(endpoint.Timestamp) < SERVICE_REGISTRATION_TIMEOUT {
+										leader_alive = true
+										break
 									}
+								}
 
-									// Check if I am still not the leader
-									if updated_service_reg.Meta["leader_id"] != pc.id {
-										leader_id := updated_service_reg.Meta["leader_id"]
-										// Check if leader is alive
-										leader_alive := false
-										for _, endpoint := range updated_service_reg.Endpoints {
-											if endpoint.ID == leader_id && time.Since(endpoint.Timestamp) < SERVICE_REGISTRATION_TIMEOUT {
-												leader_alive = true
-												break
+								// If leader is not alive, attempt to become leader
+								if !leader_alive {
+									slog.Info("Current leader appears down, attempting to become leader.")
+									service_reg.Meta["leader_id"] = pc.id
+									err := pc.service_handler.RegisterOrUpdateService(ctx, service_reg, &current_service_reg)
+
+									// The service registration has changed between our read and write, someone else has likely become leader
+									// in the meantime. But to be sure, we will check and retry if needed.
+									if err == veritasclient.ErrServiceRegistrationChanged {
+										slog.Info("Failed to become leader, another instance may have become leader first, checking...")
+
+										updated_service_reg, err := pc.service_handler.ResolveService(ctx)
+										if err != nil {
+											slog.Error("Error resolving service during leader election.", "error", err)
+										}
+
+										// Check if I am still not the leader
+										if updated_service_reg.Meta["leader_id"] != pc.id {
+											leader_id := updated_service_reg.Meta["leader_id"]
+											// Check if leader is alive
+											leader_alive := false
+											for _, endpoint := range updated_service_reg.Endpoints {
+												if endpoint.ID == leader_id && time.Since(endpoint.Timestamp) < SERVICE_REGISTRATION_TIMEOUT {
+													leader_alive = true
+													break
+												}
+											}
+
+											// If leader is not alive, retry to become leader without waiting for next interval
+											if !leader_alive {
+												slog.Info("Another instance became leader first, but it appears down, will retry to become leader soon: " + leader_id)
+												retry = true
+											} else {
+												slog.Info("Another instance became leader first: " + leader_id)
 											}
 										}
-
-										// If leader is not alive, retry to become leader without waiting for next interval
-										if !leader_alive {
-											slog.Info("Another instance became leader first, but it appears down, will retry to become leader soon: " + leader_id)
-											retry = true
-										} else {
-											slog.Info("Another instance became leader first: " + leader_id)
-										}
+									} else if err != nil {
+										slog.Error("Error attempting to become leader.", "error", err)
+									} else {
+										slog.Debug("Successfully became leader, switching to leader role.")
 									}
-								} else if err != nil {
-									slog.Error("Error attempting to become leader.", "error", err)
+								} else {
+									slog.Debug("Accepting leadership from " + leader)
 								}
-							} else {
-								slog.Debug("Accepting leadership from " + leader)
 							}
 						}
 					}
 				}
-			}
 
+			}
 		}
 	}()
 
@@ -576,7 +778,7 @@ func startListeningForConfigChanges(ctx context.Context, vClient *veritasclient.
 				}
 			case err := <-err_chan:
 				error_chan <- err
-				slog.Error("Received an error while watching variable.")
+				slog.Error("Received an error while watching variable.", "error", err)
 			}
 		}
 	}()
@@ -586,12 +788,15 @@ func startListeningForConfigChanges(ctx context.Context, vClient *veritasclient.
 
 // startUpdateGlobalTime periodically updates the global time from Veritas.
 func (pc *PartitioningController) startUpdateGlobalTime(ctx context.Context) {
+	ticker := time.NewTicker(MAX_CLOCK_TICK)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("PartitioningController global time update context done, exiting.")
 			return
-		default:
+		case <-ticker.C:
 			// Get current global time from Veritas
 			value, err := pc.vClient.GetAndAddVariable(ctx, VERITAS_TIME_SERVICE_KEY)
 			if err != nil {
@@ -614,10 +819,44 @@ func NewPartitioningController(id string, vClient *veritasclient.VeritasClient, 
 		return nil, nil, err
 	}
 
+	slog.Info("PartitioningController initializing with config from Veritas: " + value)
+
 	// Convert value to configuration
 	var config PartitioningControllerConfig
-	if err := json.Unmarshal([]byte(value), &config); err != nil {
-		return nil, nil, err
+	if value == "" || value == "{}" || len(value) < 10 { // Basic check for empty or uninitialized config
+		slog.Info("No existing PartitioningController config found in Veritas, initializing default config.")
+
+		// Initialize default config if none exists
+		config = PartitioningControllerConfig{
+			NPartitions:       1024,
+			NReplicas:         3,
+			NReads:            2,
+			NWrites:           2,
+			MServicePartition: make(map[uint32][]string),
+		}
+
+		// Save default config to Veritas
+		configBytes, err := json.Marshal(config)
+		if err != nil {
+			slog.Error("Failed to marshal default PartitioningController config.", "error", err)
+			return nil, nil, err
+		}
+
+		slog.Info("Storing default PartitioningController config in Veritas.")
+		slog.Debug(string(configBytes))
+
+		_, err = vClient.SetVariable(ctx, VERITAS_PARTITIONING_SERVICE_KEY, string(configBytes))
+		if err != nil {
+			slog.Error("Failed to set default PartitioningController config in Veritas.", "error", err)
+			return nil, nil, err
+		}
+	} else {
+		slog.Info("Existing PartitioningController config found in Veritas, loading.")
+
+		if err := json.Unmarshal([]byte(value), &config); err != nil {
+			slog.Error("Failed to unmarshal existing PartitioningController config from Veritas.", "error", err)
+			return nil, nil, err
+		}
 	}
 
 	noredb_service_handler, err := veritasclient.NewServiceRegistrationHandler(ctx, vClient, NOREDB_SERVICE_REGISTRATION_KEY)
@@ -681,9 +920,9 @@ func ColorFromBytes(data []byte) Color {
 }
 
 type Data struct {
-	x   uint16
-	y   uint16
-	val Color
+	X     uint16
+	Y     uint16
+	Value Color
 }
 
 type QuorumNotReached struct{}
@@ -740,34 +979,52 @@ func (pc *PartitioningController) getCurrentTimestamp() Timestamp {
 	}
 }
 
+// TODO revisit get and set logic and implementation!
+
 // Get retrieves data based on partitioning logic.
 func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (*Color, error) {
+	ctx, cancel := context.WithTimeout(ctx, READ_TIMEOUT)
+
 	index := pc.op_index.Add(1) // Increment operation index
 	slog.Debug(fmt.Sprintf("Starting Get operation %d for pixel (%d, %d).", index, x, y))
 
 	// Get clients for the partition
 	partitionID, err := pc.getPartition(x, y)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	clients, err := pc.getClientsForPartition(context.Background(), partitionID)
+
+	slog.Debug(fmt.Sprintf("Pixel (%d, %d) maps to partition ID %d.", x, y, partitionID))
+
+	clients, err := pc.getClientsForPartition(ctx, partitionID)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
+
+	slog.Debug(fmt.Sprintf("Retrieved clients for partition ID %d.", partitionID))
 
 	var completed_reads atomic.Uint32
 	var waiting atomic.Uint32
+	var done atomic.Uint32 // Used to signal how many workers have finished
+	done.Store(0)
 
 	var waitGroup sync.WaitGroup
-	waitGroup.Add(int(pc.config.nReads))
-	waiting.Store(pc.config.nReads) // Number of reads we wait for
+	waitGroup.Add(int(pc.config.NReads))
+	waiting.Store(pc.config.NReads) // Number of reads we wait for
 	var mu sync.Mutex
 	readValues := make([]noredbclient.PixelResponse, 0)
 	clientRead := make([]int, len(clients))
 
+	slog.Debug(fmt.Sprintf("Initiating quorum read for pixel (%d, %d) with %d reads required.", x, y, pc.config.NReads))
+
+	readctx, readCancel := context.WithCancel(ctx)
+
+	// Perform reads in parallel
 	for i, client := range clients {
 		go func(i int, client noredbclient.NoreDBClient) {
-			value_bytes, err := client.Get(ctx, index, pixelhasher.PixelToKey(x, y))
+			value_bytes, err := client.Get(readctx, index, pixelhasher.PixelToKey(x, y))
 			if err != nil {
 				slog.Error("Failed to get data from NoReDB client.", "error", err)
 
@@ -783,11 +1040,14 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 				}
 				pc.mu.Unlock()
 
+				mu.Lock()
 				// If error, do not count this as a completed read
 				if waiting.Add(1) < uint32(len(clients)) {
 					waitGroup.Add(1)
 				}
+				mu.Unlock()
 			} else {
+				slog.Debug(fmt.Sprintf("Successfully got data from NoReDB client for pixel (%d, %d).", x, y))
 				completed_reads.Add(1)
 
 				mu.Lock()
@@ -795,13 +1055,43 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 				clientRead[len(clientRead)-1] = i // Mark which client responded
 				mu.Unlock()
 			}
+
+			mu.Lock() // TODO still fails on get
+			// Signal that this read is done
+			if done.Add(1) <= waiting.Load() {
+				waitGroup.Done()
+			}
+			mu.Unlock()
 		}(i, client)
 	}
 
-	waitGroup.Wait() // Wait for all necessary reads to complete
+	slog.Debug("Waiting for a quarum to be achieved.")
+
+	// Wait for either quorum to be achieved or context to be done
+	select {
+	case <-func() chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			waitGroup.Wait()
+			close(done)
+		}()
+		return done
+	}():
+	case <-ctx.Done():
+		slog.Warn("Get operation context done before quorum could be achieved.")
+		cancel()
+		readCancel()
+		return nil, ctx.Err()
+	}
+
+	readCancel() // Cancel any remaining reads as quorum is achieved
+
+	slog.Debug("Quorum read wait completed.")
 
 	// Check if quorum is reached and return error if not
-	if uint32(completed_reads.Load()) < pc.config.nReads {
+	if uint32(completed_reads.Load()) < pc.config.NReads {
+		cancel()
+		slog.Warn(fmt.Sprintf("Quorum not reached for Get operation %d for pixel (%d, %d). Completed reads: %d", index, x, y, completed_reads.Load()))
 		return nil, &QuorumNotReached{}
 	}
 
@@ -828,6 +1118,8 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 	}
 
 	if latestValue == nil {
+		slog.Warn(fmt.Sprintf("No valid value found in quorum read for pixel (%d, %d).", x, y))
+		cancel()
 		return nil, nil // No value found
 	}
 
@@ -835,6 +1127,7 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 	if consensus {
 		slog.Debug(fmt.Sprintf("Quorum read reached consensus for pixel (%d, %d).", x, y))
 		color := ColorFromBytes(latestValue.PixelData)
+		cancel()
 		return &color, nil // All values are the same, no need for read-repair
 	}
 
@@ -851,10 +1144,10 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 	slog.Info(fmt.Sprintf("Quorum read did not reach consensus for pixel (%d, %d), performing read-repair.", x, y))
 
 	var writeComplete atomic.Uint32
-	writeComplete.Store(pc.config.nReplicas - uint32(len(clientsToWriteBack))) // Count already up-to-date replicas
+	writeComplete.Store(pc.config.NReplicas - uint32(len(clientsToWriteBack))) // Count already up-to-date replicas
 
 	var waitGroupWrite sync.WaitGroup
-	waitGroupWrite.Add(int(pc.config.nWrites - writeComplete.Load())) // Number of writes we wait for (needed to reach quorum)
+	waitGroupWrite.Add(int(pc.config.NWrites - writeComplete.Load())) // Number of writes we wait for (needed to reach quorum)
 
 	ops_completed := atomic.Uint32{}
 	ops_completed.Store(0)
@@ -880,8 +1173,9 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 	}
 	waitGroupWrite.Wait() // Wait for all write-backs to complete
 
-	if writeComplete.Load() < pc.config.nWrites {
+	if writeComplete.Load() < pc.config.NWrites {
 		slog.Warn(fmt.Sprintf("Read-repair quorum not reached for pixel (%d, %d), writes successful: %d", x, y, writeComplete.Load()))
+		cancel()
 		return nil, &QuorumNotReached{} // Indicate that read-repair quorum was not reached
 	} else {
 		slog.Info(fmt.Sprintf("Read-repair quorum reached for pixel (%d, %d), writes successful: %d", x, y, writeComplete.Load()))
@@ -889,12 +1183,15 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 	slog.Debug(fmt.Sprintf("Read-repair completed for pixel (%d, %d), writes successful: %d", x, y, writeComplete.Load()))
 
 	color := ColorFromBytes(latestValue.PixelData)
+	cancel()
 	return &color, nil
 }
 
 // Set sets data based on partitioning logic.
 func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, value Color) error {
 	index := pc.op_index.Add(1) // Get a new operation index
+
+	slog.Debug(fmt.Sprintf("Starting Set operation %d for pixel (%d, %d).", index, x, y))
 
 	// Get clients for the partition
 	partitionID, err := pc.getPartition(x, y)
@@ -906,18 +1203,23 @@ func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, v
 		return err
 	}
 
-	var completed_reads atomic.Uint32
-	var waiting atomic.Uint32
+	var mu sync.Mutex
 
+	var completed_writes atomic.Uint32
+	var waiting atomic.Uint32
+	var done atomic.Uint32 // Used to signal how many workers have finished
 	var waitGroup sync.WaitGroup
-	waitGroup.Add(int(pc.config.nWrites))
-	waiting.Store(pc.config.nWrites) // Number of writes we wait for
+	waitGroup.Add(int(pc.config.NWrites))
+	waiting.Store(pc.config.NWrites) // Number of writes we wait for
 
 	time := pc.getCurrentTimestamp()
+	slog.Debug(fmt.Sprintf("Using timestamp GlobalClock: %d, LocalClock: %d for Set operation %d for pixel (%d, %d).", time.GlobalClock, time.LocalClock, index, x, y))
+
+	writectx, writeCancel := context.WithTimeout(ctx, WRITE_TIMEOUT)
 
 	for _, client := range clients {
 		go func() {
-			err := client.Set(ctx, index, pixelhasher.PixelToKey(x, y), value.ToBytes(), time.GetTimestampBytes())
+			err := client.Set(writectx, index, pixelhasher.PixelToKey(x, y), value.ToBytes(), time.GetTimestampBytes())
 			if err != nil {
 				slog.Error("Failed to set data on NoReDB client.", "error", err)
 
@@ -935,21 +1237,34 @@ func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, v
 
 				pc.mu.Unlock()
 
+				mu.Lock()
 				// If error, do not count this as a completed write
 				if waiting.Add(1) < uint32(len(clients)) {
 					waitGroup.Add(1)
 				}
+				mu.Unlock()
 			} else {
-				completed_reads.Add(1)
+				slog.Debug(fmt.Sprintf("Successfully set data on NoReDB client for pixel (%d, %d).", x, y))
+				completed_writes.Add(1)
 			}
-			waitGroup.Done()
+
+			// Signal that this write is done
+			mu.Lock()
+			if done.Add(1) <= waiting.Load() {
+				waitGroup.Done()
+			}
+			mu.Unlock()
 		}()
 	}
 
 	waitGroup.Wait() // Wait for all necessary writes to complete
 
+	writeCancel() // Cancel any remaining writes
+
+	slog.Debug("Set operation write wait completed.")
+
 	// Check if quorum is reached and return error if not
-	if uint32(completed_reads.Load()) < pc.config.nWrites {
+	if uint32(completed_writes.Load()) < pc.config.NWrites {
 		return &QuorumNotReached{}
 	}
 
@@ -1029,7 +1344,7 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 
 	availableReplicasForPartition := make(map[uint32]int, 0)
 	// Determine available replicas for each partition
-	for partitionID := uint32(0); partitionID < pc.config.nPartitions; partitionID++ {
+	for partitionID := uint32(0); partitionID < pc.config.NPartitions; partitionID++ {
 		replicas := pc.getPartitionReplicas(partitionID)
 		availableReplicasForPartition[partitionID] = len(replicas)
 	}
@@ -1069,7 +1384,7 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 					availableReplicasForPartition[uint32(partitionID)] -= 1
 
 					// If available replicas for this partition fall below read quorum, we can not continue
-					if uint32(availableReplicasForPartition[uint32(partitionID)]) < pc.config.nReads {
+					if uint32(availableReplicasForPartition[uint32(partitionID)]) < pc.config.NReads {
 						slog.Error("Not enough replicas available for partition during GetAll, aborting.", "partition_id", partitionID)
 						errorChan <- &QuorumNotReached{}
 						// Release lock
@@ -1093,7 +1408,7 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 					responses[uint16(resp.Key)] = append(responses[uint16(resp.Key)], resp)
 
 					// Check if we have enough responses for this pixel to reach read quorum
-					if uint32(len(responses[uint16(resp.Key)])) >= pc.config.nReads {
+					if uint32(len(responses[uint16(resp.Key)])) >= pc.config.NReads {
 						done[uint16(resp.Key)] = true
 
 						// Find the value with the latest timestamp
@@ -1111,7 +1426,7 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 						}
 						if latestValue != nil {
 							x, y := pixelhasher.KeyToPixel(latestValue.Key)
-							dataChan <- Data{x: x, y: y, val: ColorFromBytes(latestValue.PixelData)}
+							dataChan <- Data{X: x, Y: y, Value: ColorFromBytes(latestValue.PixelData)}
 						}
 
 						// Remove accumulated responses for this pixel to free memory

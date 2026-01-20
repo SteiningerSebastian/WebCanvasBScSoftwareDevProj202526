@@ -9,14 +9,14 @@ $dockerfile = "./partitioning-controller/Dockerfile"
 # Pull previous image for cache (ignore errors if it doesn't exist)
 docker pull $tag1 2>$null
 
-# Build with cache
+# Build with cache (context is parent directory to include workspace modules)
 $env:DOCKER_BUILDKIT=1
 docker build --file $dockerfile `
   --cache-from $tag1 `
   --label "org.opencontainers.image.version=$version" `
   --label "org.opencontainers.image.revision=$shortSha" `
   --label "org.opencontainers.image.created=$(Get-Date -Format o)" `
-  -t $tag1 -t $tag2 ./partitioning-controller
+  -t $tag1 -t $tag2 .
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Build failed"

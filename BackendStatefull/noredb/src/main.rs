@@ -173,9 +173,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             meta: HashMap::<String, String>::new(),
         };
 
+        let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+        let namespace = match env::var("NAMESPACE") {
+            Ok(v) => v,
+            Err(_) => {
+                error!("Environment variable NAMESPACE is not set, defaulting to 'default'");
+                "default".to_string()
+            }
+        };
+        let service_name = match env::var("SERVICE_NAME") {
+            Ok(v) => v,
+            Err(_) => {
+                error!("Environment variable SERVICE_NAME is not set, defaulting to 'noredb-headless'");
+                "noredb-headless".to_string()
+            }
+        };
+
+        let fqdn = format!("{}.{}.{}.svc.cluster.local", hostname, service_name, namespace);
+        info!("Service FQDN: {}", fqdn);
+
         let mut service_endpoint = 
             ServiceEndpoint {
-                address: format!("{}", gethostname::gethostname().to_string_lossy()),
+                address: fqdn,
                 port: PORT,
                 id: unique_id_clone.to_string(),
                 timestamp: Utc::now(),

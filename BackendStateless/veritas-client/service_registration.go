@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -140,7 +141,7 @@ func (h *ServiceRegistrationHandler) handleWatchUpdates(ctx context.Context, upd
 			return
 		case err := <-errChan:
 			if err != nil {
-				fmt.Printf("Watch error: %v\n", err)
+				slog.Error("Error watching service registration for '" + h.serviceName + "': " + err.Error())
 			}
 		case update, ok := <-updateChan:
 			if !ok {
@@ -149,7 +150,7 @@ func (h *ServiceRegistrationHandler) handleWatchUpdates(ctx context.Context, upd
 
 			var serviceRegistration ServiceRegistration
 			if err := json.Unmarshal([]byte(update.NewValue), &serviceRegistration); err != nil {
-				fmt.Printf("Failed to parse service registration JSON: %v\n", err)
+				slog.Error("Failed to parse service registration JSON for key '"+h.serviceName+"': "+err.Error(), "value", update.NewValue)
 				continue
 			}
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type ClientError struct {
@@ -43,7 +44,9 @@ type NoreDBClientInterface interface {
 
 // NewNoreDBClient creates a new instance of NoreDBClient.
 func NewNoreDBClient(endpoint string) *NoreDBClient {
-	conn, err := grpc.NewClient(endpoint, grpc.EmptyDialOption{})
+	slog.Debug("Creating new NoreDBClient with endpoint: " + endpoint)
+
+	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		slog.Error(fmt.Sprintf("Failed to create gRPC client: %v\n", err))
 		return nil

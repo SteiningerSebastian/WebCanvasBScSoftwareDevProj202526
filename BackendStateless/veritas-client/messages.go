@@ -3,6 +3,8 @@ package veritasclient
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 )
 
 // ParseError represents errors that can occur during message parsing
@@ -84,6 +86,21 @@ type UpdateNotification struct {
 	OldValue string
 }
 
+var timestampRegex = regexp.MustCompile(`^\d+;.*$`)
+
+// Helper function to trim timestamp prefix from a value
+func trimTimestampPrefix(value *string) *string {
+	if value == nil {
+		return nil
+	}
+
+	if timestampRegex.MatchString(*value) {
+		trimmed := (*value)[strings.Index(*value, ";")+1:]
+		return &trimmed
+	}
+	return value
+}
+
 // ToUpdateNotification converts a WebsocketResponse into an UpdateNotification if possible.
 // Returns an error if the command type is incorrect or if any required parameters are missing.
 func (wr *WebsocketResponse) ToUpdateNotification() (*UpdateNotification, error) {
@@ -105,6 +122,10 @@ func (wr *WebsocketResponse) ToUpdateNotification() (*UpdateNotification, error)
 			}
 		}
 	}
+
+	// Remove timestamp prefixes
+	newValue = trimTimestampPrefix(newValue)
+	oldValue = trimTimestampPrefix(oldValue)
 
 	if key != nil && newValue != nil && oldValue != nil {
 		return &UpdateNotification{

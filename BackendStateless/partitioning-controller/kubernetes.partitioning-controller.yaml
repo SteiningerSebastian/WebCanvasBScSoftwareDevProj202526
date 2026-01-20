@@ -9,19 +9,21 @@ spec:
   selector:
     app: partitioning-controller
   ports:
-    - name: http
-      port: 3000
-      targetPort: 3000
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP
 ---
 kind: Deployment
 apiVersion: apps/v1
 metadata:
   name: partitioning-controller
-  namespace: default
+  namespace: default  
   labels:
     app: partitioning-controller
 spec:
   replicas: 3
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: partitioning-controller
@@ -34,8 +36,8 @@ spec:
         - name: partitioning-controller
           image: sebastiansteininger/noredb-partitioning-controller:dev
           ports:
-            - name: http
-              containerPort: 3000
+            - name: grpc
+              containerPort: 50051
               protocol: TCP
           envFrom:
             - configMapRef:
@@ -43,6 +45,12 @@ spec:
           env:
             - name: LOG_LEVEL
               value: "INFO"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_NAME
+              value: "partitioning-controller"
           resources:
             limits:
               cpu: 200m
@@ -51,23 +59,19 @@ spec:
               cpu: 50m
               memory: 64Mi
           livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-              scheme: HTTP
-            initialDelaySeconds: 15
-            timeoutSeconds: 2
-            periodSeconds: 10
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 30
+            timeoutSeconds: 5
+            periodSeconds: 20
             successThreshold: 1
             failureThreshold: 3
           readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-              scheme: HTTP
-            initialDelaySeconds: 5
-            timeoutSeconds: 2
-            periodSeconds: 5
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 10
             successThreshold: 1
             failureThreshold: 3
           imagePullPolicy: Always

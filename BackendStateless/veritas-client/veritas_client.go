@@ -569,9 +569,10 @@ func (vc *VeritasClient) WatchVariablesAutoReconnect(ctx context.Context, names 
 			for _, variable := range names {
 				value, err := vc.GetVariable(ctx, variable)
 
-				errorChan <- err
-
-				if err == nil {
+				// If there was an error during GetVariable, send it to the error channel
+				if err != nil {
+					errorChan <- err
+				} else {
 					valueChan <- UpdateNotification{
 						Key:      variable,
 						NewValue: value,
