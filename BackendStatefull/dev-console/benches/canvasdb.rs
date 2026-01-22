@@ -143,5 +143,46 @@ fn bench_canvasdb_get(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(canvasdb_benches, bench_canvasdb_get, bench_canvasdb_set);
+fn bench_canvasdb_iterate(c: &mut Criterion) {
+    let mut g = c.benchmark_group("canvasdb_iterate_pixels");
+    g.sample_size(16);
+    g.measurement_time(Duration::from_secs(15));
+
+    for &cap in &[1<<16usize, 1<<17usize, 1<<18usize] {
+        g.throughput(Throughput::Elements(cap as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(cap), &cap, |b, &cap| {
+            b.iter_batched(
+                || {
+                    let db = Arc::new(make_canvasdb(cap, 1usize, cap * 2));
+                    // Pre-populate with data
+                    for i in 0..cap as u32 {
+                        let ts = TimeStamp { bytes: (i as u128).to_le_bytes() };
+                        let entry = PixelEntry {
+                            pixel: Pixel { key: i, color: [((i & 0xFF) as u8), 0xAA, 0x55] },
+                            timestamp: ts,
+                        };
+                        db.set_pixel(entry, None);
+                    }
+
+                    // Wait for data to be moved from WAL to main store
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    
+                    db
+                },
+                |db| {
+                    let mut count = 0u64;
+                    let mut iter = db.iterate_pixels().unwrap();
+                    while let Some(_) = iter.next() {
+                        count += 1;
+                    }
+                    black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(canvasdb_benches, bench_canvasdb_iterate, bench_canvasdb_get, bench_canvasdb_set);
 criterion_main!(canvasdb_benches);
