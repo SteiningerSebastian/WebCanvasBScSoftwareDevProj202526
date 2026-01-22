@@ -128,8 +128,8 @@ impl Database for MyDatabaseServer {
         let req = request.into_inner();
         let id = req.index;
 
-        // Return an empty stream for now; populate with real keys if CanvasDB provides an iterator.
-        let (tx, rx) = mpsc::channel(4);
+        // Large buffer for high throughput streaming
+        let (tx, rx) = mpsc::channel(512);
         
         let iter = self.db.iterate_pixels().map_err(|_| {
             tonic::Status::internal("Failed to create pixel iterator")
