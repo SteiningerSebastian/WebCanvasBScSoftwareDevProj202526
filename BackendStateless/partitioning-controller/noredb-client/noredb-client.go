@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	noredb "grpc-general/noreddb"
+	"io"
 	"log/slog"
 
 	"google.golang.org/grpc"
@@ -107,7 +108,7 @@ func (c *NoreDBClient) Set(ctx context.Context, index uint32, key uint32, pixelD
 }
 
 func (c *NoreDBClient) GetAll(ctx context.Context, index uint32) (<-chan *PixelResponse, <-chan error, error) {
-	rspChan := make(chan *PixelResponse, 64) // Buffered channel for responses
+	rspChan := make(chan *PixelResponse, 8192) // Large buffered channel for high-throughput streaming
 	errChan := make(chan error)
 
 	stream, err := c.client.GetAll(ctx, &noredb.StreamRequest{
@@ -124,6 +125,11 @@ func (c *NoreDBClient) GetAll(ctx context.Context, index uint32) (<-chan *PixelR
 		for {
 			rsp, err := stream.Recv()
 			if err != nil {
+				// EOF is the normal way a stream signals completion
+				if err == io.EOF {
+					slog.Debug("GetAll stream completed successfully")
+					return
+				}
 				slog.Error(fmt.Sprintf("Error receiving from GetAll stream: %v\n", err))
 				errChan <- err
 				return // Exit the goroutine on error

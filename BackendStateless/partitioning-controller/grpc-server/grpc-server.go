@@ -52,7 +52,15 @@ func (s *GrpcServer) Set(ctx context.Context, req *partitioningcontroller.Data) 
 	}
 
 	// Perform the set operation
-	err := s.controller.Set(ctx, x, y, color)
+	doneChan, errorChan, err := s.controller.Set(ctx, x, y, color)
+
+	// Wait for either an error or the done channel to be closed. (Write achived.)
+	select {
+	case <-doneChan:
+	case e := <-errorChan:
+		err = e
+	}
+
 	if err != nil {
 		slog.Error("Failed to set pixel", "error", err)
 
@@ -85,7 +93,7 @@ func (s *GrpcServer) Get(ctx context.Context, req *partitioningcontroller.DataRe
 	y := uint16(req.Key & 0xFFFF)
 
 	// Perform the get operation
-	color, err := s.controller.Get(ctx, x, y)
+	colorChan, errChan, err := s.controller.Get(ctx, x, y)
 	if err != nil {
 		slog.Error("Failed to get pixel", "error", err)
 
@@ -98,6 +106,21 @@ func (s *GrpcServer) Get(ctx context.Context, req *partitioningcontroller.DataRe
 			}, nil
 		}
 
+		return &partitioningcontroller.DataResponse{
+			Key:    req.Key,
+			Value:  nil,
+			Status: 2, // error
+		}, nil
+	}
+
+	var color *pc.Color
+
+	// Wait for either a resposne / color or an error
+	select {
+	case col := <-colorChan:
+		color = col
+	case err := <-errChan:
+		slog.Error(err.Error())
 		return &partitioningcontroller.DataResponse{
 			Key:    req.Key,
 			Value:  nil,

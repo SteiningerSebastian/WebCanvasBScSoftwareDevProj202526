@@ -335,3 +335,27 @@ func (h *ServiceRegistrationHandler) Close() {
 		h.cancelFunc()
 	}
 }
+
+// Cleanupt old enpoints that are no longer valid.
+func (h *ServiceRegistrationHandler) TryCleanupOldEndpoints(ctx context.Context, timeout time.Duration) error {
+	reg, err := h.ResolveService(ctx)
+
+	if err != nil {
+		return err
+	}
+
+	old_reg := reg.Clone()
+
+	for i := 0; i < len(reg.Endpoints); i++ {
+		ep := reg.Endpoints[i]
+
+		// Check if the registration is timed out, if so remove it to avoid clutter.
+		if !ep.Timestamp.Add(timeout).After(time.Now()) {
+			// Remove endpoint from the list
+			reg.Endpoints = append(reg.Endpoints[:i], reg.Endpoints[i+1:]...)
+		}
+	}
+
+	// Update the service
+	return h.RegisterOrUpdateService(ctx, reg, &old_reg)
+}

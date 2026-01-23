@@ -20,6 +20,7 @@ const VERITAS_OPENTIME time.Duration = 10 * time.Second
 const SERVICE_REGISTRATION_KEY = "service-partitioning-controller"
 const SERVICE_REGISTRATION_INTERVAL = 10 * time.Second
 const SERVICE_REGISTRATION_TIMEOUT = 30 * time.Second
+const SERVICE_REGISTRATION_DELEATION_TIMEOUT = 5 * time.Minute // After this timeout endpoints are removed to avoid clutter
 
 // handleServiceRegistration manages the registration and periodic endpoint updates for the service.
 func handleServiceRegistration(ctx context.Context, handler *veritasclient.ServiceRegistrationHandler) (chan<- error, error) {
@@ -50,6 +51,9 @@ func handleServiceRegistration(ctx context.Context, handler *veritasclient.Servi
 				slog.Info("Service registration handler context done, exiting endpoint update loop.")
 				return
 			default:
+				// Try to cleanup old endpoints
+				handler.TryCleanupOldEndpoints(ctx, SERVICE_REGISTRATION_DELEATION_TIMEOUT)
+
 				time.Sleep(SERVICE_REGISTRATION_INTERVAL)
 
 				namespace := os.Getenv("NAMESPACE")

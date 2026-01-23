@@ -979,56 +979,90 @@ func (pc *PartitioningController) getCurrentTimestamp() Timestamp {
 	}
 }
 
-// TODO revisit get and set logic and implementation!
+// Returns the most current pixel response, and how many share this value
+func getMostCurrentVersion(readValues []*noredbclient.PixelResponse) (*noredbclient.PixelResponse, int) {
+	var latestValue *noredbclient.PixelResponse
+	consensus := 1
+
+	for _, val := range readValues {
+		if latestValue == nil {
+			latestValue = val
+		} else {
+			ts_current := TimestampFromBytes(val.Timestamp)
+			ts_latest := TimestampFromBytes(latestValue.Timestamp)
+
+			// Check for consensus
+			if ts_current.Cmp(&ts_latest) != 0 {
+				consensus = 0
+			} else {
+				consensus++
+			}
+
+			if ts_current.Cmp(&ts_latest) > 0 {
+				latestValue = val
+			}
+		}
+	}
+
+	return latestValue, consensus
+}
+
+type NoValidResponseReceived struct{}
+
+func (n *NoValidResponseReceived) Error() string {
+	return "No valid response was received."
+}
 
 // Get retrieves data based on partitioning logic.
-func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (*Color, error) {
-	ctx, cancel := context.WithTimeout(ctx, READ_TIMEOUT)
-
+func (pc *PartitioningController) Get(parent_ctx context.Context, x uint16, y uint16) (<-chan *Color, <-chan error, error) {
 	index := pc.op_index.Add(1) // Increment operation index
 	slog.Debug(fmt.Sprintf("Starting Get operation %d for pixel (%d, %d).", index, x, y))
 
 	// Get clients for the partition
 	partitionID, err := pc.getPartition(x, y)
 	if err != nil {
-		cancel()
-		return nil, err
+		return nil, nil, err
 	}
 
 	slog.Debug(fmt.Sprintf("Pixel (%d, %d) maps to partition ID %d.", x, y, partitionID))
 
+	ctx, cancel := context.WithTimeout(parent_ctx, READ_TIMEOUT)
+	defer cancel()
+
 	clients, err := pc.getClientsForPartition(ctx, partitionID)
 	if err != nil {
-		cancel()
-		return nil, err
+		return nil, nil, err
 	}
 
 	slog.Debug(fmt.Sprintf("Retrieved clients for partition ID %d.", partitionID))
 
-	var completed_reads atomic.Uint32
-	var waiting atomic.Uint32
-	var done atomic.Uint32 // Used to signal how many workers have finished
-	done.Store(0)
+	doneChan := make(chan *Color)
+	errorChan := make(chan error)
 
+	var completed_reads atomic.Uint32
+
+	// To wait for all clients that may respond and issue a read repair when we receive a response
 	var waitGroup sync.WaitGroup
-	waitGroup.Add(int(pc.config.NReads))
-	waiting.Store(pc.config.NReads) // Number of reads we wait for
+
 	var mu sync.Mutex
-	readValues := make([]noredbclient.PixelResponse, 0)
+
+	readValues := make([]*noredbclient.PixelResponse, 0)
 	clientRead := make([]int, len(clients))
 
 	slog.Debug(fmt.Sprintf("Initiating quorum read for pixel (%d, %d) with %d reads required.", x, y, pc.config.NReads))
 
-	readctx, readCancel := context.WithCancel(ctx)
-
 	// Perform reads in parallel
 	for i, client := range clients {
+		waitGroup.Add(1)
 		go func(i int, client noredbclient.NoreDBClient) {
-			value_bytes, err := client.Get(readctx, index, pixelhasher.PixelToKey(x, y))
+			ctx, cancel := context.WithTimeout(parent_ctx, READ_TIMEOUT)
+			defer cancel()
+
+			value_bytes, err := client.Get(ctx, index, pixelhasher.PixelToKey(x, y))
 			if err != nil {
 				slog.Error("Failed to get data from NoReDB client.", "error", err)
 
-				// Remove client
+				// Remove client if it is non-responsive or not working correctly
 				pc.mu.Lock()
 				client.Close()
 				// Find and delete the client from the map
@@ -1039,186 +1073,158 @@ func (pc *PartitioningController) Get(ctx context.Context, x uint16, y uint16) (
 					}
 				}
 				pc.mu.Unlock()
-
-				mu.Lock()
-				// If error, do not count this as a completed read
-				if waiting.Add(1) < uint32(len(clients)) {
-					waitGroup.Add(1)
-				}
-				mu.Unlock()
 			} else {
 				slog.Debug(fmt.Sprintf("Successfully got data from NoReDB client for pixel (%d, %d).", x, y))
-				completed_reads.Add(1)
 
 				mu.Lock()
-				readValues = append(readValues, *value_bytes)
+
+				// If a quorum is reached we notify the listener
+				if completed_reads.Add(1) == pc.config.NReads {
+					latestValue, agree := getMostCurrentVersion(readValues)
+
+					// If enough instances agree on the most current value, we can safly return
+					// it before the read repair is started.
+					if agree >= int(pc.config.NWrites) {
+						slog.Debug("Reached read quorum befor all instances have returned a value.")
+
+						color := ColorFromBytes(latestValue.PixelData)
+						doneChan <- &color // Send the color to the listener.
+					}
+				}
+
+				readValues = append(readValues, value_bytes)
 				clientRead[len(clientRead)-1] = i // Mark which client responded
 				mu.Unlock()
 			}
 
-			mu.Lock() // TODO still fails on get
-			// Signal that this read is done
-			if done.Add(1) <= waiting.Load() {
-				waitGroup.Done()
-			}
-			mu.Unlock()
+			waitGroup.Done()
 		}(i, client)
 	}
 
 	slog.Debug("Waiting for a quarum to be achieved.")
 
-	// Wait for either quorum to be achieved or context to be done
-	select {
-	case <-func() chan struct{} {
-		done := make(chan struct{})
-		go func() {
-			waitGroup.Wait()
-			close(done)
-		}()
-		return done
-	}():
-	case <-ctx.Done():
-		slog.Warn("Get operation context done before quorum could be achieved.")
-		cancel()
-		readCancel()
-		return nil, ctx.Err()
-	}
+	go func() {
+		// Wait for either quorum to be achieved or context to be done
+		waitGroup.Wait()
 
-	readCancel() // Cancel any remaining reads as quorum is achieved
+		slog.Debug("Quorum read wait completed.")
 
-	slog.Debug("Quorum read wait completed.")
+		// Check if quorum is reached and return error if not
+		if uint32(completed_reads.Load()) < pc.config.NReads {
+			slog.Warn(fmt.Sprintf("Quorum not reached for Get operation %d for pixel (%d, %d). Completed reads: %d", index, x, y, completed_reads.Load()))
+			errorChan <- &QuorumNotReached{}
+		}
 
-	// Check if quorum is reached and return error if not
-	if uint32(completed_reads.Load()) < pc.config.NReads {
-		cancel()
-		slog.Warn(fmt.Sprintf("Quorum not reached for Get operation %d for pixel (%d, %d). Completed reads: %d", index, x, y, completed_reads.Load()))
-		return nil, &QuorumNotReached{}
-	}
+		// Find the value with the latest timestamp
+		latestValue, consensus := getMostCurrentVersion(readValues)
 
-	// Find the value with the latest timestamp
-	var latestValue *noredbclient.PixelResponse
-	consensus := true // Assume consensus until proven otherwise (all read values are the same)
-
-	for _, val := range readValues {
 		if latestValue == nil {
-			latestValue = &val
-		} else {
-			ts_current := TimestampFromBytes(val.Timestamp)
-			ts_latest := TimestampFromBytes(latestValue.Timestamp)
-
-			// Check for consensus
-			if ts_current.Cmp(&ts_latest) != 0 {
-				consensus = false
-			}
-
-			if ts_current.Cmp(&ts_latest) > 0 {
-				latestValue = &val
-			}
+			slog.Warn(fmt.Sprintf("No valid value found in quorum read for pixel (%d, %d).", x, y))
+			errorChan <- &NoValidResponseReceived{}
 		}
-	}
 
-	if latestValue == nil {
-		slog.Warn(fmt.Sprintf("No valid value found in quorum read for pixel (%d, %d).", x, y))
-		cancel()
-		return nil, nil // No value found
-	}
+		// If not all clients agree on the same value
+		if consensus != len(clients) {
+			// Create new context for writeback
+			ctx, cancel = context.WithTimeout(parent_ctx, WRITE_TIMEOUT)
+			defer cancel()
 
-	// If consensus is reached, return the value directly
-	if consensus {
-		slog.Debug(fmt.Sprintf("Quorum read reached consensus for pixel (%d, %d).", x, y))
-		color := ColorFromBytes(latestValue.PixelData)
-		cancel()
-		return &color, nil // All values are the same, no need for read-repair
-	}
-
-	clientsToWriteBack := make([]int, 0)
-	for i, val := range readValues {
-		ts_current := TimestampFromBytes(val.Timestamp)
-		ts_latest := TimestampFromBytes(latestValue.Timestamp)
-		if ts_current.Cmp(&ts_latest) != 0 {
-			clientsToWriteBack = append(clientsToWriteBack, i)
-		}
-	}
-
-	// Perform read-repair to update stale replicas
-	slog.Info(fmt.Sprintf("Quorum read did not reach consensus for pixel (%d, %d), performing read-repair.", x, y))
-
-	var writeComplete atomic.Uint32
-	writeComplete.Store(pc.config.NReplicas - uint32(len(clientsToWriteBack))) // Count already up-to-date replicas
-
-	var waitGroupWrite sync.WaitGroup
-	waitGroupWrite.Add(int(pc.config.NWrites - writeComplete.Load())) // Number of writes we wait for (needed to reach quorum)
-
-	ops_completed := atomic.Uint32{}
-	ops_completed.Store(0)
-
-	// Write back the latest value to all replicas to ensure consistency (read-repair)
-	for _, clientIndex := range clientsToWriteBack {
-		client := clients[clientIndex] // Get the corresponding client that needs to be updated
-		go func() {
-			err := client.Set(ctx, index, pixelhasher.PixelToKey(x, y), latestValue.PixelData, latestValue.Timestamp)
-			if err != nil {
-				slog.Error("Failed to write back data to NoReDB client during read-repair.", "error", err)
-
-				// If error, do not count this as a completed write
-				if ops_completed.Add(1) < uint32(len(clientsToWriteBack)) {
-					waitGroupWrite.Add(1)
+			// Check which clients need to be updated / have stall values.
+			clientsToWriteBack := make([]int, 0)
+			for i, val := range readValues {
+				ts_current := TimestampFromBytes(val.Timestamp)
+				ts_latest := TimestampFromBytes(latestValue.Timestamp)
+				if ts_current.Cmp(&ts_latest) != 0 {
+					clientsToWriteBack = append(clientsToWriteBack, i)
 				}
-			} else {
-				writeComplete.Add(1)
-				ops_completed.Add(1)
 			}
-			waitGroupWrite.Done()
-		}()
-	}
-	waitGroupWrite.Wait() // Wait for all write-backs to complete
 
-	if writeComplete.Load() < pc.config.NWrites {
-		slog.Warn(fmt.Sprintf("Read-repair quorum not reached for pixel (%d, %d), writes successful: %d", x, y, writeComplete.Load()))
-		cancel()
-		return nil, &QuorumNotReached{} // Indicate that read-repair quorum was not reached
-	} else {
-		slog.Info(fmt.Sprintf("Read-repair quorum reached for pixel (%d, %d), writes successful: %d", x, y, writeComplete.Load()))
-	}
-	slog.Debug(fmt.Sprintf("Read-repair completed for pixel (%d, %d), writes successful: %d", x, y, writeComplete.Load()))
+			// Perform read-repair to update stale replicas
+			slog.Info(fmt.Sprintf("Quorum read did not reach consensus for pixel (%d, %d), performing read-repair.", x, y))
 
-	color := ColorFromBytes(latestValue.PixelData)
-	cancel()
-	return &color, nil
+			var writeCompleted atomic.Uint32
+			writeCompleted.Store(pc.config.NReplicas - uint32(len(clientsToWriteBack))) // Count already up-to-date replicas
+
+			var waitGroupWrite sync.WaitGroup
+
+			// Write back the latest value to all replicas to ensure consistency (read-repair)
+			for _, clientIndex := range clientsToWriteBack {
+				waitGroupWrite.Add(1)
+				client := clients[clientIndex] // Get the corresponding client that needs to be updated
+				go func() {
+					err := client.Set(ctx, index, pixelhasher.PixelToKey(x, y), latestValue.PixelData, latestValue.Timestamp)
+					if err != nil {
+						slog.Error("Failed to write back data to NoReDB client during read-repair.", "error", err)
+					} else {
+						writeCompleted.Add(1)
+					}
+					waitGroupWrite.Done()
+				}()
+			}
+			waitGroupWrite.Wait() // Wait for all write-backs to complete
+
+			if writeCompleted.Load() < pc.config.NWrites {
+				slog.Warn(fmt.Sprintf("Read-repair quorum not reached for pixel (%d, %d), writes successful: %d", x, y, writeCompleted.Load()))
+				errorChan <- &QuorumNotReached{} // Quorum could not not reached.
+			} else {
+				slog.Info(fmt.Sprintf("Read-repair quorum reached for pixel (%d, %d), writes successful: %d", x, y, writeCompleted.Load()))
+				color := ColorFromBytes(latestValue.PixelData)
+				doneChan <- &color // Quorum was reached
+			}
+
+			slog.Debug(fmt.Sprintf("Read-repair completed for pixel (%d, %d), writes successful: %d", x, y, writeCompleted.Load()))
+		} else {
+			color := ColorFromBytes(latestValue.PixelData)
+			doneChan <- &color
+		}
+
+		// Close the channels
+		close(doneChan)
+		close(errorChan)
+	}()
+
+	return doneChan, errorChan, nil
 }
 
 // Set sets data based on partitioning logic.
-func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, value Color) error {
+func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, value Color) (<-chan struct{}, <-chan error, error) {
 	index := pc.op_index.Add(1) // Get a new operation index
 
 	slog.Debug(fmt.Sprintf("Starting Set operation %d for pixel (%d, %d).", index, x, y))
 
+	// A chanel that is closed as soon as we reach quorum
+	doneChan := make(chan struct{})
+	errorChan := make(chan error)
+
 	// Get clients for the partition
 	partitionID, err := pc.getPartition(x, y)
 	if err != nil {
-		return err
-	}
-	clients, err := pc.getClientsForPartition(context.Background(), partitionID)
-	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	var mu sync.Mutex
+	clients, err := pc.getClientsForPartition(ctx, partitionID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(clients) < int(pc.config.NWrites) {
+		slog.Error("Unable to reach quorum, not enough instances online.")
+		return nil, nil, &QuorumNotReached{}
+	}
 
 	var completed_writes atomic.Uint32
-	var waiting atomic.Uint32
-	var done atomic.Uint32 // Used to signal how many workers have finished
 	var waitGroup sync.WaitGroup
-	waitGroup.Add(int(pc.config.NWrites))
-	waiting.Store(pc.config.NWrites) // Number of writes we wait for
 
 	time := pc.getCurrentTimestamp()
 	slog.Debug(fmt.Sprintf("Using timestamp GlobalClock: %d, LocalClock: %d for Set operation %d for pixel (%d, %d).", time.GlobalClock, time.LocalClock, index, x, y))
 
-	writectx, writeCancel := context.WithTimeout(ctx, WRITE_TIMEOUT)
-
+	// Write to all clients
 	for _, client := range clients {
+		waitGroup.Add(1)
 		go func() {
+			writectx, writecancel := context.WithTimeout(ctx, WRITE_TIMEOUT)
+			defer writecancel()
+
 			err := client.Set(writectx, index, pixelhasher.PixelToKey(x, y), value.ToBytes(), time.GetTimestampBytes())
 			if err != nil {
 				slog.Error("Failed to set data on NoReDB client.", "error", err)
@@ -1236,40 +1242,44 @@ func (pc *PartitioningController) Set(ctx context.Context, x uint16, y uint16, v
 				}
 
 				pc.mu.Unlock()
-
-				mu.Lock()
-				// If error, do not count this as a completed write
-				if waiting.Add(1) < uint32(len(clients)) {
-					waitGroup.Add(1)
-				}
-				mu.Unlock()
 			} else {
 				slog.Debug(fmt.Sprintf("Successfully set data on NoReDB client for pixel (%d, %d).", x, y))
-				completed_writes.Add(1)
+				if completed_writes.Add(1) == pc.config.NWrites {
+					slog.Info(fmt.Sprintf("Reached quorum for write for pixel (%d, %d).", x, y))
+					close(doneChan) // quorum achived, close channel
+				}
 			}
 
-			// Signal that this write is done
-			mu.Lock()
-			if done.Add(1) <= waiting.Load() {
-				waitGroup.Done()
-			}
-			mu.Unlock()
+			waitGroup.Done()
 		}()
 	}
 
-	waitGroup.Wait() // Wait for all necessary writes to complete
+	// Wait for the writes to finish or time out.
+	go func() {
+		waitGroup.Wait() // Wait for operations to finish or time out
 
-	writeCancel() // Cancel any remaining writes
+		slog.Debug("Set operation write wait completed.")
 
-	slog.Debug("Set operation write wait completed.")
+		// Check if quorum is reached and return error if not
+		if uint32(completed_writes.Load()) < pc.config.NWrites {
+			slog.Error(fmt.Sprintf("Unable to achive quorum during writes, operation timed out. Wrote completed with %d db-servers.", completed_writes.Load()))
+			errorChan <- &QuorumNotReached{}
+		}
 
-	// Check if quorum is reached and return error if not
-	if uint32(completed_writes.Load()) < pc.config.NWrites {
-		return &QuorumNotReached{}
-	}
+		// Close all channels
 
-	// Placeholder for setting data based on partitioning
-	return nil
+		// Ensure doneChan is closed (if not already closed)
+		select {
+		case <-doneChan:
+		default:
+			close(doneChan)
+		}
+
+		// Close errorChan
+		close(errorChan)
+	}()
+
+	return doneChan, errorChan, nil
 }
 
 type errorWithIndex struct {
@@ -1303,8 +1313,8 @@ func mergeDataChannels(channels []<-chan *noredbclient.PixelResponse) <-chan *no
 	go func() {
 		defer close(merged)
 		var wg sync.WaitGroup
-		wg.Add(len(channels))
 		for _, ch := range channels {
+			wg.Add(1)
 			go func(c <-chan *noredbclient.PixelResponse) {
 				defer wg.Done()
 				for data := range c {
@@ -1355,13 +1365,22 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 	responses := make(map[uint16][]*noredbclient.PixelResponse, 0)
 	done := make(map[uint16]bool, 0)
 
+	// Merge channels once before the loop
+	mergedErrChan := mergeErrorChannels(errChannels)
+	mergedDataChan := mergeDataChannels(channels)
+
 	go func() {
 		defer close(dataChan)
 
 		// Merge data from all clients for this partition
 		for {
 			select {
-			case errorWithIndex := <-mergeErrorChannels(errChannels):
+			case errorWithIndex, ok := <-mergedErrChan:
+				if !ok {
+					// Error channel closed, ignore
+					mergedErrChan = nil
+					continue
+				}
 				err := errorWithIndex.err
 				idx := errorWithIndex.index
 
@@ -1395,7 +1414,7 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 
 				// Release lock
 				pc.mu.Unlock()
-			case resp, ok := <-mergeDataChannels(channels):
+			case resp, ok := <-mergedDataChan:
 				if !ok {
 					// All channels are closed
 					slog.Info("All NoReDB client data channels closed during GetAll.")
@@ -1413,20 +1432,35 @@ func (pc *PartitioningController) GetAll(ctx context.Context) (<-chan Data, <-ch
 
 						// Find the value with the latest timestamp
 						var latestValue *noredbclient.PixelResponse
-						for _, val := range responses[uint16(resp.Key)] {
-							if latestValue == nil {
-								latestValue = val
-							} else {
-								ts_current := TimestampFromBytes(val.Timestamp)
-								ts_latest := TimestampFromBytes(latestValue.Timestamp)
-								if ts_current.Cmp(&ts_latest) > 0 {
-									latestValue = val
-								}
-							}
-						}
-						if latestValue != nil {
+						li := responses[uint16(resp.Key)]
+						latestValue, consensus := getMostCurrentVersion(li)
+
+						if consensus >= int(pc.config.NWrites) && latestValue != nil {
 							x, y := pixelhasher.KeyToPixel(latestValue.Key)
 							dataChan <- Data{X: x, Y: y, Value: ColorFromBytes(latestValue.PixelData)}
+						} else {
+							// Trigger read repair
+							slog.Info(fmt.Sprintf("Detected stale values, doing a full read to repair data. key:%d", latestValue.Key))
+
+							// Trigger a full normal read to repair the values.
+							go func() {
+								x, y := pixelhasher.KeyToPixel(latestValue.Key)
+								cChan, eChan, err := pc.Get(ctx, x, y)
+
+								if err != nil {
+									slog.Error("Unable to repair cluster.")
+									errorChan <- err
+									return
+								}
+
+								select {
+								case color := <-cChan:
+									// We can only return the data here as if we would simply return without repairing we could break consistency
+									dataChan <- Data{x, y, *color}
+								case err := <-eChan:
+									errorChan <- err
+								}
+							}()
 						}
 
 						// Remove accumulated responses for this pixel to free memory
