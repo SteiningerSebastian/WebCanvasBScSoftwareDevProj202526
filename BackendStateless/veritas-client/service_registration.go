@@ -244,58 +244,66 @@ func (h *ServiceRegistrationHandler) RegisterOrUpdateService(ctx context.Context
 
 // RegisterOrUpdateEndpoint registers or updates a service endpoint
 func (h *ServiceRegistrationHandler) RegisterOrUpdateEndpoint(ctx context.Context, endpoint *ServiceEndpoint) error {
-	// Get current service registration
-	current, err := h.ResolveService(ctx)
-	if err != nil {
-		return err
-	}
+	// Retry logic for compare-and-set conflicts
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Get current service registration
+		current, err := h.ResolveService(ctx)
+		if err != nil {
+			return err
+		}
 
-	// Create updated service registration
-	updated := *current
-	updated.Endpoints = make([]ServiceEndpoint, len(current.Endpoints))
-	copy(updated.Endpoints, current.Endpoints)
+		// Create updated service registration
+		updated := *current
+		updated.Endpoints = make([]ServiceEndpoint, len(current.Endpoints))
+		copy(updated.Endpoints, current.Endpoints)
 
-	// Check if endpoint already exists
-	found := false
-	for i, ep := range updated.Endpoints {
-		if ep.ID == endpoint.ID {
-			updated.Endpoints[i] = *endpoint
-			found = true
-			break
+		// Check if endpoint already exists
+		found := false
+		for i, ep := range updated.Endpoints {
+			if ep.ID == endpoint.ID {
+				updated.Endpoints[i] = *endpoint
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			updated.Endpoints = append(updated.Endpoints, *endpoint)
+		}
+
+		// Convert to JSON
+		jsonBytes, err := json.Marshal(&updated)
+		if err != nil {
+			return ErrEndpointRegistrationFailed
+		}
+		jsonStr := string(jsonBytes)
+
+		oldJSONBytes, err := json.Marshal(current)
+		if err != nil {
+			return ErrEndpointRegistrationFailed
+		}
+		oldJSON := string(oldJSONBytes)
+
+		// Use CompareAndSetVariable to update the service registration atomically
+		success, err := h.client.CompareAndSetVariable(ctx, h.serviceName, oldJSON, jsonStr)
+		if err != nil {
+			return ErrEndpointRegistrationFailed
+		}
+		if success {
+			h.mu.Lock()
+			h.currentRegistration = &updated
+			h.mu.Unlock()
+			return nil
+		}
+
+		// CompareAndSet failed, retry after a short delay
+		if attempt < maxRetries-1 {
+			time.Sleep(time.Millisecond * 50 * time.Duration(attempt+1))
 		}
 	}
 
-	if !found {
-		updated.Endpoints = append(updated.Endpoints, *endpoint)
-	}
-
-	// Convert to JSON
-	jsonBytes, err := json.Marshal(&updated)
-	if err != nil {
-		return ErrEndpointRegistrationFailed
-	}
-	jsonStr := string(jsonBytes)
-
-	oldJSONBytes, err := json.Marshal(current)
-	if err != nil {
-		return ErrEndpointRegistrationFailed
-	}
-	oldJSON := string(oldJSONBytes)
-
-	// Use CompareAndSetVariable to update the service registration atomically
-	success, err := h.client.CompareAndSetVariable(ctx, h.serviceName, oldJSON, jsonStr)
-	if err != nil {
-		return ErrEndpointRegistrationFailed
-	}
-	if !success {
-		return ErrServiceRegistrationChanged
-	}
-
-	h.mu.Lock()
-	h.currentRegistration = &updated
-	h.mu.Unlock()
-
-	return nil
+	return ErrServiceRegistrationChanged
 }
 
 // AddListener adds a listener for service registration updates
@@ -338,24 +346,43 @@ func (h *ServiceRegistrationHandler) Close() {
 
 // Cleanupt old enpoints that are no longer valid.
 func (h *ServiceRegistrationHandler) TryCleanupOldEndpoints(ctx context.Context, timeout time.Duration) error {
-	reg, err := h.ResolveService(ctx)
+	// Retry logic for compare-and-set conflicts
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		reg, err := h.ResolveService(ctx)
+		if err != nil {
+			return err
+		}
 
-	if err != nil {
+		old_reg := reg.Clone()
+
+		// Filter out expired endpoints
+		validEndpoints := make([]ServiceEndpoint, 0, len(reg.Endpoints))
+		for _, ep := range reg.Endpoints {
+			// Check if the registration is timed out, if so remove it to avoid clutter.
+			if ep.Timestamp.Add(timeout).After(time.Now()) {
+				validEndpoints = append(validEndpoints, ep)
+			}
+		}
+
+		// If no endpoints were removed, no need to update
+		if len(validEndpoints) == len(reg.Endpoints) {
+			return nil
+		}
+
+		reg.Endpoints = validEndpoints
+
+		// Update the service
+		err = h.RegisterOrUpdateService(ctx, reg, &old_reg)
+		if err == ErrServiceRegistrationChanged {
+			// Retry on conflict
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Millisecond * 100 * time.Duration(attempt+1))
+				continue
+			}
+		}
 		return err
 	}
 
-	old_reg := reg.Clone()
-
-	for i := 0; i < len(reg.Endpoints); i++ {
-		ep := reg.Endpoints[i]
-
-		// Check if the registration is timed out, if so remove it to avoid clutter.
-		if !ep.Timestamp.Add(timeout).After(time.Now()) {
-			// Remove endpoint from the list
-			reg.Endpoints = append(reg.Endpoints[:i], reg.Endpoints[i+1:]...)
-		}
-	}
-
-	// Update the service
-	return h.RegisterOrUpdateService(ctx, reg, &old_reg)
+	return ErrServiceRegistrationChanged
 }

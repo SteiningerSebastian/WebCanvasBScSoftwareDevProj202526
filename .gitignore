@@ -22,3 +22,18 @@ target
 
 # Ignore all *.ignore.* files - make it easier to manage temporary ignore files for testing / refactoring
 *.ignore.*
+/BackendStateless/WebCanvas/.vs/WebCanvas.slnx
+/BackendStateless/WebCanvas/WebCanvas/obj
+/BackendStateless/WebCanvas/.vs/WebCanvas/CopilotIndices/18.0.988.22099
+/BackendStateless/WebCanvas/VeritasClient/obj
+/BackendStateless/WebCanvas/.vs/CopilotSnapshots/C8E735C0B6D3DB45B60E343AA72F5040
+/BackendStateless/WebCanvas/NoredbPartitioningControllerClient/obj
+/BackendStateless/WebCanvas/.vs/CopilotSnapshots
+/BackendStateless/WebCanvas/.vs/ProjectEvaluation
+/BackendStateless/WebCanvas/VeritasClientTests/obj
+/BackendStateless/WebCanvas/WebCanvasTests/obj
+/BackendStateless/WebCanvas/NoredbPartitioningControllerClient/bin/Release/net10.0
+/BackendStateless/WebCanvas/VeritasClient/bin/Release/net10.0
+/BackendStateless/WebCanvas/VeritasClientTests/bin/Release/net10.0
+/BackendStateless/WebCanvas/WebCanvas/bin/Release/net10.0
+/BackendStateless/WebCanvas/WebCanvasTests/bin/Release/net10.0
