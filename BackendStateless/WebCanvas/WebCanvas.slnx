@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="NoredbPartitioningControllerClient/NoredbPartitioningControllerClient.csproj" />
+  <Project Path="VeritasClient/VeritasClient.csproj" />
+  <Project Path="VeritasClientTests/VeritasClientTests.csproj" />
+  <Project Path="WebCanvas/WebCanvas.csproj" />
+  <Project Path="WebCanvasTests/WebCanvasTests.csproj" Id="47677941-495d-4bab-b409-793139ae2eae" />
+</Solution>
