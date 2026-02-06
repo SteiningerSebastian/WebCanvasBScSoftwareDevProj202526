@@ -17,7 +17,7 @@ public class ServiceRegistrationService : BackgroundService
     private readonly ServiceRegistrationOptions _options;
     private readonly ILogger<ServiceRegistrationService> _logger;
     private readonly IHostApplicationLifetime _lifetime;
-    private ServiceRegistrationHandler? _registrationHandler;
+    private IServiceRegistration? _registrationHandler;
     private ServiceEndpoint? _currentEndpoint;
     private string? _serverAddress;
     private int _serverPort;
@@ -27,12 +27,14 @@ public class ServiceRegistrationService : BackgroundService
         IOptions<ServiceRegistrationOptions> options,
         ILogger<ServiceRegistrationService> logger,
         IHostApplicationLifetime lifetime,
+        IServiceRegistration serviceRegistration,
         IConfiguration configuration)
     {
         _veritasClient = veritasClient ?? throw new ArgumentNullException(nameof(veritasClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _lifetime = lifetime ?? throw new ArgumentNullException(nameof(lifetime));
+        _registrationHandler = serviceRegistration ?? throw new ArgumentNullException(nameof(serviceRegistration));
 
         // Extract port from configuration
         var urls = configuration.GetValue<string>("ASPNETCORE_URLS") 
@@ -57,10 +59,6 @@ public class ServiceRegistrationService : BackgroundService
             _logger.LogDebug(
                 "Creating ServiceRegistrationHandler for {ServiceName}.",
                 _options.ServiceName);
-            _registrationHandler = new ServiceRegistrationHandler(
-                _veritasClient,
-                $"service-{_options.ServiceName}",
-                logError: msg => _logger.LogError(msg));
 
             // Determine the endpoint address
             _logger.LogDebug("Determining endpoint address...");
@@ -125,44 +123,70 @@ public class ServiceRegistrationService : BackgroundService
         {
             _logger.LogDebug("UsePodHostname is enabled, checking for Kubernetes environment");
             
-            // In Kubernetes, use the pod hostname (FQDN)
-            var hostname = Environment.GetEnvironmentVariable("HOSTNAME");
-            var podNamespace = Environment.GetEnvironmentVariable("POD_NAMESPACE");
+            // In Kubernetes, use the pod IP address for direct pod-to-pod communication
+            var podIp = Environment.GetEnvironmentVariable("POD_IP");
+            var podName = Environment.GetEnvironmentVariable("POD_NAME");
             
             _logger.LogDebug(
-                "Environment variables: HOSTNAME={Hostname}, POD_NAMESPACE={PodNamespace}",
-                hostname ?? "(not set)",
-                podNamespace ?? "(not set)");
+                "Environment variables: POD_IP={PodIp}, POD_NAME={PodName}",
+                podIp ?? "(not set)",
+                podName ?? "(not set)");
             
-            if (!string.IsNullOrWhiteSpace(hostname))
+            if (!string.IsNullOrWhiteSpace(podIp))
             {
-                // Get namespace from environment or default to "default"
-                var namespace_ = podNamespace ?? "default";
-                
-                // Construct FQDN: pod-name.service-name.namespace.svc.cluster.local
-                // Assuming the service name matches the ServiceName in options
-                var fqdn = $"{hostname}.{_options.ServiceName.ToLowerInvariant()}-headless.{namespace_}.svc.cluster.local";
-                
                 _logger.LogInformation(
-                    "Using Kubernetes FQDN: {FQDN} (hostname={Hostname}, service={ServiceName}, namespace={Namespace})",
-                    fqdn,
-                    hostname,
-                    _options.ServiceName,
-                    namespace_);
-                return fqdn;
+                    "Using Kubernetes Pod IP: {PodIp} (pod name: {PodName})",
+                    podIp,
+                    podName ?? "unknown");
+                return podIp;
             }
             
-            _logger.LogWarning("HOSTNAME environment variable not found, falling back to local hostname");
+            _logger.LogWarning("POD_IP environment variable not found, falling back to local IP detection");
+            
+            // Fallback: try to detect local IP
+            try
+            {
+                var localIp = GetLocalIpAddress();
+                if (localIp != null)
+                {
+                    _logger.LogInformation("Using detected local IP: {LocalIp}", localIp);
+                    return localIp;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to detect local IP address");
+            }
         }
         else
         {
             _logger.LogDebug("UsePodHostname is disabled, using local hostname");
         }
 
-        // Fallback to local hostname
+        // Final fallback to local hostname
         var localHostname = System.Net.Dns.GetHostName();
         _logger.LogInformation("Using hostname: {Hostname}", localHostname);
         return localHostname;
+    }
+
+    private string? GetLocalIpAddress()
+    {
+        try
+        {
+            var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+            foreach (var ip in host.AddressList)
+            {
+                if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    return ip.ToString();
+                }
+            }
+        }
+        catch
+        {
+            // Ignore errors
+        }
+        return null;
     }
 
     private int ExtractPortFromUrl(string urls)
@@ -325,9 +349,7 @@ public class ServiceRegistrationService : BackgroundService
     public override void Dispose()
     {
         _logger.LogInformation("Disposing service registration service");
-        
-        _registrationHandler?.Dispose();
-        
+                
         base.Dispose();
     }
 }

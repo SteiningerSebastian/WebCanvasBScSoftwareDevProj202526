@@ -9,11 +9,11 @@
         /// <summary>
         /// Broadcast a cache invalidation to all connected peer instances.
         /// </summary>
-        Task BroadcastInvalidationAsync(uint key, string instanceId, CancellationToken cancellationToken = default);
+        Task BroadcastInvalidationAsync(uint key, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Subscribe to cache invalidation messages from peers.
         /// </summary>
-        void Subscribe(Func<uint, string, Task> onInvalidation);
+        void Subscribe(Func<uint, Task> onInvalidation);
     }
 }

@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
 using Microsoft.AspNetCore.SignalR.Client;
 using VeritasClient.ServiceRegistration;
 
@@ -9,11 +11,17 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
     private readonly IServiceRegistration _serviceRegistration;
     private readonly ILogger<PeerConnectionService> _logger;
     private readonly string _instanceId;
-    private readonly ConcurrentDictionary<string, HubConnection> _peerConnections = new();
-    private readonly ConcurrentBag<Func<uint, string, Task>> _subscribers = new();
+    private readonly ConcurrentDictionary<string, TcpClient> _peerConnections = new();
+    private readonly ConcurrentDictionary<string, ServiceEndpoint> _failedEndpoints = new();
+    private readonly ConcurrentBag<Func<uint, Task>> _subscribers = new();
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private Task? _retryTask;
+    private Task? _listeningTask;
     private bool _disposed = false;
+
+    const int CONNECTION_TIMEOUT_SECONDS = 15;
+    const int PORT = 5050;
 
     public PeerConnectionService(
         IServiceRegistration serviceRegistration,
@@ -40,44 +48,166 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
             _logger.LogInformation(
                 "Resolved initial service registration with {Count} endpoint(s)",
                 serviceRegistration.Endpoints.Count);
-            await ProcessEndpointsAsync(serviceRegistration.Endpoints, new List<ServiceEndpoint>());
+            await ProcessEndpointsAsync(serviceRegistration.Endpoints, new(), new());
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, 
+            _logger.LogWarning(ex,
                 "Failed to get initial service endpoints (error: {ErrorType}: {ErrorMessage}), will retry on updates",
                 ex.GetType().Name,
                 ex.Message);
         }
+
+        // Start periodic retry task for failed connections
+        _retryTask = Task.Run(() => RetryFailedConnectionsLoopAsync(_cancellationTokenSource.Token));
+
+        _listeningTask = Task.Run(() => StartListening());
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Begins listening for incoming peer connections on the configured TCP port and handles each connection
+    /// asynchronously.
+    /// </summary>
+    /// <remarks>This method runs continuously until the associated cancellation token is triggered. Each
+    /// accepted peer connection is processed without blocking the acceptance of new connections. Logging is performed
+    /// for connection events and errors.</remarks>
+    /// <returns>A task that represents the asynchronous listening operation.</returns>
+    private async Task StartListening()
+    {
+        var listener = new TcpListener(IPAddress.Any, PORT);
+        listener.Start();
+        _logger.LogInformation("Listening for peer connections on port {Port}", PORT);
+
+        while (!_cancellationTokenSource.Token.IsCancellationRequested)
+        {
+            try
+            {
+                var client = await listener.AcceptTcpClientAsync();
+                _logger.LogInformation("Accepted new peer connection from {RemoteEndPoint}", client.Client.RemoteEndPoint);
+                _ = HandlePeerConnectionAsync(client);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error accepting peer connection");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handles communication with a connected peer instance. (One way: receiving invalidation messages)
+    /// </summary>
+    /// <param name="client">The TCP client representing the peer connection.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
+    private async Task HandlePeerConnectionAsync(TcpClient client)
+    {
+        try
+        {
+            using var networkStream = client.GetStream();
+            while (!_cancellationTokenSource.Token.IsCancellationRequested && client.Connected)
+            {
+                var buffer = new byte[4];
+                var bytesRead = await networkStream.ReadAsync(buffer, 0, 4, _cancellationTokenSource.Token);
+                if (bytesRead == 0)
+                {
+                    _logger.LogInformation("Peer at {RemoteEndPoint} closed the connection", client.Client.RemoteEndPoint);
+
+                    // The client is responsible for reconnecting if needed.
+                    break; // Connection closed
+                }
+
+                _logger.LogDebug("Received {BytesRead} bytes from peer at {RemoteEndPoint}", bytesRead, client.Client.RemoteEndPoint);
+
+                // Parse the invalidation key
+                var key = BitConverter.ToUInt32(buffer, 0);
+
+                _logger.LogDebug("Received invalidation for key {Key} from instance", key);
+                        
+                // Notify subscribers
+                foreach (var subscriber in _subscribers)
+                {
+                    try
+                    {
+                        await subscriber(key);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error notifying subscriber of invalidation for key {Key}", key);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error handling peer connection");
+        }
+        finally
+        {
+            client.Close();
+            _logger.LogInformation("Closed peer connection from {RemoteEndPoint}", client.Client.RemoteEndPoint);
+        }
+    }
+
+    /// </inheritdoc/>
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Stopping peer connection service");
         _cancellationTokenSource.Cancel();
 
         // Disconnect all peer connections
-        var disconnectTasks = _peerConnections.Values.Select(conn => DisconnectAsync(conn));
-        return Task.WhenAll(disconnectTasks);
+        foreach(var client in _peerConnections.Values)
+        {
+            client.Close();
+        }
     }
 
+    /// <summary>
+    /// Is called when service endpoints are updated.
+    /// </summary>
+    /// <param name="update">The updated service endpoints information.</param>
+    /// <returns>The task representing the asynchronous operation.</returns>
     private async Task OnEndpointsUpdatedAsync(ServiceEndpointsUpdate update)
     {
         _logger.LogInformation(
-            "Service endpoints updated: {AddedCount} added, {RemovedCount} removed",
+            "Service endpoints updated: {AddedCount} added, {RemovedCount} removed, {UpdatedCount} updated",
             update.AddedEndpoints.Count,
-            update.RemovedEndpoints.Count);
+            update.RemovedEndpoints.Count,
+            update.UpdatedEndpoints.Count);
 
-        await ProcessEndpointsAsync(update.AddedEndpoints, update.RemovedEndpoints);
+        _logger.LogDebug("Processing endpoint updates...");
+        _logger.LogDebug("Added endpoints: {AddedEndpoints}", string.Join(", ", update.AddedEndpoints.Select(ep => ep.Id)));
+        _logger.LogDebug("Removed endpoints: {RemovedEndpoints}", string.Join(", ", update.RemovedEndpoints.Select(ep => ep.Id)));
+        _logger.LogDebug("Updated endpoints: {UpdatedEndpoints}", string.Join(", ", update.UpdatedEndpoints.Select(ep => ep.Id)));
+
+        await ProcessEndpointsAsync(update.AddedEndpoints, update.RemovedEndpoints, update.UpdatedEndpoints);
     }
 
     private async Task ProcessEndpointsAsync(
         List<ServiceEndpoint> addedEndpoints,
-        List<ServiceEndpoint> removedEndpoints)
+        List<ServiceEndpoint> removedEndpoints,
+        List<ServiceEndpoint> updatedEndpoints)
     {
         await _connectionLock.WaitAsync();
         try
         {
+            // For the updated endpoints, treat them as removed then added
+            removedEndpoints.AddRange(updatedEndpoints);
+            addedEndpoints.AddRange(updatedEndpoints);
+
+            // Remove connections to endpoints that are no longer available
+            foreach (var endpoint in removedEndpoints)
+            {
+                // Remove from active connections
+                if (_peerConnections.TryRemove(endpoint.Id, out var connection))
+                {
+                    _logger.LogInformation($"Removing peer connection to {endpoint.Id}");
+                    // Disconnect the connection and dispose
+                    connection.Close();
+                }
+
+                // Remove from failed endpoints list
+                _failedEndpoints.TryRemove(endpoint.Id, out _);
+            }
+
             // Filter out stale endpoints (older than 60 seconds)
             var staleThreshold = DateTime.UtcNow - TimeSpan.FromSeconds(60);
             var validEndpoints = addedEndpoints
@@ -91,29 +221,16 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
                     addedEndpoints.Count - validEndpoints.Count);
             }
 
-            // Remove connections to endpoints that are no longer available
-            foreach (var endpoint in removedEndpoints)
-            {
-                var endpointKey = GetEndpointKey(endpoint);
-                if (_peerConnections.TryRemove(endpointKey, out var connection))
-                {
-                    _logger.LogInformation($"Removing peer connection to {endpointKey}");
-                    await DisconnectAsync(connection);
-                }
-            }
-
             // Add connections to new valid endpoints
             foreach (var endpoint in validEndpoints)
             {
-                var endpointKey = GetEndpointKey(endpoint);
-                
                 // Skip if we already have a connection
-                if (_peerConnections.ContainsKey(endpointKey))
+                if (_peerConnections.ContainsKey(endpoint.Id))
                 {
                     continue;
                 }
 
-                _logger.LogInformation("Connecting to peer instance at {Endpoint}", endpointKey);
+                _logger.LogInformation("Connecting to peer instance at {Endpoint}", endpoint.Id);
                 await ConnectToPeerAsync(endpoint);
             }
         }
@@ -123,116 +240,118 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
         }
     }
 
-    private async Task ConnectToPeerAsync(ServiceEndpoint endpoint)
+    /// <summary>
+    /// Connects to a peer at the specified service endpoint.
+    /// </summary>
+    /// <param name="serviceEndpoint">The service endpoint to connect to.</param>
+    /// <returns>The task representing the asynchronous operation.</returns>
+    private async Task ConnectToPeerAsync(ServiceEndpoint serviceEndpoint)
     {
-        var endpointKey = GetEndpointKey(endpoint);
-        var url = $"http://{endpoint.Address}:{endpoint.Port}/invalidation";
+        var endpoint = $"{serviceEndpoint.Address}:{PORT}";
 
         try
         {
-            var connection = new HubConnectionBuilder()
-                .WithUrl(url)
-                .WithAutomaticReconnect(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10) })
-                .Build();
-
-            // Register handler for incoming invalidations
-            connection.On<uint, string>("InvalidateCache", async (key, instanceId) =>
-            {
-                _logger.LogDebug(
-                    "Received cache invalidation from peer {InstanceId} for key {Key}",
-                    instanceId,
-                    key);
-
-                // Don't process our own invalidations
-                if (instanceId == _instanceId)
-                {
-                    return;
-                }
-
-                // Notify all subscribers
-                var notifyTasks = _subscribers.Select(subscriber =>
-                    Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await subscriber(key, instanceId);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Error in invalidation subscriber");
-                        }
-                    }));
-
-                await Task.WhenAll(notifyTasks);
-            });
-
-            connection.Reconnecting += error =>
-            {
-                _logger.LogWarning("Reconnecting to peer at {Endpoint}: {Error}", endpointKey, error?.Message);
-                return Task.CompletedTask;
-            };
-
-            connection.Reconnected += connectionId =>
-            {
-                _logger.LogInformation("Reconnected to peer at {Endpoint}", endpointKey);
-                return Task.CompletedTask;
-            };
-
-            connection.Closed += async error =>
-            {
-                _logger.LogWarning("Connection closed to peer at {Endpoint}: {Error}", endpointKey, error?.Message);
-                
-                // Remove from our connection dictionary
-                _peerConnections.TryRemove(endpointKey, out _);
-            };
+            var client = new TcpClient();
 
             // Add timeout to the connection attempt
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token);
-            cts.CancelAfter(TimeSpan.FromSeconds(15));
-            
-            await connection.StartAsync(cts.Token);
-            
-            _peerConnections[endpointKey] = connection;
-            
-            _logger.LogInformation("Successfully connected to peer at {Endpoint}", endpointKey);
+            cts.CancelAfter(TimeSpan.FromSeconds(CONNECTION_TIMEOUT_SECONDS));
+
+            await client.ConnectAsync(IPEndPoint.Parse(endpoint), cts.Token);
+
+            _peerConnections.AddOrUpdate(serviceEndpoint.Id, client, (key, oldValue) => client);
+
+            // Remove from failed endpoints if it was there
+            _failedEndpoints.TryRemove(serviceEndpoint.Id, out _);
+
+            _logger.LogInformation("Successfully connected to peer at {Endpoint}", serviceEndpoint.Id);
         }
         catch (OperationCanceledException)
         {
-            _logger.LogWarning("Timeout connecting to peer at {Endpoint} - peer may not be ready yet", endpointKey);
+            _logger.LogWarning("Timeout connecting to peer at {Endpoint} - peer may not be ready yet, will retry later", serviceEndpoint.Id);
+            _failedEndpoints[serviceEndpoint.Id] = serviceEndpoint;
         }
-        catch (HttpRequestException ex) when (ex.InnerException is System.Net.Sockets.SocketException socketEx)
+        catch (SocketException socketEx)
         {
-            _logger.LogWarning("Cannot reach peer at {Endpoint}: {Error} (likely DNS or network issue)", endpointKey, socketEx.Message);
+            _logger.LogWarning("Cannot reach peer at {Endpoint}: {Error} (likely DNS or network issue), will retry later", serviceEndpoint.Id, socketEx.Message);
+            _failedEndpoints[serviceEndpoint.Id] = serviceEndpoint;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to connect to peer at {Endpoint}", endpointKey);
+            _logger.LogError(ex, "Failed to connect to peer at {Endpoint}, will retry later", serviceEndpoint.Id);
+            _failedEndpoints[serviceEndpoint.Id] = serviceEndpoint;
         }
     }
 
-    private async Task DisconnectAsync(HubConnection connection)
+    /// <summary>
+    /// Sometimes connections to peers fail (e.g., peer not ready yet).
+    /// This method retries failed connections periodically.
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token to signal the operation's cancellation.</param>
+    /// <returns>The task representing the asynchronous operation.</returns>
+    private async Task RetryFailedConnectionsLoopAsync(CancellationToken cancellationToken)
     {
-        try
-        {
-            await connection.StopAsync();
-            await connection.DisposeAsync();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Error disconnecting from peer");
-        }
-    }
+        _logger.LogDebug("Starting retry loop for failed peer connections");
 
-    private static string GetEndpointKey(ServiceEndpoint endpoint)
-    {
-        return $"{endpoint.Address}:{endpoint.Port}";
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                // Wait 30 seconds between retry attempts
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+
+                if (_failedEndpoints.IsEmpty)
+                {
+                    continue;
+                }
+
+                _logger.LogInformation("Retrying {Count} failed peer connection(s)", _failedEndpoints.Count);
+
+                var endpointsToRetry = _failedEndpoints.ToArray();
+
+                foreach (var kvp in endpointsToRetry)
+                {
+                    var endpointKey = kvp.Key;
+                    var endpoint = kvp.Value;
+
+                    // Skip if already connected (might have succeeded in the meantime)
+                    if (_peerConnections.ContainsKey(endpointKey))
+                    {
+                        _failedEndpoints.TryRemove(endpointKey, out _);
+                        continue;
+                    }
+
+                    _logger.LogDebug("Retrying connection to peer at {Endpoint}", endpointKey);
+
+                    // Try to connect
+                    await ConnectToPeerAsync(endpoint);
+
+                    // If successful, ConnectToPeerAsync will add to _peerConnections and we can remove from failed
+                    if (_peerConnections.ContainsKey(endpointKey))
+                    {
+                        _failedEndpoints.TryRemove(endpointKey, out _);
+                        _logger.LogInformation("Successfully connected to previously failed peer at {Endpoint}", endpointKey);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in retry loop for failed connections");
+            }
+        }
+
+        _logger.LogDebug("Retry loop for failed peer connections has exited");
     }
 
     /// <inheritdoc/>
-    public async Task BroadcastInvalidationAsync(uint key, string instanceId, CancellationToken cancellationToken = default)
+    public async Task BroadcastInvalidationAsync(uint key, CancellationToken cancellationToken = default)
     {
         var connections = _peerConnections.Values.ToArray();
-        
+
         if (connections.Length == 0)
         {
             _logger.LogDebug("No peer connections available for broadcasting invalidation");
@@ -242,12 +361,13 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
         _logger.LogDebug("Broadcasting invalidation for key {Key} to {Count} peers", key, connections.Length);
 
         var broadcastTasks = connections
-            .Where(conn => conn.State == HubConnectionState.Connected)
-            .Select(async conn =>
+            .Where(client => client.Connected)
+            .Select(async client =>
             {
                 try
                 {
-                    await conn.InvokeAsync("BroadcastInvalidation", key, instanceId, cancellationToken);
+                    _logger.LogDebug("Sending invalidation to peer");
+                    await client.GetStream().WriteAsync(BitConverter.GetBytes(key));
                 }
                 catch (Exception ex)
                 {
@@ -259,7 +379,7 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
     }
 
     /// <inheritdoc/>
-    public void Subscribe(Func<uint, string, Task> onInvalidation)
+    public void Subscribe(Func<uint, Task> onInvalidation)
     {
         if (onInvalidation == null)
         {
@@ -269,20 +389,37 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
         _subscribers.Add(onInvalidation);
     }
 
+    /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed)
             return;
-        
+
         _disposed = true;
-        
+
         if (!_cancellationTokenSource.IsCancellationRequested)
         {
             _cancellationTokenSource.Cancel();
         }
-        
-        var disconnectTasks = _peerConnections.Values.Select(conn => DisconnectAsync(conn));
-        Task.WhenAll(disconnectTasks).Wait(TimeSpan.FromSeconds(5));
+
+        // Wait for retry task to complete
+        if (_retryTask != null)
+        {
+            try
+            {
+                _retryTask.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch (AggregateException)
+            {
+                // Task was cancelled, which is expected
+            }
+        }
+
+        // Dispose all peer connections
+        foreach (var client in _peerConnections.Values)
+        {
+            client.Close();
+        }
 
         _cancellationTokenSource.Dispose();
         _connectionLock.Dispose();

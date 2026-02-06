@@ -41,7 +41,7 @@ builder.Services.AddSingleton<IVeritasClient>(sp =>
     // - In production, we use the environment variable VERITAS_ENDPOINTS
     var endpoints = new List<string>();
 
-    var logger = sp.GetRequiredService<ILogger<ServiceRegistrationService>>();
+    var logger = sp.GetRequiredService<ILogger<VeritasClient.VeritasClient>>();
 
     // Production endpoints from environment variable
     var endpointsEnv = Environment.GetEnvironmentVariable("VERITAS_NODES");
@@ -80,8 +80,7 @@ builder.Services.AddSingleton<IVeritasClient>(sp =>
     return new VeritasClient.VeritasClient(
         endpoints.ToArray(),
         TimeSpan.FromSeconds(5),
-        logDebug: msg => logger.LogDebug("[VeritasClient] {Message}", msg),
-        logWarning: msg => logger.LogWarning("[VeritasClient] {Message}", msg));
+        logger: logger);
 });
 
 // Add services for API controllers
@@ -97,7 +96,7 @@ builder.Services.AddPartitioningControllerClientWithLogging();
 builder.Services.AddSingleton<IServiceRegistration>(sp =>
 {
     var veritasClient = sp.GetRequiredService<IVeritasClient>();
-    var logger = sp.GetRequiredService<ILogger<ServiceRegistrationService>>();
+    var logger = sp.GetRequiredService<ILogger<ServiceRegistrationHandler>>();
     var options = sp.GetRequiredService<IOptions<ServiceRegistrationOptions>>();
 
     logger.LogInformation("Creating ServiceRegistrationHandler for {ServiceName}.", options.Value.ServiceName);
@@ -105,15 +104,12 @@ builder.Services.AddSingleton<IServiceRegistration>(sp =>
     return new VeritasClient.ServiceRegistration.ServiceRegistrationHandler(
         veritasClient,
         $"service-{options.Value.ServiceName}",
-        logError: msg => logger.LogError(msg));
+        logger);
 });
 
 // Add peer connection service as a hosted service (connects to other backend instances)
 builder.Services.AddSingleton<IPeerConnectionService, PeerConnectionService>();
 builder.Services.AddHostedService(sp => (PeerConnectionService)sp.GetRequiredService<IPeerConnectionService>());
-
-// Add cache invalidation service as a singleton (uses peer connections)
-builder.Services.AddSingleton<ICacheInvalidationService, CacheInvalidationService>();
 
 // Add canvas cache service as a singleton
 builder.Services.AddSingleton<ICanvasCacheService, CanvasCacheService>();
@@ -139,7 +135,6 @@ app.MapControllers();
 
 // Map SignalR hubs
 app.MapHub<CanvasHub>("/canvas");  // For end-user clients
-app.MapHub<InvalidationHub>("/invalidation");  // For inter-service cache invalidation
 
 // Health check endpoint
 app.MapGet("/health", () => "WebCanvas is running.");

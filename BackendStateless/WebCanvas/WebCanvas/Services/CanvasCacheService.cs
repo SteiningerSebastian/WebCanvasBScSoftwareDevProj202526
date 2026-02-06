@@ -7,7 +7,7 @@ namespace WebCanvas.Services;
 public class CanvasCacheService : ICanvasCacheService
 {
     private readonly IPartitioningControllerClient _partitioningClient;
-    private readonly ICacheInvalidationService _invalidationService;
+    private readonly IPeerConnectionService _peerConnectionService;
     private readonly ILogger<CanvasCacheService> _logger;
     private readonly ConcurrentDictionary<uint, RGBColor> _cache = new();
     private readonly ConcurrentQueue<uint> _invalidationQueue = new();
@@ -17,15 +17,15 @@ public class CanvasCacheService : ICanvasCacheService
 
     public CanvasCacheService(
         IPartitioningControllerClient partitioningClient,
-        ICacheInvalidationService invalidationService,
+        IPeerConnectionService peerConnectionService,
         ILogger<CanvasCacheService> logger)
     {
         _partitioningClient = partitioningClient ?? throw new ArgumentNullException(nameof(partitioningClient));
-        _invalidationService = invalidationService ?? throw new ArgumentNullException(nameof(invalidationService));
+        _peerConnectionService = peerConnectionService ?? throw new ArgumentNullException(nameof(peerConnectionService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         // Subscribe to cache invalidation notifications before warming
-        _invalidationService.Subscribe(OnCacheInvalidationAsync);
+        _peerConnectionService.Subscribe(OnCacheInvalidationAsync);
 
         // Start cache warming in the background
         _ = Task.Run(WarmCacheAsync);
@@ -211,7 +211,7 @@ public class CanvasCacheService : ICanvasCacheService
             await Task.WhenAll(notifyTasks);
 
             // Publish cache invalidation to other instances (they will pull and notify their clients)
-            await _invalidationService.PublishInvalidationAsync(key, cancellationToken);
+            await _peerConnectionService.BroadcastInvalidationAsync(key, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -248,12 +248,12 @@ public class CanvasCacheService : ICanvasCacheService
         // Fallback: Pixel not found in cache
         var rsp = await _partitioningClient.GetAsync(key, cancellationToken);
 
-        if (rsp.Value.Length == 0)
+        if (rsp is null || rsp?.Value.Length == 0)
         {
             return null; // Pixel does not exist
         }
 
-        var byteArray = rsp.Value.ToByteArray();
+        var byteArray = rsp!.Value.ToByteArray();
         if (byteArray.Length < 3)
         {
             _logger.LogWarning("Invalid pixel data for ({X}, {Y}): expected at least 3 bytes (RGB), got {Length} bytes", x, y, byteArray.Length);
