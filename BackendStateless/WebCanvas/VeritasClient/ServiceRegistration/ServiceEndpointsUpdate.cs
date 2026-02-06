@@ -7,6 +7,7 @@ namespace VeritasClient.ServiceRegistration;
 /// </summary>
 public class ServiceEndpointsUpdate
 {
-    public List<ServiceEndpoint> AddedEndpoints { get; set; } = new();
-    public List<ServiceEndpoint> RemovedEndpoints { get; set; } = new();
+    public required List<ServiceEndpoint> AddedEndpoints { get; set; }
+    public required List<ServiceEndpoint> RemovedEndpoints { get; set; }
+    public required List<ServiceEndpoint> UpdatedEndpoints { get; set; }
 }

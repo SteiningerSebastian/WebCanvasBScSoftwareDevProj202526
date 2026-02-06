@@ -7,6 +7,7 @@ using System.Threading.Channels;
 using VeritasClient.CircuitBreaker;
 using VeritasClient.Exceptions;
 using VeritasClient.Models;
+using Microsoft.Extensions.Logging;
 
 namespace VeritasClient;
 
@@ -23,8 +24,7 @@ public class VeritasClient : IVeritasClient
     private readonly EndpointSelector _endpointSelector;
     private readonly HttpClient _httpClient;
     private readonly TimeSpan _timeout;
-    private readonly Action<string>? _logDebug;
-    private readonly Action<string>? _logWarning;
+    private readonly ILogger<VeritasClient> _logger;
 
     /// <summary>
     /// Creates a new VeritasClient with the given endpoints and timeout.
@@ -35,34 +35,35 @@ public class VeritasClient : IVeritasClient
     /// <param name="successThreshold">Number of successes before closing circuit</param>
     /// <param name="openTimeout">Time to wait before attempting half-open state</param>
     /// <param name="httpClient">Optional HTTP client (for testing)</param>
-    /// <param name="logDebug">Optional debug logger</param>
-    /// <param name="logWarning">Optional warning logger</param>
+    /// <param name="logger">Logger instance</param>
     public VeritasClient(
         string[] endpoints,
         TimeSpan timeout,
+        ILogger<VeritasClient>? logger = null,
         int failureThreshold = 3,
         int successThreshold = 2,
         TimeSpan? openTimeout = null,
-        HttpClient? httpClient = null,
-        Action<string>? logDebug = null,
-        Action<string>? logWarning = null)
+        HttpClient? httpClient = null)
     {
         if (endpoints == null || endpoints.Length == 0)
         {
             throw new ArgumentException("At least one endpoint must be provided", nameof(endpoints));
         }
 
+        _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<VeritasClient>.Instance;
+
         // Shuffle endpoints to distribute load
         _endpoints = ShuffleEndpoints(endpoints);
         _timeout = timeout;
         _httpClient = httpClient ?? new HttpClient();
-        _logDebug = logDebug;
-        _logWarning = logWarning;
         _endpointSelector = new EndpointSelector(
             _endpoints.Length,
             failureThreshold,
             successThreshold,
             openTimeout ?? TimeSpan.FromSeconds(30));
+
+        _logger.LogInformation("VeritasClient initialized with {EndpointCount} endpoints: [{Endpoints}], timeout: {Timeout}s, failureThreshold: {FailureThreshold}, successThreshold: {SuccessThreshold}",
+            _endpoints.Length, string.Join(", ", _endpoints), timeout.TotalSeconds, failureThreshold, successThreshold);
     }
 
     private static string[] ShuffleEndpoints(string[] endpoints)
@@ -101,7 +102,8 @@ public class VeritasClient : IVeritasClient
         Func<HttpRequestMessage> requestFactory,
         CancellationToken cancellationToken)
     {
-        _logDebug?.Invoke($"Starting request execution with {_endpoints.Length} configured endpoints: [{string.Join(", ", _endpoints)}]");
+        _logger.LogDebug("Starting request execution with {EndpointCount} configured endpoints: [{Endpoints}]",
+            _endpoints.Length, string.Join(", ", _endpoints));
         
         for (int retries = 0; retries < RetryBeforeFail; retries++)
         {
@@ -111,19 +113,31 @@ public class VeritasClient : IVeritasClient
             try
             {
                 currentEndpoint = GetEndpoint();
-                _logDebug?.Invoke($"Selected endpoint index {currentEndpoint}: {_endpoints[currentEndpoint]}");
+                _logger.LogDebug("Selected endpoint index {EndpointIndex}: {Endpoint}",
+                    currentEndpoint, _endpoints[currentEndpoint]);
             }
             catch (NoHealthyEndpointException ex)
             {
-                _logWarning?.Invoke($"No healthy endpoint available on attempt {retries + 1}/{RetryBeforeFail}: {ex.Message}");
+                _logger.LogWarning(ex, "No healthy endpoint available on attempt {AttemptNumber}/{MaxAttempts}",
+                    retries + 1, RetryBeforeFail);
                 var backoffDuration = TimeSpan.FromMilliseconds(
                     RetryDelayMs * Math.Pow(ExponentialBackoffBase, retries));
-                _logDebug?.Invoke($"Backing off for {backoffDuration.TotalMilliseconds}ms before retry");
-                await Task.Delay(backoffDuration, cancellationToken);
+                _logger.LogDebug("Backing off for {BackoffMs}ms before retry", backoffDuration.TotalMilliseconds);
+                
+                try
+                {
+                    await Task.Delay(backoffDuration, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogDebug("Request cancelled during backoff");
+                    throw;
+                }
                 continue;
             }
 
-            _logDebug?.Invoke($"Executing request to {_endpoints[currentEndpoint]} (attempt {retries + 1}/{RetryBeforeFail})");
+            _logger.LogDebug("Executing request to {Endpoint} (attempt {AttemptNumber}/{MaxAttempts})",
+                _endpoints[currentEndpoint], retries + 1, RetryBeforeFail);
 
             var request = requestFactory();
             var uriBuilder = new UriBuilder(request.RequestUri!)
@@ -138,32 +152,56 @@ public class VeritasClient : IVeritasClient
             {
                 uriBuilder.Port = port;
             }
+            else
+            {
+                _logger.LogWarning("Endpoint {Endpoint} does not specify a port, using default", endpoint);
+            }
             
             request.RequestUri = uriBuilder.Uri;
-            _logDebug?.Invoke($"Constructed request URI: {request.Method} {request.RequestUri} (timeout: {_timeout.TotalSeconds}s)");
+            _logger.LogDebug("Constructed request URI: {Method} {Uri} (timeout: {TimeoutSeconds}s)",
+                request.Method, request.RequestUri, _timeout.TotalSeconds);
 
             try
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 cts.CancelAfter(_timeout);
 
-                _logDebug?.Invoke($"Sending HTTP request to {request.RequestUri}...");
+                _logger.LogDebug("Sending HTTP request to {Uri}", request.RequestUri);
                 var response = await _httpClient.SendAsync(request, cts.Token);
-                _logDebug?.Invoke($"Received response: {(int)response.StatusCode} {response.StatusCode}");
+                _logger.LogDebug("Received response: {StatusCode} {StatusCodeName}",
+                    (int)response.StatusCode, response.StatusCode);
 
                 if (response.StatusCode >= System.Net.HttpStatusCode.InternalServerError)
                 {
-                    _logWarning?.Invoke($"Server error from {_endpoints[currentEndpoint]}: {(int)response.StatusCode} {response.StatusCode}. Marking endpoint as failed and retrying...");
+                    _logger.LogWarning("Server error from {Endpoint}: {StatusCode} {StatusCodeName}. Marking endpoint as failed and retrying",
+                        _endpoints[currentEndpoint], (int)response.StatusCode, response.StatusCode);
                     _endpointSelector.OnFailure(currentEndpoint);
 
                     var backoffDuration = TimeSpan.FromMilliseconds(
                         RetryDelayMs * Math.Pow(ExponentialBackoffBase, retries));
-                    await Task.Delay(backoffDuration, cancellationToken);
+                    
+                    try
+                    {
+                        await Task.Delay(backoffDuration, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        _logger.LogDebug("Request cancelled during backoff");
+                        throw;
+                    }
                     continue;
                 }
 
+                if (!response.IsSuccessStatusCode)
+                {
+                    var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                    _logger.LogWarning("Non-success status code from {Endpoint}: {StatusCode} {StatusCodeName}. Response: {Response}",
+                        _endpoints[currentEndpoint], (int)response.StatusCode, response.StatusCode, errorBody);
+                }
+
                 var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                _logDebug?.Invoke($"Request succeeded: {_endpoints[currentEndpoint]} (response length: {responseBody.Length} bytes)");
+                _logger.LogDebug("Request succeeded: {Endpoint} (response length: {ResponseLength} bytes)",
+                    _endpoints[currentEndpoint], responseBody.Length);
                 _endpointSelector.OnSuccess(currentEndpoint);
 
                 return responseBody;
@@ -172,22 +210,38 @@ public class VeritasClient : IVeritasClient
             {
                 if (ex is TaskCanceledException && cancellationToken.IsCancellationRequested)
                 {
-                    _logDebug?.Invoke("Request cancelled by caller");
+                    _logger.LogDebug("Request cancelled by caller");
                     throw;
                 }
                 
                 var errorType = ex is TaskCanceledException ? "Timeout" : "Connection";
-                _logWarning?.Invoke($"{errorType} error on {_endpoints[currentEndpoint]} (attempt {retries + 1}/{RetryBeforeFail}): {ex.GetType().Name}: {ex.Message}");
+                _logger.LogWarning(ex, "{ErrorType} error on {Endpoint} (attempt {AttemptNumber}/{MaxAttempts})",
+                    errorType, _endpoints[currentEndpoint], retries + 1, RetryBeforeFail);
                 _endpointSelector.OnFailure(currentEndpoint);
 
                 var backoffDuration = TimeSpan.FromMilliseconds(
                     RetryDelayMs * Math.Pow(ExponentialBackoffBase, retries));
-                _logDebug?.Invoke($"Backing off for {backoffDuration.TotalMilliseconds}ms before retry");
-                await Task.Delay(backoffDuration, cancellationToken);
+                _logger.LogDebug("Backing off for {BackoffMs}ms before retry", backoffDuration.TotalMilliseconds);
+                
+                try
+                {
+                    await Task.Delay(backoffDuration, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogDebug("Request cancelled during backoff");
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error executing request to {Endpoint} (attempt {AttemptNumber}/{MaxAttempts})",
+                    _endpoints[currentEndpoint], retries + 1, RetryBeforeFail);
+                throw;
             }
         }
 
-        _logWarning?.Invoke($"Maximum retries ({RetryBeforeFail}) reached. All endpoints failed.");
+        _logger.LogError("Maximum retries ({MaxRetries}) reached. All endpoints failed", RetryBeforeFail);
         throw new MaxRetriesReachedException();
     }
 
@@ -220,9 +274,11 @@ public class VeritasClient : IVeritasClient
     {
         if (!IsValidName(name))
         {
+            _logger.LogError("Invalid variable name: {Name}", name);
             throw new InvalidNameException(name);
         }
 
+        _logger.LogDebug("Getting variable: {Name}", name);
         return await ExecuteRequestFromPathAsync("GET", $"/get/{name}", null, cancellationToken);
     }
 
@@ -230,9 +286,11 @@ public class VeritasClient : IVeritasClient
     {
         if (!IsValidName(name))
         {
+            _logger.LogError("Invalid variable name: {Name}", name);
             throw new InvalidNameException(name);
         }
 
+        _logger.LogDebug("Getting variable (eventual consistency): {Name}", name);
         return await ExecuteRequestFromPathAsync("GET", $"/get_eventual/{name}", null, cancellationToken);
     }
 
@@ -240,9 +298,11 @@ public class VeritasClient : IVeritasClient
     {
         if (!IsValidName(name))
         {
+            _logger.LogError("Invalid variable name: {Name}", name);
             throw new InvalidNameException(name);
         }
 
+        _logger.LogDebug("Peeking variable: {Name}", name);
         return await ExecuteRequestFromPathAsync("GET", $"/peek/{name}", null, cancellationToken);
     }
 
@@ -250,13 +310,17 @@ public class VeritasClient : IVeritasClient
     {
         if (!IsValidName(name))
         {
+            _logger.LogError("Invalid variable name: {Name}", name);
             throw new InvalidNameException(name);
         }
 
+        _logger.LogDebug("Setting variable: {Name} (value length: {ValueLength} bytes)", name, value.Length);
         var response = await ExecuteRequestFromPathAsync(
             "PUT", $"/set/{name}", Encoding.UTF8.GetBytes(value), cancellationToken);
         
-        return string.Equals(response, "true", StringComparison.OrdinalIgnoreCase);
+        var success = string.Equals(response, "true", StringComparison.OrdinalIgnoreCase);
+        _logger.LogDebug("Set variable {Name}: {Success}", name, success);
+        return success;
     }
 
     public async Task<bool> AppendVariableAsync(string name, string value, CancellationToken cancellationToken = default)
@@ -298,14 +362,19 @@ public class VeritasClient : IVeritasClient
     {
         if (!IsValidName(name))
         {
+            _logger.LogError("Invalid variable name: {Name}", name);
             throw new InvalidNameException(name);
         }
 
+        _logger.LogDebug("Compare-and-set variable: {Name} (expected length: {ExpectedLength}, new length: {NewLength})",
+            name, expectedValue.Length, newValue?.Length ?? 0);
         var body = $"{expectedValue.Length};{expectedValue}{newValue}";
         var response = await ExecuteRequestFromPathAsync(
             "PUT", $"/compare_set/{name}", Encoding.UTF8.GetBytes(body), cancellationToken);
         
-        return string.Equals(response, "true", StringComparison.OrdinalIgnoreCase);
+        var success = string.Equals(response, "true", StringComparison.OrdinalIgnoreCase);
+        _logger.LogDebug("Compare-and-set variable {Name}: {Success}", name, success);
+        return success;
     }
 
     public async Task<long> GetAndAddVariableAsync(string name, CancellationToken cancellationToken = default)
@@ -334,41 +403,52 @@ public class VeritasClient : IVeritasClient
 
         _ = Task.Run(async () =>
         {
+            // Read messages
+            var buffer = new byte[32768];
+
             try
             {
                 int currentEndpoint;
                 try
                 {
                     currentEndpoint = GetEndpoint();
+                    _logger.LogDebug("Selected endpoint {EndpointIndex} for WebSocket connection: {Endpoint}",
+                        currentEndpoint, _endpoints[currentEndpoint]);
                 }
                 catch (NoHealthyEndpointException ex)
                 {
-                    _logWarning?.Invoke("No healthy endpoint available.");
+                    _logger.LogWarning(ex, "No healthy endpoint available for WebSocket connection");
                     await errorChannel.Writer.WriteAsync(ex, cancellationToken);
                     return;
                 }
 
                 var ws = new ClientWebSocket();
-                var uri = new Uri($"ws://{_endpoints[currentEndpoint].Replace("http://", "").Replace("https://", "")}/ws");
+                var endpointAddress = _endpoints[currentEndpoint].Replace("http://", "").Replace("https://", "");
+                var uri = new Uri($"ws://{endpointAddress}/ws");
                 
+                _logger.LogInformation("Connecting to WebSocket at {Uri}", uri);
                 await ws.ConnectAsync(uri, cancellationToken);
+                _logger.LogInformation("WebSocket connected successfully to {Uri}", uri);
 
                 // Send watch commands
+                _logger.LogDebug("Sending watch commands for {VariableCount} variables: [{Variables}]",
+                    names.Length, string.Join(", ", names));
                 foreach (var name in names)
                 {
-                    var cmd = WebSocketCommand.FromWatchCommand(name);
+                    var cmd = new WatchCommand(name);
                     var json = JsonSerializer.Serialize(cmd);
                     var cmdBuffer = Encoding.UTF8.GetBytes(json);
                     
+                    _logger.LogDebug("Sending watch command for variable: {Name}", name);
+                    _logger.LogTrace("WebSocket command JSON: {Json}", json);
                     await ws.SendAsync(
                         new ArraySegment<byte>(cmdBuffer),
                         WebSocketMessageType.Text,
                         true,
                         cancellationToken);
                 }
+                _logger.LogDebug("All watch commands sent successfully");
 
-                // Read messages
-                var buffer = new byte[4096];
                 var messageBuilder = new StringBuilder();
                 
                 while (!cancellationToken.IsCancellationRequested && ws.State == WebSocketState.Open)
@@ -385,26 +465,36 @@ public class VeritasClient : IVeritasClient
                         {
                             var message = messageBuilder.ToString();
                             messageBuilder.Clear();
+
+                            _logger.LogDebug("Received WebSocket message: {Message}", message);
                             
                             try
                             {
-                                var response = JsonSerializer.Deserialize<WebSocketResponse>(message);
-                                
-                                if (response != null)
+                                var response = JsonSerializer.Deserialize<WebSocketCommand>(message);
+
+                                if (response != null && response.Command == nameof(UpdateNotification))
                                 {
+                                    UpdateNotification updateNotification = response.CastDown<UpdateNotification>();
+                                    _logger.LogTrace("Received WebSocket update for key: {Key}", updateNotification.Key);
                                     _endpointSelector.OnSuccess(currentEndpoint);
-                                    await valueChannel.Writer.WriteAsync(response.ToUpdateNotification(), cancellationToken);
+                                    await valueChannel.Writer.WriteAsync(updateNotification, cancellationToken);
+                                }
+                                else
+                                {
+                                    _logger.LogWarning("Received null WebSocket response after deserialization. Message: {Message}", message);
                                 }
                             }
                             catch (JsonException ex)
                             {
-                                _logWarning?.Invoke($"Failed to parse WebSocket message as JSON: {message}. Error: {ex.Message}");
-                                await errorChannel.Writer.WriteAsync(new Exception($"Invalid JSON received from WebSocket: {message}"), CancellationToken.None);
+                                _logger.LogWarning(ex, "Failed to parse WebSocket message as JSON. Message: {Message}", message);
+                                await errorChannel.Writer.WriteAsync(new Exception($"Invalid JSON received from WebSocket: {message}", ex), CancellationToken.None);
                             }
                         }
                     }
                     else if (result.MessageType == WebSocketMessageType.Close)
                     {
+                        _logger.LogInformation("WebSocket close message received. Status: {Status}, Description: {Description}",
+                            result.CloseStatus, result.CloseStatusDescription);
                         await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", cancellationToken);
                         break;
                     }
@@ -412,10 +502,12 @@ public class VeritasClient : IVeritasClient
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                _logger.LogError(ex, "Error in WebSocket watch loop");
                 await errorChannel.Writer.WriteAsync(ex, CancellationToken.None);
             }
             finally
             {
+                _logger.LogDebug("WebSocket watch loop completed, closing channels");
                 valueChannel.Writer.Complete();
                 errorChannel.Writer.Complete();
             }
@@ -462,25 +554,27 @@ public class VeritasClient : IVeritasClient
                         var (updates, errors) = await WatchVariablesAsync(names, cancellationToken);
 
                         // Initial fetch
+                        _logger.LogDebug("Performing initial fetch for {VariableCount} variables", names.Length);
                         foreach (var variable in names)
                         {
                             try
                             {
                                 var value = await GetVariableAsync(variable, cancellationToken);
+                                _logger.LogTrace("Initial fetch succeeded for variable: {Variable}", variable);
                                 await valueChannel.Writer.WriteAsync(
-                                    new UpdateNotification
-                                    {
-                                        Key = variable,
-                                        NewValue = value,
-                                        OldValue = value
-                                    },
+                                    new UpdateNotification(variable, null, value),
                                     cancellationToken);
                             }
                             catch (Exception ex)
                             {
+                                _logger.LogWarning(ex, "Initial fetch failed for variable: {Variable}", variable);
                                 await errorChannel.Writer.WriteAsync(ex, cancellationToken);
+
+                                // If initial fetch fails, continue to reconnect
+                                continue;
                             }
                         }
+                        _logger.LogDebug("Initial fetch completed");
 
                         // Forward updates and errors
                         var updateTask = Task.Run(async () =>
@@ -501,22 +595,42 @@ public class VeritasClient : IVeritasClient
 
                         await Task.WhenAny(updateTask, errorTask);
                     }
-                    catch (NoHealthyEndpointException)
+                    catch (NoHealthyEndpointException ex)
                     {
-                        _logWarning?.Invoke("No healthy endpoint available, retrying...");
-                        await Task.Delay(RetryDelayMs, cancellationToken);
+                        _logger.LogWarning(ex, "No healthy endpoint available, retrying in {DelayMs}ms", RetryDelayMs);
+                        try
+                        {
+                            await Task.Delay(RetryDelayMs, cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            _logger.LogDebug("Auto-reconnect cancelled during retry delay");
+                            throw;
+                        }
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
+                        _logger.LogError(ex, "Error in auto-reconnect watch loop");
                         await errorChannel.Writer.WriteAsync(ex, CancellationToken.None);
                     }
 
                     // Wait before reconnecting
-                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                    _logger.LogDebug("Waiting 1 second before reconnecting");
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        _logger.LogDebug("Auto-reconnect cancelled during reconnect delay");
+                        throw;
+                    }
                 }
             }
             finally
             {
+                _logger.LogDebug("Auto-reconnect watch loop completed, closing channels");
+
                 valueChannel.Writer.Complete();
                 errorChannel.Writer.Complete();
             }

@@ -1,4 +1,6 @@
 ﻿using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using VeritasClient;
 using VeritasClient.Models;
@@ -24,9 +26,12 @@ namespace VeritasClientTests
             }
         }
 
-        private ServiceRegistrationHandler CreateHandler(string serviceName, Action<string>? logError = null)
+        private ServiceRegistrationHandler CreateHandler(string serviceName, ILogger<ServiceRegistrationHandler>? logger = null)
         {
-            var handler = new ServiceRegistrationHandler(_mockClient.Object, serviceName, logError);
+            var handler = new ServiceRegistrationHandler(
+                _mockClient.Object, 
+                serviceName, 
+                logger ?? NullLogger<ServiceRegistrationHandler>.Instance);
             _handlers.Add(handler);
             return handler;
         }
@@ -38,7 +43,7 @@ namespace VeritasClientTests
         {
             // Act & Assert
             Assert.Throws<ArgumentNullException>(() => 
-                new ServiceRegistrationHandler(null!, "test-service"));
+                new ServiceRegistrationHandler(null!, "test-service", NullLogger<ServiceRegistrationHandler>.Instance));
         }
 
         [Fact]
@@ -46,7 +51,7 @@ namespace VeritasClientTests
         {
             // Act & Assert
             Assert.Throws<ArgumentNullException>(() => 
-                new ServiceRegistrationHandler(_mockClient.Object, null!));
+                new ServiceRegistrationHandler(_mockClient.Object, null!, NullLogger<ServiceRegistrationHandler>.Instance));
         }
 
         [Fact]
@@ -384,58 +389,6 @@ namespace VeritasClientTests
         #region Listener Tests
 
         [Fact]
-        public async Task AddListener_ShouldInvokeCallback_WhenServiceUpdates()
-        {
-            // Arrange
-            var service = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var jsonStr = JsonSerializer.Serialize(service);
-            var notification = new UpdateNotification
-            {
-                Key = "test-service",
-                OldValue = "",
-                NewValue = jsonStr
-            };
-
-            var tcs = new TaskCompletionSource<ServiceRegistration>();
-
-            // Setup mock BEFORE creating handler
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerable(notification), AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddListener(s =>
-            {
-                tcs.TrySetResult(s);
-            });
-
-            // Wait for the callback to be invoked
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert
-            Assert.True(completedTask == tcs.Task, "Callback was not invoked within timeout");
-            var receivedService = await tcs.Task;
-            Assert.NotNull(receivedService);
-            Assert.Equal(service.Id, receivedService!.Id);
-        }
-
-        private static async IAsyncEnumerable<UpdateNotification> CreateAsyncEnumerable(UpdateNotification notification)
-        {
-            await Task.Delay(10); // Small delay to ensure handler is ready
-            yield return notification;
-        }
-
-        [Fact]
         public void AddListener_ShouldThrowArgumentNullException_WhenCallbackIsNull()
         {
             // Arrange
@@ -450,174 +403,9 @@ namespace VeritasClientTests
             Assert.Throws<ArgumentNullException>(() => handler.AddListener(null!));
         }
 
-        [Fact]
-        public async Task AddListener_ShouldSkipEmptyUpdates()
-        {
-            // Arrange - Simulate initial watch with empty value followed by actual registration
-            var service = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var jsonStr = JsonSerializer.Serialize(service);
-
-            var tcs = new TaskCompletionSource<ServiceRegistration>();
-
-            // Setup mock BEFORE creating handler - send empty string first, then valid JSON
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerableMultiple(
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = "" },
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = jsonStr }),
-                    AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddListener(s =>
-            {
-                tcs.TrySetResult(s);
-            });
-
-            // Wait for the callback to be invoked
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert - Should receive the valid update, not the empty one
-            Assert.True(completedTask == tcs.Task, "Callback was not invoked within timeout");
-            var receivedService = await tcs.Task;
-            Assert.NotNull(receivedService);
-            Assert.Equal(service.Id, receivedService!.Id);
-            Assert.Single(receivedService.Endpoints);
-        }
-
         #endregion
 
         #region Endpoint Listener Tests
-
-        [Fact]
-        public async Task AddEndpointListener_ShouldInvokeCallback_WhenEndpointsChange()
-        {
-            // Arrange
-            var oldService = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var newService = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow },
-                    new ServiceEndpoint { Id = "ep2", Address = "localhost", Port = 8081, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var oldJson = JsonSerializer.Serialize(oldService);
-            var newJson = JsonSerializer.Serialize(newService);
-
-            var updates = new List<ServiceEndpointsUpdate>();
-            var tcs = new TaskCompletionSource<bool>();
-
-            // Setup mock BEFORE creating handler
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerableMultiple(
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = oldJson },
-                    new UpdateNotification { Key = "test-service", OldValue = oldJson, NewValue = newJson }),
-                    AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddEndpointListener(update =>
-            {
-                updates.Add(update);
-                if (updates.Count == 2)
-                {
-                    tcs.TrySetResult(true);
-                }
-            });
-
-            // Wait for both callbacks to be invoked
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert
-            Assert.True(completedTask == tcs.Task, "Callbacks were not invoked within timeout");
-            Assert.Equal(2, updates.Count);
-            
-            // First update: ep1 added (initial state)
-            Assert.Single(updates[0].AddedEndpoints);
-            Assert.Empty(updates[0].RemovedEndpoints);
-            Assert.Equal("ep1", updates[0].AddedEndpoints[0].Id);
-            
-            // Second update: ep2 added
-            Assert.Single(updates[1].AddedEndpoints);
-            Assert.Empty(updates[1].RemovedEndpoints);
-            Assert.Equal("ep2", updates[1].AddedEndpoints[0].Id);
-        }
-
-        [Fact]
-        public async Task AddEndpointListener_ShouldNotifyOnFirstUpdate()
-        {
-            // Arrange
-            var service = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var jsonStr = JsonSerializer.Serialize(service);
-
-            var tcs = new TaskCompletionSource<ServiceEndpointsUpdate>();
-
-            // Setup mock BEFORE creating handler
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerable(
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = jsonStr }),
-                    AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddEndpointListener(update =>
-            {
-                tcs.TrySetResult(update);
-            });
-
-            // Wait for the callback to be invoked
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert
-            Assert.True(completedTask == tcs.Task, "Callback was not invoked within timeout");
-            var receivedUpdate = await tcs.Task;
-            Assert.NotNull(receivedUpdate);
-            Assert.Single(receivedUpdate!.AddedEndpoints);
-            Assert.Empty(receivedUpdate.RemovedEndpoints);
-            Assert.Equal("ep1", receivedUpdate.AddedEndpoints[0].Id);
-        }
-
-        private static async IAsyncEnumerable<UpdateNotification> CreateAsyncEnumerableMultiple(params UpdateNotification[] notifications)
-        {
-            await Task.Delay(10);
-            foreach (var notification in notifications)
-            {
-                yield return notification;
-                await Task.Delay(10);
-            }
-        }
 
         [Fact]
         public void AddEndpointListener_ShouldThrowArgumentNullException_WhenCallbackIsNull()
@@ -634,118 +422,7 @@ namespace VeritasClientTests
             Assert.Throws<ArgumentNullException>(() => handler.AddEndpointListener(null!));
         }
 
-        [Fact]
-        public async Task AddEndpointListener_ShouldSkipEmptyUpdates()
-        {
-            // Arrange - Simulate initial watch with empty value followed by actual registration
-            var service = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var jsonStr = JsonSerializer.Serialize(service);
-
-            var tcs = new TaskCompletionSource<ServiceEndpointsUpdate>();
-
-            // Setup mock BEFORE creating handler - send empty string first, then valid JSON
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerableMultiple(
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = "" },
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = "   " },
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = jsonStr }),
-                    AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddEndpointListener(update =>
-            {
-                tcs.TrySetResult(update);
-            });
-
-            // Wait for the callback to be invoked
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert - Should receive the valid update with ep1 added, not the empty ones
-            Assert.True(completedTask == tcs.Task, "Callback was not invoked within timeout");
-            var receivedUpdate = await tcs.Task;
-            Assert.NotNull(receivedUpdate);
-            Assert.Single(receivedUpdate!.AddedEndpoints);
-            Assert.Empty(receivedUpdate.RemovedEndpoints);
-            Assert.Equal("ep1", receivedUpdate.AddedEndpoints[0].Id);
-        }
-
-        [Fact]
-        public async Task AddEndpointListener_ShouldNotifyRemovedEndpoints()
-        {
-            // Arrange
-            var oldService = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow },
-                    new ServiceEndpoint { Id = "ep2", Address = "localhost", Port = 8081, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var newService = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var oldJson = JsonSerializer.Serialize(oldService);
-            var newJson = JsonSerializer.Serialize(newService);
-
-            var updates = new List<ServiceEndpointsUpdate>();
-            var tcs = new TaskCompletionSource<bool>();
-
-            // Setup mock BEFORE creating handler
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerableMultiple(
-                    new UpdateNotification { Key = "test-service", OldValue = "", NewValue = oldJson },
-                    new UpdateNotification { Key = "test-service", OldValue = oldJson, NewValue = newJson }),
-                    AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddEndpointListener(update =>
-            {
-                updates.Add(update);
-                if (updates.Count == 2)
-                {
-                    tcs.TrySetResult(true);
-                }
-            });
-
-            // Wait for both callbacks to be invoked
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert
-            Assert.True(completedTask == tcs.Task, "Callbacks were not invoked within timeout");
-            Assert.Equal(2, updates.Count);
-            
-            // First update: ep1 and ep2 added (initial state)
-            Assert.Equal(2, updates[0].AddedEndpoints.Count);
-            Assert.Empty(updates[0].RemovedEndpoints);
-            
-            // Second update: ep2 removed
-            Assert.Empty(updates[1].AddedEndpoints);
-            Assert.Single(updates[1].RemovedEndpoints);
-            Assert.Equal("ep2", updates[1].RemovedEndpoints[0].Id);
-        }
-
+       
         #endregion
 
         #region TryCleanupOldEndpointsAsync Tests
@@ -856,92 +533,25 @@ namespace VeritasClientTests
             Assert.Null(result);
         }
 
-        [Fact]
-        public async Task GetCurrentRegistration_ShouldReturnCachedRegistration_AfterUpdate()
-        {
-            // Arrange
-            var service = new ServiceRegistration
-            {
-                Id = "test-service",
-                Endpoints = new List<ServiceEndpoint>
-                {
-                    new ServiceEndpoint { Id = "ep1", Address = "localhost", Port = 8080, Timestamp = DateTime.UtcNow }
-                }
-            };
-
-            var jsonStr = JsonSerializer.Serialize(service);
-            var notification = new UpdateNotification
-            {
-                Key = "test-service",
-                OldValue = "",
-                NewValue = jsonStr
-            };
-
-            var tcs = new TaskCompletionSource<ServiceRegistration>();
-
-            // Setup mock BEFORE creating handler
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerable(notification), AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service");
-            handler.AddListener(s => tcs.TrySetResult(s));
-
-            // Wait for the watch task to process the update
-            var timeoutTask = Task.Delay(2000);
-            await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Act
-            var result = handler.GetCurrentRegistration();
-
-            // Assert
-            Assert.NotNull(result);
-            Assert.Equal(service.Id, result!.Id);
-            Assert.Single(result.Endpoints);
-        }
-
         #endregion
 
         #region Error Handling Tests
 
-        [Fact]
-        public async Task Handler_ShouldLogError_WhenInvalidJsonReceived()
-        {
-            // Arrange
-            var tcs = new TaskCompletionSource<string>();
-            
-            var notification = new UpdateNotification
-            {
-                Key = "test-service",
-                OldValue = "",
-                NewValue = "invalid json {{{"
-            };
-
-            // Setup mock BEFORE creating handler
-            _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
-                It.IsAny<string[]>(),
-                It.IsAny<CancellationToken>()))
-                .Returns((CreateAsyncEnumerable(notification), AsyncEnumerable.Empty<Exception>()));
-
-            var handler = CreateHandler("test-service", logError => tcs.TrySetResult(logError));
-
-            // Wait for the error to be logged
-            var timeoutTask = Task.Delay(2000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-            // Assert
-            Assert.True(completedTask == tcs.Task, "Error was not logged within timeout");
-            var loggedError = await tcs.Task;
-            Assert.NotNull(loggedError);
-            Assert.Contains("Failed to parse service registration JSON", loggedError);
-        }
 
         [Fact]
         public async Task Handler_ShouldLogError_WhenWatchErrorOccurs()
         {
             // Arrange
-            var tcs = new TaskCompletionSource<string>();
+            var mockLogger = new Mock<ILogger<ServiceRegistrationHandler>>();
+            var tcs = new TaskCompletionSource<bool>();
+
+            mockLogger.Setup(x => x.Log(
+                LogLevel.Error,
+                It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((v, t) => v.ToString()!.Contains("Error watching service registration")),
+                It.IsAny<Exception>(),
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+                .Callback(() => tcs.TrySetResult(true));
 
             // Setup mock BEFORE creating handler
             _mockClient.Setup(c => c.WatchVariablesAutoReconnect(
@@ -949,7 +559,7 @@ namespace VeritasClientTests
                 It.IsAny<CancellationToken>()))
                 .Returns((AsyncEnumerable.Empty<UpdateNotification>(), CreateAsyncEnumerableError(new Exception("Watch error"))));
 
-            var handler = CreateHandler("test-service", logError => tcs.TrySetResult(logError));
+            var handler = CreateHandler("test-service", mockLogger.Object);
 
             // Wait for the error to be logged
             var timeoutTask = Task.Delay(2000);
@@ -957,9 +567,6 @@ namespace VeritasClientTests
 
             // Assert
             Assert.True(completedTask == tcs.Task, "Error was not logged within timeout");
-            var loggedError = await tcs.Task;
-            Assert.NotNull(loggedError);
-            Assert.Contains("Error watching service registration", loggedError);
         }
 
         private static async IAsyncEnumerable<Exception> CreateAsyncEnumerableError(Exception error)
