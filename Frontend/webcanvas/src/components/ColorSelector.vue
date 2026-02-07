@@ -5,9 +5,12 @@ const emit = defineEmits<{
   colorChange: [color: { r: number; g: number; b: number; hex: string }]
 }>()
 
+// Expanded state
+const isExpanded = ref(false)
+
 // HSV color model
 const hue = ref(0) // 0-360
-const saturation = ref(100) // 0-100
+const saturation = ref(0) // 0-100
 const value = ref(100) // 0-100
 
 // Predefined colors
@@ -132,16 +135,36 @@ const saturationGradient = computed(() => {
 const valueGradient = computed(() => {
   return 'linear-gradient(to right, #000000 0%, #ffffff 100%)'
 })
+
+/**
+ * Toggle expanded state
+ */
+const toggleExpanded = () => {
+  isExpanded.value = !isExpanded.value
+}
 </script>
 
 <template>
-  <div class="color-selector">
-    <div class="color-display" :style="{ backgroundColor: currentColor.hex }">
-      <span class="color-hex">{{ currentColor.hex }}</span>
-    </div>
+  <div class="color-selector-wrapper">
+    <!-- Color circle - always visible -->
+    <div 
+      class="color-circle"
+      :style="{ backgroundColor: currentColor.hex }"
+      @click="toggleExpanded"
+      :title="isExpanded ? 'Close color picker' : 'Open color picker'"
+    ></div>
     
-    <div class="slider-group">
-      <label>Hue</label>
+    <!-- Expanded view: full color picker -->
+    <div v-if="isExpanded" class="color-selector">
+      <div class="color-header">
+        <div class="color-display" :style="{ backgroundColor: currentColor.hex }">
+          <span class="color-hex">{{ currentColor.hex }}</span>
+        </div>
+        <button class="close-button" @click="toggleExpanded">×</button>
+      </div>
+      
+      <div class="slider-group">
+        <label>Hue</label>
       <input 
         type="range" 
         min="0" 
@@ -191,33 +214,88 @@ const valueGradient = computed(() => {
         ></button>
       </div>
     </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.color-selector-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.color-circle {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3), inset 0 1px 2px rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.color-circle:hover {
+  transform: scale(1.15);
+  border-color: rgba(255, 255, 255, 0.6);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4), inset 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.color-circle:active {
+  transform: scale(0.95);
+}
+
 .color-selector {
   position: absolute;
-  top: 20px;
-  left: 20px;
-  z-index: 10;
-  background-color: #2a2a2a;
-  border: 1px solid #444;
-  border-radius: 8px;
-  padding: 15px;
-  width: 250px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  background-color: rgba(35, 35, 35, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 20px;
+  width: 280px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(10px);
+}
+
+.color-header {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  margin-bottom: 15px;
 }
 
 .color-display {
-  width: 100%;
+  flex: 1;
   height: 60px;
   border-radius: 4px;
-  margin-bottom: 15px;
   border: 2px solid #444;
   display: flex;
   align-items: flex-end;
   justify-content: center;
   padding-bottom: 5px;
+}
+
+.close-button {
+  width: 30px;
+  background-color: #333;
+  color: #fff;
+  border: 1px solid #555;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 24px;
+  line-height: 1;
+  transition: background-color 0.2s;
+  padding: 0;
+}
+
+.close-button:hover {
+  background-color: #444;
+}
+
+.close-button:active {
+  background-color: #222;
 }
 
 .color-hex {
@@ -248,6 +326,7 @@ const valueGradient = computed(() => {
   border-radius: 10px;
   outline: none;
   -webkit-appearance: none;
+  appearance: none;
   cursor: pointer;
   border: 1px solid #555;
 }

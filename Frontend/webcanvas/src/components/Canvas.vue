@@ -6,9 +6,9 @@ const canvasRef = ref<HTMLCanvasElement | null>(null)
 let ctx: CanvasRenderingContext2D | null = null
 let imageData: ImageData | null = null
 
-// Define canvas dimensions (4K resolution)
-const CANVAS_WIDTH = 256//4096
-const CANVAS_HEIGHT = 256//4096
+// Define canvas dimensions 
+const CANVAS_WIDTH = 256 //4096
+const CANVAS_HEIGHT = 256 //4096
 
 // Pan and zoom state
 const zoom = ref(0.9) // 0.9 = 90% of viewport height
@@ -18,7 +18,25 @@ const isDragging = ref(false)
 const dragStartX = ref(0)
 const dragStartY = ref(0)
 const isDrawing = ref(false)
-const brushRadius = ref(2) // Brush radius in pixels
+const brushRadius = ref(1) // Brush radius in pixels
+
+/**
+ * Set brush size
+ */
+const setBrushSize = (size: number) => {
+  brushRadius.value = size
+}
+
+/**
+ * Prevent toolbar clicks from reaching canvas
+ */
+const handleToolbarClick = (e: MouseEvent) => {
+  e.stopPropagation()
+}
+
+const handleToolbarMouseDown = (e: MouseEvent) => {
+  e.stopPropagation()
+}
 
 // Current drawing color
 const currentColor = ref({ r: 255, g: 255, b: 255, hex: '#FFFFFF' })
@@ -253,6 +271,12 @@ const handleWheel = (e: WheelEvent) => {
 }
 
 const handleMouseDown = (e: MouseEvent) => {
+  // Check if clicking on canvas (not on toolbar)
+  const target = e.target as HTMLElement
+  if (target.closest('.toolbar')) {
+    return // Ignore clicks on toolbar
+  }
+  
   if (e.button === 2) { // Right click for panning
     isDragging.value = true
     dragStartX.value = e.clientX - panX.value
@@ -320,13 +344,34 @@ defineExpose({
     @mouseleave="handleMouseLeave"
     @contextmenu="handleContextMenu"
   >
-    <ColorSelector @color-change="handleColorChange" />
-    <button class="reset-button" @click="resetView">Reset View</button>
     <canvas 
       ref="canvasRef" 
       class="canvas"
       :style="canvasStyle"
     ></canvas>
+    
+    <div class="toolbar" @mousedown="handleToolbarMouseDown" @click="handleToolbarClick">
+      <ColorSelector @color-change="handleColorChange" />
+      
+      <div class="separator"></div>
+      
+      <div class="brush-size-selector">
+        <button 
+          v-for="size in [0, 1, 2]" 
+          :key="size"
+          class="brush-size-button"
+          :class="{ active: brushRadius === size }"
+          @click="setBrushSize(size)"
+          :title="size === 0 ? 'Single pixel' : `Radius ${size}`"
+        >
+          <div class="brush-preview" :style="{ width: `${(size * 2 + 8)}px`, height: `${(size * 2 + 8)}px` }"></div>
+        </button>
+      </div>
+      
+      <div class="separator"></div>
+      
+      <button class="reset-button" @click="resetView" title="Reset view"></button>
+    </div>
   </div>
 </template>
 
@@ -349,26 +394,104 @@ defineExpose({
   image-rendering: pixelated;
   image-rendering: crisp-edges;
 }
-.reset-button {
+
+.toolbar {
   position: absolute;
-  top: 20px;
-  right: 20px;
+  bottom: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background-color: rgba(35, 35, 35, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 50px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(10px);
   z-index: 10;
-  padding: 10px 20px;
-  background-color: #333;
-  color: #fff;
-  border: 1px solid #555;
-  border-radius: 4px;
+}
+
+.separator {
+  width: 1px;
+  height: 24px;
+  background-color: rgba(255, 255, 255, 0.15);
+  margin: 0 4px;
+}
+
+.brush-size-selector {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.brush-size-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background-color: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 50%;
   cursor: pointer;
-  font-size: 14px;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.brush-size-button:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.4);
+  transform: scale(1.1);
+}
+
+.brush-size-button.active {
+  background-color: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+.brush-size-button:active {
+  transform: scale(0.95);
+}
+
+.brush-preview {
+  background-color: rgba(255, 255, 255, 0.8);
+  border-radius: 50%;
+  transition: all 0.2s ease;
+}
+
+.brush-size-button:hover .brush-preview {
+  background-color: rgba(255, 255, 255, 1);
+}
+
+.reset-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background-color: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 18px;
   font-family: inherit;
-  transition: background-color 0.2s;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.reset-button::before {
+  content: '⟲';
+  font-size: 20px;
 }
 
 .reset-button:hover {
-  background-color: #444;
+  background-color: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 1);
+  transform: scale(1.1);
 }
 
 .reset-button:active {
-  background-color: #222;
+  transform: scale(0.95);
 }</style>
