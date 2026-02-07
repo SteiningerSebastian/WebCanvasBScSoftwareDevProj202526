@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
+import ColorSelector from './ColorSelector.vue'
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 let ctx: CanvasRenderingContext2D | null = null
@@ -10,7 +11,7 @@ const CANVAS_WIDTH = 256//4096
 const CANVAS_HEIGHT = 256//4096
 
 // Pan and zoom state
-const zoom = ref(0.2) // Start at 20% zoom to see full 4K canvas
+const zoom = ref(0.9) // 0.9 = 90% of viewport height
 const panX = ref(0)
 const panY = ref(0)
 const isDragging = ref(false)
@@ -19,11 +20,41 @@ const dragStartY = ref(0)
 const isDrawing = ref(false)
 const brushRadius = ref(2) // Brush radius in pixels
 
+// Current drawing color
+const currentColor = ref({ r: 255, g: 255, b: 255, hex: '#FFFFFF' })
+
+/**
+ * Handle color change from color selector
+ */
+const handleColorChange = (color: { r: number; g: number; b: number; hex: string }) => {
+  currentColor.value = color
+}
+
+/**
+ * Calculate zoom level that fills the available height
+ */
+const getFillHeightZoom = (containerHeight: number): number => {
+  return containerHeight / CANVAS_HEIGHT
+}
+
 // Computed style for canvas transform
-const canvasStyle = computed(() => ({
-  transform: `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`,
-  transformOrigin: '0 0'
-}))
+const canvasStyle = computed(() => {
+  const container = canvasRef.value?.parentElement
+  if (!container) {
+    return {
+      transform: `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`,
+      transformOrigin: '0 0'
+    }
+  }
+  
+  const fillHeightZoom = getFillHeightZoom(container.clientHeight)
+  const actualZoom = zoom.value * fillHeightZoom
+  
+  return {
+    transform: `translate(${panX.value}px, ${panY.value}px) scale(${actualZoom})`,
+    transformOrigin: '0 0'
+  }
+})
 
 /**
  * Set a pixel at the given coordinates with the specified color
@@ -89,7 +120,7 @@ const drawCircle = (centerX: number, centerY: number, radius: number) => {
   for (let y = -radius; y <= radius; y++) {
     for (let x = -radius; x <= radius; x++) {
       if (x * x + y * y <= radius * radius) {
-        setPixel(centerX + x, centerY + y, 255, 255, 255, 255)
+        setPixel(centerX + x, centerY + y, currentColor.value.r, currentColor.value.g, currentColor.value.b, 255)
       }
     }
   }
@@ -158,22 +189,8 @@ onMounted(() => {
       
       // Center the canvas - calculate offset from top-left of container
       setTimeout(() => {
-        const container = canvasRef.value?.parentElement
-        if (container && canvasRef.value) {
-          const containerWidth = container.clientWidth
-          const containerHeight = container.clientHeight
-          const scaledWidth = CANVAS_WIDTH * zoom.value
-          const scaledHeight = CANVAS_HEIGHT * zoom.value
-          
-          // Center by positioning the scaled canvas in the middle of the viewport
-          panX.value = (containerWidth - scaledWidth) / 2
-          panY.value = (containerHeight - scaledHeight) / 2
-          
-          console.log('Canvas centered at:', panX.value, panY.value, 'zoom:', zoom.value)
-          console.log('Container size:', containerWidth, containerHeight)
-          console.log('Scaled canvas size:', scaledWidth, scaledHeight)
-        }
-      }, 0)
+        resetView()
+      }, 100)
     }
   }
 })
@@ -187,6 +204,26 @@ const getContext = () => ctx
  * Get the canvas element
  */
 const getCanvas = () => canvasRef.value
+
+/**
+ * Reset view to center and initial zoom
+ */
+const resetView = () => {
+  zoom.value = 0.9
+  
+  const container = canvasRef.value?.parentElement
+  if (container && canvasRef.value) {
+    const containerWidth = container.clientWidth
+    const containerHeight = container.clientHeight
+    const fillHeightZoom = getFillHeightZoom(containerHeight)
+    const actualZoom = zoom.value * fillHeightZoom
+    const scaledWidth = CANVAS_WIDTH * actualZoom
+    const scaledHeight = CANVAS_HEIGHT * actualZoom
+    
+    panX.value = (containerWidth - scaledWidth) / 2
+    panY.value = (containerHeight - scaledHeight) / 2
+  }
+}
 
 // Pan and zoom event handlers
 const handleWheel = (e: WheelEvent) => {
@@ -283,6 +320,8 @@ defineExpose({
     @mouseleave="handleMouseLeave"
     @contextmenu="handleContextMenu"
   >
+    <ColorSelector @color-change="handleColorChange" />
+    <button class="reset-button" @click="resetView">Reset View</button>
     <canvas 
       ref="canvasRef" 
       class="canvas"
@@ -295,7 +334,7 @@ defineExpose({
 .canvas-container {
   position: relative;
   width: 100%;
-  height: 100vh;
+  height: 100%;
   background-color: #1f1f1f;
   overflow: hidden;
   cursor: crosshair;
@@ -310,4 +349,26 @@ defineExpose({
   image-rendering: pixelated;
   image-rendering: crisp-edges;
 }
-</style>
+.reset-button {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 10;
+  padding: 10px 20px;
+  background-color: #333;
+  color: #fff;
+  border: 1px solid #555;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  font-family: inherit;
+  transition: background-color 0.2s;
+}
+
+.reset-button:hover {
+  background-color: #444;
+}
+
+.reset-button:active {
+  background-color: #222;
+}</style>

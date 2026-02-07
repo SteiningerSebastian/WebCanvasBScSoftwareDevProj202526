@@ -11,9 +11,10 @@ import Canvas from '../components/Canvas.vue'
 
 <style scoped>
   main {
-    display: block;
+    display: flex;
     justify-content: center;
     align-items: center;
-    height: 100vh;
+    height: calc(100% - 72px); 
+    margin: 0;
   }
 </style>
