@@ -16,12 +16,18 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
     private readonly ConcurrentBag<Func<uint, Task>> _subscribers = new();
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private readonly ConcurrentQueue<uint> _broadcastQueue = new();
+    private readonly SemaphoreSlim _broadcastSignal = new(0);
     private Task? _retryTask;
     private Task? _listeningTask;
+    private Task? _broadcastTask;
     private bool _disposed = false;
 
     const int CONNECTION_TIMEOUT_SECONDS = 15;
     const int PORT = 5050;
+    const int MTU = 1460; // 1500 -header mut be divisible by 4
+    const int MAX_KEYS_PER_BATCH = MTU / 4; // Maximum keys per batch (365)
+    const int BATCH_DELAY_MS = 10; // Wait up to 10ms to collect more keys
 
     public PeerConnectionService(
         IServiceRegistration serviceRegistration,
@@ -62,6 +68,9 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
         _retryTask = Task.Run(() => RetryFailedConnectionsLoopAsync(_cancellationTokenSource.Token));
 
         _listeningTask = Task.Run(() => StartListening());
+
+        // Start broadcast batching task
+        _broadcastTask = Task.Run(() => BroadcastBatchingLoopAsync(_cancellationTokenSource.Token));
     }
 
     /// <summary>
@@ -105,8 +114,8 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
             using var networkStream = client.GetStream();
             while (!_cancellationTokenSource.Token.IsCancellationRequested && client.Connected)
             {
-                var buffer = new byte[4];
-                var bytesRead = await networkStream.ReadAsync(buffer, 0, 4, _cancellationTokenSource.Token);
+                var buffer = new byte[MTU];
+                var bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length, _cancellationTokenSource.Token);
                 if (bytesRead == 0)
                 {
                     _logger.LogInformation("Peer at {RemoteEndPoint} closed the connection", client.Client.RemoteEndPoint);
@@ -115,23 +124,34 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
                     break; // Connection closed
                 }
 
+                if (bytesRead % 4 != 0)
+                {
+                    _logger.LogWarning("Received {BytesRead} bytes from peer at {RemoteEndPoint}, which is not a multiple of 4",
+                        bytesRead, client.Client.RemoteEndPoint);
+                    continue;
+                }
+
                 _logger.LogDebug("Received {BytesRead} bytes from peer at {RemoteEndPoint}", bytesRead, client.Client.RemoteEndPoint);
 
-                // Parse the invalidation key
-                var key = BitConverter.ToUInt32(buffer, 0);
-
-                _logger.LogDebug("Received invalidation for key {Key} from instance", key);
-                        
-                // Notify subscribers
-                foreach (var subscriber in _subscribers)
+                // Split multiple different invalidation keys
+                for (int i = 0; i < bytesRead - 3; i += 4)
                 {
-                    try
+                    // Parse the invalidation key
+                    var key = BitConverter.ToUInt32(buffer[i..(i + 4)], 0);
+
+                    _logger.LogDebug("Received invalidation for key {Key} from instance", key);
+
+                    // Notify subscribers
+                    foreach (var subscriber in _subscribers)
                     {
-                        await subscriber(key);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error notifying subscriber of invalidation for key {Key}", key);
+                        try
+                        {
+                            await subscriber(key);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error notifying subscriber of invalidation for key {Key}", key);
+                        }
                     }
                 }
             }
@@ -348,17 +368,114 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
     }
 
     /// <inheritdoc/>
-    public async Task BroadcastInvalidationAsync(uint key, CancellationToken cancellationToken = default)
+    public Task BroadcastInvalidationAsync(uint key, CancellationToken cancellationToken = default)
+    {
+        _broadcastQueue.Enqueue(key);
+        _broadcastSignal.Release();
+        _logger.LogDebug("Queued invalidation for key {Key} for batched broadcast", key);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Background task that batches invalidation keys and broadcasts them to all peers.
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token to signal the operation's cancellation.</param>
+    /// <returns>The task representing the asynchronous operation.</returns>
+    private async Task BroadcastBatchingLoopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogDebug("Starting broadcast batching loop");
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                // Wait for at least one key to be available
+                await _broadcastSignal.WaitAsync(cancellationToken);
+
+                var batch = new List<uint>();
+
+                // Collect the first key
+                if (_broadcastQueue.TryDequeue(out var firstKey))
+                {
+                    batch.Add(firstKey);
+                }
+
+                // Wait a short time to collect more keys (up to BATCH_DELAY_MS)
+                var deadline = DateTime.UtcNow.AddMilliseconds(BATCH_DELAY_MS);
+                while (batch.Count < MAX_KEYS_PER_BATCH && DateTime.UtcNow < deadline)
+                {
+                    // Try to get more keys from the queue
+                    if (_broadcastQueue.TryDequeue(out var key))
+                    {
+                        batch.Add(key);
+                    }
+                    else
+                    {
+                        // No more keys immediately available, wait a tiny bit
+                        await Task.Delay(1, cancellationToken);
+                    }
+                }
+
+                // Collect any remaining keys up to the batch limit (non-blocking final sweep)
+                while (batch.Count < MAX_KEYS_PER_BATCH && _broadcastQueue.TryDequeue(out var key))
+                {
+                    batch.Add(key);
+                }
+
+                // Drain any excess semaphore signals (one signal per dequeued item)
+                for (int i = 1; i < batch.Count; i++)
+                {
+                    if (_broadcastSignal.CurrentCount > 0)
+                    {
+                        _broadcastSignal.Wait(0);
+                    }
+                }
+
+                if (batch.Count == 0)
+                {
+                    continue;
+                }
+
+                await BroadcastBatchAsync(batch, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in broadcast batching loop");
+            }
+        }
+
+        _logger.LogDebug("Broadcast batching loop has exited");
+    }
+
+    /// <summary>
+    /// Broadcasts a batch of invalidation keys to all connected peers.
+    /// </summary>
+    /// <param name="batch">The list of invalidation keys to broadcast.</param>
+    /// <param name="cancellationToken">The cancellation token to signal the operation's cancellation.</param>
+    /// <returns>The task representing the asynchronous operation.</returns>
+    private async Task BroadcastBatchAsync(List<uint> batch, CancellationToken cancellationToken)
     {
         var connections = _peerConnections.Values.ToArray();
 
         if (connections.Length == 0)
         {
-            _logger.LogDebug("No peer connections available for broadcasting invalidation");
+            _logger.LogDebug("No peer connections available for broadcasting {Count} invalidation(s)", batch.Count);
             return;
         }
 
-        _logger.LogDebug("Broadcasting invalidation for key {Key} to {Count} peers", key, connections.Length);
+        _logger.LogDebug("Broadcasting batch of {BatchSize} invalidation key(s) to {PeerCount} peer(s)", 
+            batch.Count, connections.Length);
+
+        // Convert all keys to a single byte array
+        var buffer = new byte[batch.Count * 4];
+        for (int i = 0; i < batch.Count; i++)
+        {
+            BitConverter.TryWriteBytes(buffer.AsSpan(i * 4, 4), batch[i]);
+        }
 
         var broadcastTasks = connections
             .Where(client => client.Connected)
@@ -366,12 +483,12 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
             {
                 try
                 {
-                    _logger.LogDebug("Sending invalidation to peer");
-                    await client.GetStream().WriteAsync(BitConverter.GetBytes(key));
+                    await client.GetStream().WriteAsync(buffer, cancellationToken);
+                    _logger.LogDebug("Sent batch of {Count} invalidation(s) to peer", batch.Count);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to broadcast invalidation to a peer");
+                    _logger.LogWarning(ex, "Failed to broadcast batch to a peer");
                 }
             });
 
@@ -423,6 +540,7 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
 
         _cancellationTokenSource.Dispose();
         _connectionLock.Dispose();
+        _broadcastSignal.Dispose();
     }
 }
 
