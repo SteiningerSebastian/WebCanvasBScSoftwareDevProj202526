@@ -10,10 +10,10 @@ import Canvas from '../components/Canvas.vue'
 </template>
 
 <style scoped>
-main {
+  main {
     display: block;
     justify-content: center;
     align-items: center;
     height: 100vh;
-}
+  }
 </style>
