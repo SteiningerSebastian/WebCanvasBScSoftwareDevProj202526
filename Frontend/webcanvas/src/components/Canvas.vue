@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
+import * as signalR from '@microsoft/signalr'
 import ColorSelector from './ColorSelector.vue'
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -9,6 +10,12 @@ let imageData: ImageData | null = null
 // Define canvas dimensions 
 const CANVAS_WIDTH = 256 //4096
 const CANVAS_HEIGHT = 256 //4096
+
+// SignalR connection
+let connection: signalR.HubConnection | null = null
+const connectionStatus = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
+const pixelsReceived = ref(0)
+const pixelsSent = ref(0)
 
 // Pan and zoom state
 const zoom = ref(0.9) // 0.9 = 90% of viewport height
@@ -82,17 +89,28 @@ const canvasStyle = computed(() => {
  * @param g - Green component (0-255)
  * @param b - Blue component (0-255)
  * @param a - Alpha component (0-255), default 255
+ * @returns true if pixel was changed, false if it was already the target color
  */
-const setPixel = (x: number, y: number, r: number, g: number, b: number, a: number = 255) => {
-  if (!imageData || !ctx) return
+const setPixel = (x: number, y: number, r: number, g: number, b: number, a: number = 255): boolean => {
+  if (!imageData || !ctx) return false
   
-  if (x < 0 || x >= CANVAS_WIDTH || y < 0 || y >= CANVAS_HEIGHT) return
+  if (x < 0 || x >= CANVAS_WIDTH || y < 0 || y >= CANVAS_HEIGHT) return false
   
   const index = (y * CANVAS_WIDTH + x) * 4
+  
+  // Check if pixel is already the target color
+  if (imageData.data[index] === r && 
+      imageData.data[index + 1] === g && 
+      imageData.data[index + 2] === b && 
+      imageData.data[index + 3] === a) {
+    return false // No change needed
+  }
+  
   imageData.data[index] = r
   imageData.data[index + 1] = g
   imageData.data[index + 2] = b
   imageData.data[index + 3] = a
+  return true
 }
 
 /**
@@ -138,7 +156,31 @@ const drawCircle = (centerX: number, centerY: number, radius: number) => {
   for (let y = -radius; y <= radius; y++) {
     for (let x = -radius; x <= radius; x++) {
       if (x * x + y * y <= radius * radius) {
-        setPixel(centerX + x, centerY + y, currentColor.value.r, currentColor.value.g, currentColor.value.b, 255)
+        const pixelX = centerX + x
+        const pixelY = centerY + y
+        
+        // Set pixel locally - only proceed if pixel actually changed
+        const changed = setPixel(pixelX, pixelY, currentColor.value.r, currentColor.value.g, currentColor.value.b, 255)
+        
+        // Send to hub asynchronously if pixel changed and we're connected
+        if (changed && connection && connectionStatus.value === 'connected') {
+          // Fire and forget - don't await
+          connection.invoke('SetPixel', {
+            x: pixelX,
+            y: pixelY,
+            color: {
+              R: currentColor.value.r,
+              G: currentColor.value.g,
+              B: currentColor.value.b
+            }
+          }).then(() => {
+            pixelsSent.value++
+          }).catch((error) => {
+            console.error('Failed to send pixel to hub:', error)
+          })
+
+          console.log(`Pixel set at (${pixelX}, ${pixelY}) with color (${currentColor.value.r}, ${currentColor.value.g}, ${currentColor.value.b})`)
+        }
       }
     }
   }
@@ -186,6 +228,110 @@ const paintPattern = () => {
   console.log('Render complete!')
 }
 
+/**
+ * Initialize SignalR connection
+ */
+const connectToHub = async () => {
+  try {
+    console.log('Initializing SignalR connection to /canvas...')
+    connectionStatus.value = 'connecting'
+
+    connection = new signalR.HubConnectionBuilder()
+      .withUrl('http://localhost:8080/canvas')
+      .withAutomaticReconnect()
+      .configureLogging(signalR.LogLevel.Information)
+      .build()
+
+    // Register event handlers
+    connection.on('PixelReceived', (pixel: { x: number; y: number; color: { r: number; g: number; b: number } }) => {
+      pixelsReceived.value++
+      setPixel(pixel.x, pixel.y, pixel.color.r, pixel.color.g, pixel.color.b, 255)
+      render()
+    })
+
+    connection.on('PixelUpdated', (response: { x: number; y: number; color: { r?: number; g?: number; b?: number; R?: number; G?: number; B?: number } }) => {
+      // Handle both camelCase (r,g,b) and PascalCase (R,G,B) from SignalR
+      const r = response.color.r ?? response.color.R ?? 0
+      const g = response.color.g ?? response.color.G ?? 0
+      const b = response.color.b ?? response.color.B ?? 0
+
+      console.log(`Pixel updated at (${response.x}, ${response.y}): (${r}, ${g}, ${b})`)
+      
+      setPixel(response.x, response.y, r, g, b, 255)
+      render()
+    })
+
+    connection.on('CanvasStreamComplete', (count: number) => {
+      console.log(`Canvas stream complete: ${count} pixels received`)
+      render()
+    })
+
+    connection.on('CanvasStreamFailed', (error: string) => {
+      console.error(`Canvas stream failed: ${error}`)
+    })
+
+    connection.onreconnecting(() => {
+      console.warn('Connection lost, reconnecting...')
+      connectionStatus.value = 'connecting'
+    })
+
+    connection.onreconnected(() => {
+      console.log('Reconnected successfully')
+      connectionStatus.value = 'connected'
+      // Request canvas stream to sync state
+      streamCanvas()
+    })
+
+    connection.onclose((error) => {
+      console.error(`Connection closed: ${error || 'No error details'}`)
+      connectionStatus.value = 'disconnected'
+    })
+
+    // Start connection
+    await connection.start()
+    console.log('Connected successfully to CanvasHub')
+    connectionStatus.value = 'connected'
+    
+    // Request initial canvas state
+    await streamCanvas()
+
+  } catch (error) {
+    console.error('Failed to connect to hub:', error)
+    connectionStatus.value = 'disconnected'
+  }
+}
+
+/**
+ * Request canvas stream from server
+ */
+const streamCanvas = async () => {
+  if (!connection || connectionStatus.value !== 'connected') {
+    console.warn('Cannot stream canvas: not connected')
+    return
+  }
+  
+  try {
+    console.log('Requesting canvas stream...')
+    await connection.invoke('StreamCanvas')
+  } catch (error) {
+    console.error('Failed to stream canvas:', error)
+  }
+}
+
+/**
+ * Disconnect from SignalR hub
+ */
+const disconnectFromHub = async () => {
+  if (connection) {
+    try {
+      await connection.stop()
+      console.log('Disconnected from hub')
+    } catch (error) {
+      console.error('Error disconnecting from hub:', error)
+    }
+  }
+}
+
 onMounted(() => {
   if (canvasRef.value) {
     console.log('Canvas mounted, dimensions:', CANVAS_WIDTH, 'x', CANVAS_HEIGHT)
@@ -203,14 +349,22 @@ onMounted(() => {
       console.log('ImageData acquired, size:', imageData.data.length)
       
       // Paint the pattern
-      paintPattern()
+      // Only for Debug: paintPattern()
+      clear() // Start with a blank canvas
       
       // Center the canvas - calculate offset from top-left of container
       setTimeout(() => {
         resetView()
       }, 100)
+      
+      // Connect to SignalR hub
+      connectToHub()
     }
   }
+})
+
+onUnmounted(() => {
+  disconnectFromHub()
 })
 
 /**
@@ -349,6 +503,16 @@ defineExpose({
       class="canvas"
       :style="canvasStyle"
     ></canvas>
+    
+    <!-- Connection Status Badge -->
+    <div class="status-badge" :class="connectionStatus">
+      <div class="status-dot"></div>
+      <span>{{ connectionStatus === 'connected' ? 'Connected' : connectionStatus === 'connecting' ? 'Connecting...' : 'Disconnected' }}</span>
+      <div class="status-stats" v-if="connectionStatus === 'connected'">
+        <span>↓{{ pixelsReceived }}</span>
+        <span>↑{{ pixelsSent }}</span>
+      </div>
+    </div>
     
     <div class="toolbar" @mousedown="handleToolbarMouseDown" @click="handleToolbarClick">
       <ColorSelector @color-change="handleColorChange" />
@@ -494,4 +658,60 @@ defineExpose({
 
 .reset-button:active {
   transform: scale(0.95);
-}</style>
+}
+
+.status-badge {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background-color: rgba(35, 35, 35, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+  z-index: 11;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #f48771;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.status-badge.connecting .status-dot {
+  background-color: #dcdcaa;
+}
+
+.status-badge.connected .status-dot {
+  background-color: #4ec9b0;
+  animation: none;
+}
+
+.status-stats {
+  display: flex;
+  gap: 8px;
+  margin-left: 4px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+</style>

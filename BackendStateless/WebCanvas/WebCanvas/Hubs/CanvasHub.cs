@@ -26,7 +26,7 @@ public class CanvasHub : Microsoft.AspNetCore.SignalR.Hub
     /// invalidates the cache on all other instances, and notifies all connected clients.
     /// </summary>
     /// <param name="request">The pixel data to set</param>
-    public async Task SetPixel(SetPixelRequest request)
+    public async Task<bool> SetPixel(SetPixelRequest request)
     {
         try
         {
@@ -39,8 +39,13 @@ public class CanvasHub : Microsoft.AspNetCore.SignalR.Hub
 
             // Write-through to storage and update cache
             // This also publishes invalidation to other instances
-            await _cacheService.SetPixelAsync(request.X, request.Y, request.Color, Context.ConnectionAborted);
+            var isSet = await _cacheService.SetPixelAsync(request.X, request.Y, request.Color, Context.ConnectionAborted);
 
+            if (!isSet)
+            {
+                return false;
+            }
+            
             _logger.LogDebug(
                 "Pixel ({X}, {Y}) updated successfully",
                 request.X,
@@ -60,6 +65,7 @@ public class CanvasHub : Microsoft.AspNetCore.SignalR.Hub
 
             throw new HubException("Failed to set pixel", ex);
         }
+        return true;
     }
 
     /// <summary>

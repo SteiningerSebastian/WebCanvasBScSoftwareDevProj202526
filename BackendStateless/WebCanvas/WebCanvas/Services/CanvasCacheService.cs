@@ -179,7 +179,7 @@ public class CanvasCacheService : ICanvasCacheService
         }
     }
 
-    public async Task SetPixelAsync(uint x, uint y, RGBColor color, CancellationToken cancellationToken = default)
+    public async Task<bool> SetPixelAsync(uint x, uint y, RGBColor color, CancellationToken cancellationToken = default)
     {
         var pixel = new Pixel { X = x, Y = y, Color = color };
         var key = pixel.ToKey();
@@ -187,7 +187,13 @@ public class CanvasCacheService : ICanvasCacheService
         try
         {
             // Write-through: Write to partitioning controller first
-            await _partitioningClient.SetAsync(key, pixel.Color.ToBytes(), cancellationToken);
+            var result = await _partitioningClient.SetAsync(key, pixel.Color.ToBytes(), cancellationToken);
+
+            if (result.Status != 0b0001)
+            {
+                _logger.LogWarning("Failed to set pixel ({X}, {Y}) in partitioning controller: {Status}", x, y, result.Status);
+                return false;
+            }
 
             // Update local cache
             _cache[key] = color;
@@ -218,6 +224,8 @@ public class CanvasCacheService : ICanvasCacheService
             _logger.LogError(ex, "Failed to set pixel ({X}, {Y})", x, y);
             throw;
         }
+
+        return true;
     }
 
     public async Task<Pixel?> GetPixelAsync(uint x, uint y, CancellationToken cancellationToken = default)

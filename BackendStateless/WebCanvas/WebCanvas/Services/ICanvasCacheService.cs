@@ -11,7 +11,7 @@ namespace WebCanvas.Services
         /// <summary>
         /// Set a pixel value (write-through to partitioning controller).
         /// </summary>
-        Task SetPixelAsync(uint x, uint y, RGBColor color, CancellationToken cancellationToken = default);
+        Task<bool> SetPixelAsync(uint x, uint y, RGBColor color, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Get a pixel value (from cache).

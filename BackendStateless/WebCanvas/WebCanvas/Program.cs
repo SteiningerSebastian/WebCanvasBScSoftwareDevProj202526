@@ -100,7 +100,11 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 
 // Add SignalR
-builder.Services.AddSignalR();
+builder.Services.AddSignalR(options =>
+{
+    options.MaximumParallelInvocationsPerClient = 1024;
+    options.StreamBufferCapacity = 1024;
+});
 
 builder.Services.AddPartitioningControllerClientWithLogging();
 

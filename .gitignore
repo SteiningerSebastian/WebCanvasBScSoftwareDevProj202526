@@ -37,3 +37,4 @@ target
 /BackendStateless/WebCanvas/VeritasClientTests/bin/Release/net10.0
 /BackendStateless/WebCanvas/WebCanvas/bin/Release/net10.0
 /BackendStateless/WebCanvas/WebCanvasTests/bin/Release/net10.0
+/node_modules
