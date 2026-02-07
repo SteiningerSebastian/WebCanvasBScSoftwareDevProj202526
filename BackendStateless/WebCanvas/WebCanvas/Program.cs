@@ -8,6 +8,18 @@ using WebCanvas.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Because this is an educational example, we allow CORS requests
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("SignalRPolicy", builder =>
+    {
+        builder.WithOrigins("http://localhost:5173") 
+               .AllowAnyHeader()
+               .AllowAnyMethod()
+               .AllowCredentials();
+    });
+});
+
 // Configure host options to prevent BackgroundService failures from stopping the host
 builder.Services.Configure<HostOptions>(options =>
 {
@@ -125,6 +137,8 @@ builder.Services.AddHttpLogging();
 
 var app = builder.Build();
 
+app.UseCors("SignalRPolicy");
+
 // Enable HTTP logging
 app.UseHttpLogging();
 
@@ -134,7 +148,7 @@ app.UseStaticFiles();
 app.MapControllers();
 
 // Map SignalR hubs
-app.MapHub<CanvasHub>("/canvas");  // For end-user clients
+app.MapHub<CanvasHub>("/canvas").RequireCors("SignalRPolicy"); 
 
 // Health check endpoint
 app.MapGet("/health", () => "WebCanvas is running.");
