@@ -17,7 +17,7 @@ public class ServiceRegistrationService : BackgroundService
     private readonly ServiceRegistrationOptions _options;
     private readonly ILogger<ServiceRegistrationService> _logger;
     private readonly IHostApplicationLifetime _lifetime;
-    private IServiceRegistration? _registrationHandler;
+    private IServiceRegistrationHandler? _registrationHandler;
     private ServiceEndpoint? _currentEndpoint;
     private string? _serverAddress;
     private int _serverPort;
@@ -27,7 +27,7 @@ public class ServiceRegistrationService : BackgroundService
         IOptions<ServiceRegistrationOptions> options,
         ILogger<ServiceRegistrationService> logger,
         IHostApplicationLifetime lifetime,
-        IServiceRegistration serviceRegistration,
+        IServiceRegistrationHandler serviceRegistration,
         IConfiguration configuration)
     {
         _veritasClient = veritasClient ?? throw new ArgumentNullException(nameof(veritasClient));

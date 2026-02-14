@@ -8,7 +8,7 @@ namespace WebCanvas.Services;
 
 public class PeerConnectionService : IPeerConnectionService, IHostedService, IDisposable
 {
-    private readonly IServiceRegistration _serviceRegistration;
+    private readonly IServiceRegistrationHandler _serviceRegistration;
     private readonly ILogger<PeerConnectionService> _logger;
     private readonly string _instanceId;
     private readonly ConcurrentDictionary<string, TcpClient> _peerConnections = new();
@@ -30,7 +30,7 @@ public class PeerConnectionService : IPeerConnectionService, IHostedService, IDi
     const int BATCH_DELAY_MS = 10; // Wait up to 10ms to collect more keys
 
     public PeerConnectionService(
-        IServiceRegistration serviceRegistration,
+        IServiceRegistrationHandler serviceRegistration,
         ILogger<PeerConnectionService> logger)
     {
         _serviceRegistration = serviceRegistration ?? throw new ArgumentNullException(nameof(serviceRegistration));

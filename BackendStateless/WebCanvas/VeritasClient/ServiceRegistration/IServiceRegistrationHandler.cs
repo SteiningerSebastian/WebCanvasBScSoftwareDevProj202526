@@ -5,7 +5,7 @@ namespace VeritasClient.ServiceRegistration;
 /// <summary>
 /// Interface for service registration operations.
 /// </summary>
-public interface IServiceRegistration
+public interface IServiceRegistrationHandler
 {
     /// <summary>
     /// Registers a new service or updates an existing one with the service registry.

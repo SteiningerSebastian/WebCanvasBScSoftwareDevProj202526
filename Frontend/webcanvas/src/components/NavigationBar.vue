@@ -5,8 +5,8 @@
         <h1>WebCanvas</h1>
       </div>
       <div class="nav-links">
-        <a href="#canvas" class="nav-link">Canvas</a>
-        <a href="#about" class="nav-link">About</a>
+        <a href="/" class="nav-link">Canvas</a>
+        <a href="about" class="nav-link">About</a>
       </div>
     </div>
   </nav>

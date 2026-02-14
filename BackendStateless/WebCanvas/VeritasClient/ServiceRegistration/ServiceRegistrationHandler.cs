@@ -8,7 +8,7 @@ namespace VeritasClient.ServiceRegistration;
 /// <summary>
 /// Implements service registration operations using Veritas as the backend.
 /// </summary>
-public class ServiceRegistrationHandler : IServiceRegistration, IDisposable
+public class ServiceRegistrationHandler : IServiceRegistrationHandler, IDisposable
 {
     private readonly IVeritasClient _client;
     private readonly string _serviceName;

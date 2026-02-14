@@ -10,12 +10,12 @@ namespace WebCanvasTests
 {
     public class PeerConnectionServiceTests
     {
-        private readonly Mock<IServiceRegistration> _mockServiceRegistration;
+        private readonly Mock<IServiceRegistrationHandler> _mockServiceRegistration;
         private readonly Mock<ILogger<PeerConnectionService>> _mockLogger;
 
         public PeerConnectionServiceTests()
         {
-            _mockServiceRegistration = new Mock<IServiceRegistration>();
+            _mockServiceRegistration = new Mock<IServiceRegistrationHandler>();
             _mockLogger = new Mock<ILogger<PeerConnectionService>>();
         }
 

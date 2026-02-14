@@ -109,7 +109,7 @@ builder.Services.AddSignalR(options =>
 builder.Services.AddPartitioningControllerClientWithLogging();
 
 // Add service registration handler as a singleton (needed by PeerConnectionService)
-builder.Services.AddSingleton<IServiceRegistration>(sp =>
+builder.Services.AddSingleton<IServiceRegistrationHandler>(sp =>
 {
     var veritasClient = sp.GetRequiredService<IVeritasClient>();
     var logger = sp.GetRequiredService<ILogger<ServiceRegistrationHandler>>();
