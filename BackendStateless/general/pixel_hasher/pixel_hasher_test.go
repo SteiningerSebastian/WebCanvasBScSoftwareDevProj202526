@@ -4,18 +4,6 @@ import (
 	"testing"
 )
 
-func TestPixelHasher(t *testing.T) {
-	// Test with empty data
-	if got := PixelHasher([]byte{}); got != 42 {
-		t.Errorf("PixelHasher([]) = %v, want 42", got)
-	}
-
-	// Test with some data
-	if got := PixelHasher([]byte{1, 2, 3}); got != 42 {
-		t.Errorf("PixelHasher([1,2,3]) = %v, want 42", got)
-	}
-}
-
 func TestPixelToKey_Uniqueness(t *testing.T) {
 	seen := make(map[uint32]struct{})
 	for x := uint16(0); x < 256; x++ {

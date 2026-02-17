@@ -1,10 +1,6 @@
 // A package containing functions for hashing pixel data and converting pixel coordinates to keys.
 package pixelhasher
 
-func PixelHasher(data []byte) uint32 {
-	return 42 // Placeholder implementation
-}
-
 // PixelToKey converts pixel coordinates (x, y) into a unique uint32 key.
 func PixelToKey(x uint16, y uint16) uint32 {
 	key := uint32(x)<<16 | uint32(y)
@@ -113,7 +109,7 @@ func inversePermute32Bitwise(x uint32) uint32 {
 	//
 	// Same reasoning as Step 2.
 	//
-	// Inverse: x *= 0xf6e5c5df;
+	// Inverse:
 	x *= 0x43021123
 
 	// Step 3: XOR-shift to further mix bits
@@ -133,7 +129,7 @@ func inversePermute32Bitwise(x uint32) uint32 {
 	//
 	// This spreads bit dependencies across many bit positions.
 	//
-	// Inverse: x *= 0x1f123bb5;
+	// Inverse
 	x *= 0x1D69E2A5
 
 	// Step 1: XOR upper 16 bits into lower 16 bits
