@@ -36,11 +36,13 @@
           @touchend="handleTouchEnd"
         >
           <img 
+            ref="imageRef"
             :src="src" 
             :alt="alt" 
             class="fullscreen-svg"
             :style="imageStyle"
             draggable="false"
+            @load="resetZoom"
           />
         </div>
       </div>
@@ -49,7 +51,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 
 interface Props {
   src: string
@@ -63,6 +65,7 @@ const scale = ref(1)
 const translateX = ref(0)
 const translateY = ref(0)
 const contentRef = ref<HTMLElement | null>(null)
+const imageRef = ref<HTMLImageElement | null>(null)
 
 let isDragging = false
 let startX = 0
@@ -78,12 +81,18 @@ const imageStyle = computed(() => ({
 const openFullscreen = () => {
   isFullscreen.value = true
   document.body.style.overflow = 'hidden'
+  // Reset zoom to fit screen when opening fullscreen
+  nextTick(() => {
+    resetZoom()
+  })
 }
 
 const closeFullscreen = () => {
   isFullscreen.value = false
   document.body.style.overflow = ''
-  resetZoom()
+  scale.value = 1
+  translateX.value = 0
+  translateY.value = 0
 }
 
 const zoomIn = () => {
@@ -95,7 +104,32 @@ const zoomOut = () => {
 }
 
 const resetZoom = () => {
-  scale.value = 1
+  // Calculate scale to fit image to viewport
+  if (!contentRef.value || !imageRef.value) {
+    scale.value = 1
+    translateX.value = 0
+    translateY.value = 0
+    return
+  }
+
+  const viewportWidth = contentRef.value.clientWidth
+  const viewportHeight = contentRef.value.clientHeight
+  const imageWidth = imageRef.value.naturalWidth
+  const imageHeight = imageRef.value.naturalHeight
+
+  if (!imageWidth || !imageHeight) {
+    scale.value = 1
+    translateX.value = 0
+    translateY.value = 0
+    return
+  }
+
+  // Calculate scale to fit either width or height (whichever is more constrained)
+  const scaleX = viewportWidth / imageWidth
+  const scaleY = viewportHeight / imageHeight
+  const fitScale = Math.min(scaleX, scaleY) // Fit to screen (scale up or down as needed)
+
+  scale.value = fitScale
   translateX.value = 0
   translateY.value = 0
 }
@@ -207,8 +241,8 @@ const handleTouchEnd = () => {
   position: fixed;
   top: 0;
   left: 0;
-  width: 100vw;
-  height: 100vh;
+  width: 100dvw;
+  height: 100dvh;
   background: rgba(0, 0, 0, 0.95);
   z-index: 10000;
   display: flex;
@@ -274,10 +308,12 @@ const handleTouchEnd = () => {
   display: flex;
   gap: 0.5rem;
   z-index: 10001;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgba(0, 0, 0, 0.85);
   padding: 0.5rem;
   border-radius: 0.5rem;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  pointer-events: auto;
 }
 
 .zoom-controls button {

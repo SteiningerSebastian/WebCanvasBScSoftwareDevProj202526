@@ -27,6 +27,13 @@ const dragStartY = ref(0)
 const isDrawing = ref(false)
 const brushRadius = ref(1) // Brush radius in pixels
 
+// Touch state
+let lastTouchDistance = 0
+let lastTouchX = 0
+let lastTouchY = 0
+const isTouching = ref(false)
+const touchMode = ref<'draw' | 'pan' | 'zoom'>('draw')
+
 /**
  * Set brush size
  */
@@ -58,8 +65,10 @@ const handleColorChange = (color: { r: number; g: number; b: number; hex: string
 /**
  * Calculate zoom level that fills the available height
  */
-const getFillHeightZoom = (containerHeight: number): number => {
-  return containerHeight / CANVAS_HEIGHT
+const getFillZoom = (containerHeight: number, containerWidth: number): number => {
+  const zoomHeight = containerHeight / CANVAS_HEIGHT
+  const zoomWidth = containerWidth / CANVAS_WIDTH
+  return Math.min(zoomHeight, zoomWidth)
 }
 
 // Computed style for canvas transform
@@ -72,7 +81,7 @@ const canvasStyle = computed(() => {
     }
   }
   
-  const fillHeightZoom = getFillHeightZoom(container.clientHeight)
+  const fillHeightZoom = getFillZoom(container.clientHeight, container.clientWidth)
   const actualZoom = zoom.value * fillHeightZoom
   
   return {
@@ -203,6 +212,51 @@ const getCanvasCoordinates = (e: MouseEvent): { x: number, y: number } | null =>
   const canvasY = Math.floor(clickY / scaleY)
   
   return { x: canvasX, y: canvasY }
+}
+
+/**
+ * Convert touch event to canvas coordinates
+ */
+const getCanvasCoordinatesFromTouch = (touch: Touch): { x: number, y: number } | null => {
+  if (!canvasRef.value) return null
+  
+  const rect = canvasRef.value.getBoundingClientRect()
+  const clickX = touch.clientX - rect.left
+  const clickY = touch.clientY - rect.top
+  
+  const scaleX = rect.width / CANVAS_WIDTH
+  const scaleY = rect.height / CANVAS_HEIGHT
+  
+  const canvasX = Math.floor(clickX / scaleX)
+  const canvasY = Math.floor(clickY / scaleY)
+  
+  return { x: canvasX, y: canvasY }
+}
+
+/**
+ * Calculate distance between two touch points
+ */
+const getTouchDistance = (touches: TouchList): number => {
+  if (touches.length < 2) return 0
+  const touch0 = touches[0]
+  const touch1 = touches[1]
+  if (!touch0 || !touch1) return 0
+  const dx = touch0.clientX - touch1.clientX
+  const dy = touch0.clientY - touch1.clientY
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+/**
+ * Get center point between two touches
+ */
+const getTouchCenter = (touches: TouchList): { x: number, y: number } | null => {
+  const touch0 = touches[0]
+  const touch1 = touches[1]
+  if (!touch0 || !touch1) return null
+  return {
+    x: (touch0.clientX + touch1.clientX) / 2,
+    y: (touch0.clientY + touch1.clientY) / 2
+  }
 }
 
 /**
@@ -387,8 +441,8 @@ const resetView = () => {
   if (container && canvasRef.value) {
     const containerWidth = container.clientWidth
     const containerHeight = container.clientHeight
-    const fillHeightZoom = getFillHeightZoom(containerHeight)
-    const actualZoom = zoom.value * fillHeightZoom
+    const fillZoom = getFillZoom(containerHeight, containerWidth)
+    const actualZoom = zoom.value * fillZoom
     const scaledWidth = CANVAS_WIDTH * actualZoom
     const scaledHeight = CANVAS_HEIGHT * actualZoom
     
@@ -474,6 +528,131 @@ const handleContextMenu = (e: MouseEvent) => {
   e.preventDefault() // Prevent right-click menu
 }
 
+// Touch event handlers
+const handleTouchStart = (e: TouchEvent) => {
+  // Check if touching toolbar
+  const target = e.target as HTMLElement
+  if (target.closest('.toolbar') || target.closest('.status-badge')) {
+    return // Let toolbar handle its own events
+  }
+
+  e.preventDefault()
+  isTouching.value = true
+  
+  if (e.touches.length === 1) {
+    // Single touch - prepare for drawing (but don't draw yet)
+    touchMode.value = 'draw'
+    const touch = e.touches[0]
+    if (!touch) return
+    lastTouchX = touch.clientX
+    lastTouchY = touch.clientY
+    // Don't draw immediately - wait for touchMove to confirm it's a drag
+  } else if (e.touches.length === 2) {
+    // Two touches - start pinch zoom
+    touchMode.value = 'zoom'
+    isDrawing.value = false
+    lastTouchDistance = getTouchDistance(e.touches)
+    const center = getTouchCenter(e.touches)
+    if (!center) return
+    lastTouchX = center.x
+    lastTouchY = center.y
+  }
+}
+
+const handleTouchMove = (e: TouchEvent) => {
+  if (!isTouching.value) return
+  
+  // Check if touching toolbar - let toolbar handle its own events
+  const target = e.target as HTMLElement
+  if (target.closest('.toolbar') || target.closest('.status-badge')) {
+    return
+  }
+  
+  e.preventDefault()
+  
+  if (e.touches.length === 1 && touchMode.value === 'draw') {
+    // Single touch drawing
+    const touch = e.touches[0]
+    if (!touch) return
+    const coords = getCanvasCoordinatesFromTouch(touch)
+    if (coords && coords.x >= 0 && coords.x < CANVAS_WIDTH && coords.y >= 0 && coords.y < CANVAS_HEIGHT) {
+      isDrawing.value = true
+      drawCircle(coords.x, coords.y, brushRadius.value)
+      render()
+    }
+    lastTouchX = touch.clientX
+    lastTouchY = touch.clientY
+  } else if (e.touches.length === 2) {
+    // Two finger gestures
+    const currentDistance = getTouchDistance(e.touches)
+    const center = getTouchCenter(e.touches)
+    if (!center) return
+    
+    if (touchMode.value === 'draw') {
+      // Switched from drawing to two-finger gesture
+      touchMode.value = 'zoom'
+      isDrawing.value = false
+      lastTouchDistance = currentDistance
+      lastTouchX = center.x
+      lastTouchY = center.y
+      return
+    }
+    
+    // Pinch to zoom
+    if (lastTouchDistance > 0 && currentDistance > 0) {
+      const distanceDelta = currentDistance - lastTouchDistance
+      const zoomDelta = (distanceDelta / 200) * zoom.value // Scale zoom based on current zoom level
+      const newZoom = Math.max(0.05, Math.min(100, zoom.value + zoomDelta))
+      
+      // Zoom toward pinch center
+      if (canvasRef.value) {
+        panX.value = center.x - (center.x - panX.value) * (newZoom / zoom.value)
+        panY.value = center.y - (center.y - panY.value) * (newZoom / zoom.value)
+      }
+      
+      zoom.value = newZoom
+    }
+    
+    // Pan with two fingers
+    const deltaX = center.x - lastTouchX
+    const deltaY = center.y - lastTouchY
+    panX.value += deltaX
+    panY.value += deltaY
+    
+    lastTouchDistance = currentDistance
+    lastTouchX = center.x
+    lastTouchY = center.y
+  }
+}
+
+const handleTouchEnd = (e: TouchEvent) => {
+  // Check if touching toolbar - let toolbar handle its own events
+  const target = e.target as HTMLElement
+  if (target.closest('.toolbar') || target.closest('.status-badge')) {
+    return // Let toolbar handle its own click events
+  }
+  
+  e.preventDefault()
+  
+  if (e.touches.length === 0) {
+    // All touches ended
+    isTouching.value = false
+    isDrawing.value = false
+    isDragging.value = false
+    lastTouchDistance = 0
+    touchMode.value = 'draw'
+  } else if (e.touches.length === 1 && touchMode.value === 'zoom') {
+    // Went from two fingers to one - switch back to draw mode
+    touchMode.value = 'draw'
+    lastTouchDistance = 0
+    const touch = e.touches[0]
+    if (touch) {
+      lastTouchX = touch.clientX
+      lastTouchY = touch.clientY
+    }
+  }
+}
+
 // Expose methods to parent components
 defineExpose({
   setPixel,
@@ -497,6 +676,10 @@ defineExpose({
     @mouseup="handleMouseUp"
     @mouseleave="handleMouseLeave"
     @contextmenu="handleContextMenu"
+    @touchstart="handleTouchStart"
+    @touchmove="handleTouchMove"
+    @touchend="handleTouchEnd"
+    @touchcancel="handleTouchEnd"
   >
     <canvas 
       ref="canvasRef" 
@@ -543,10 +726,13 @@ defineExpose({
 .canvas-container {
   position: relative;
   width: 100%;
-  height: 100%;
+  height: calc(100dvh - 72px);
   background-color: #1f1f1f;
   overflow: hidden;
   cursor: crosshair;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .canvas {
@@ -574,6 +760,7 @@ defineExpose({
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(10px);
   z-index: 10;
+  touch-action: auto;
 }
 
 .separator {
@@ -676,6 +863,7 @@ defineExpose({
   z-index: 11;
   font-size: 12px;
   color: rgba(255, 255, 255, 0.8);
+  touch-action: auto;
 }
 
 .status-dot {

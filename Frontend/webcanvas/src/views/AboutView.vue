@@ -1511,19 +1511,19 @@ const diagramConnections = [
 </script>
 
 <style>
+.page {
+  overflow-y: scroll;
+  height: calc(100dvh - 72px);
+}
+
 .about {
   margin: 1rem auto;
   padding: 0 2rem;
   max-width: 1280px;
   color: #ffffff;
-  overflow:auto;
-  height: max-content;
-  padding-bottom: 2em;
-}
-
-.page {
-  overflow: auto;
-  height: calc(100vh - 72px);
+  overflow: visible;
+  height: fit-content;
+  padding-bottom: 5em;
 }
 
 p {

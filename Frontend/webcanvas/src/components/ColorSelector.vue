@@ -255,9 +255,17 @@ const toggleExpanded = () => {
   border-radius: 12px;
   padding: 20px;
   width: 280px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 100 
+0 1px rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(10px);
 }
+
+@media (max-width: 768px) {
+  .color-selector {
+  transform: translateX(-25%);
+  }
+}
+
 
 .color-header {
   display: flex;

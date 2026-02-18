@@ -99,7 +99,7 @@ const handleClick = () => {
   if (props.targetSection) {
     const element = document.getElementById(props.targetSection)
     if (element) {
-      element.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      element.scrollIntoView({ behavior: 'smooth', block: 'start', inline: 'nearest' })
     }
   }
 }

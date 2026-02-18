@@ -14,7 +14,7 @@ import Canvas from '../components/Canvas.vue'
     display: flex;
     justify-content: center;
     align-items: center;
-    height: calc(100% - 72px); 
+    height: calc(100dvh - 72px); 
     margin: 0;
   }
 </style>
