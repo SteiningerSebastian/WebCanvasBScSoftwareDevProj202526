@@ -321,7 +321,8 @@ const handleTouchEnd = () => {
   }
   
   .zoom-controls {
-    bottom: 1rem;
+    bottom: 3rem;
+    bottom: max(3rem, env(safe-area-inset-bottom, 0px) + 1rem);
   }
   
   .zoom-controls button {
