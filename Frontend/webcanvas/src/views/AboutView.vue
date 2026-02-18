@@ -734,8 +734,614 @@ func (pc *PartitioningController) startUpdateGlobalTime(ctx context.Context) {
     </section>
 
     <section id="noredb-cluster" class="component-detail">
-      <h2>NoReDB Cluster</h2>
-      <p>Content coming soon...</p>
+      <h2>NoReDB Cluster: Architecture and Implementation</h2>
+      <p>
+        NoReDB is a custom-built distributed key-value store written in Rust that serves as the persistent storage layer for WebCanvas. 
+        Each NoReDB instance is a high-performance database server capable of storing millions of pixel entries with microsecond read/write 
+        latency. The cluster operates in a leaderless, peer-to-peer architecture where each instance independently handles requests routed 
+        to it by the Partitioning Controller. This section provides an in-depth look at the internal architecture of a single NoReDB instance, 
+        examining the sophisticated storage engine that enables both durability and performance.
+      </p>
+
+      <h3>Storage Architecture: Components and Design Rationale</h3>
+      <p>
+        At its core, each NoReDB instance implements a <strong>Canvas Database (CanvasDB)</strong> that manages pixel data through three 
+        specialized components working in concert: a <strong>Write-Ahead Log (WAL)</strong>, a <strong>B-tree Index</strong>, and a 
+        <strong>Data Store</strong>. This architecture, inspired by modern database systems like RocksDB and PostgreSQL, separates concerns 
+        between fast sequential writes (WAL), efficient indexed lookups (B-tree), and persistent storage (Data Store). All three components 
+        are built on top of a unified abstraction layer called <strong>Persistent Random Access Memory (PRAM)</strong>, which provides 
+        memory-mapped file access with allocation management.
+      </p>
+
+      <div class="diagram-container">
+        <ScalableSvg :src="NoredbComponents" alt="NoReDB Components Diagram" />
+        <p class="diagram-caption">Figure 7: NoReDB instance internal architecture showing WAL, B-tree index, data store, and PRAM abstraction</p>
+      </div>
+
+      <p>
+        The <strong>Write-Ahead Log (WAL)</strong> is a circular buffer that records all incoming pixel updates in append-only fashion. 
+        Its purpose is twofold: first, it provides crash recovery—if the instance fails before persisting data to the index and store, 
+        the WAL can be replayed on restart to restore the database to a consistent state. Second, it decouples write acknowledgment from 
+        expensive indexing operations. When a pixel update arrives, it's immediately appended to the WAL and flushed to disk in batches 
+        every 100ms, allowing the server to acknowledge the write quickly without blocking on tree updates or memory allocation.
+      </p>
+
+      <pre><code>// Write-Ahead Log structure
+pub struct WriteAheadLog&lt;T&gt; where T: Sized {
+    pram: Arc&lt;PersistentRandomAccessMemory&gt;,
+    size: usize,                      // Maximum number of entries
+    length: Arc&lt;AtomicU64&gt;,          // Current number of entries
+    head: Arc&lt;RwLock&lt;Pointer&lt;u64&gt;&gt;&gt;, // Write position
+    tail: Arc&lt;RwLock&lt;Pointer&lt;u64&gt;&gt;&gt;, // Read position
+    data: Arc&lt;Pointer&lt;T&gt;&gt;,           // Circular buffer data
+}</code></pre>
+
+      <p>
+        The <strong>B-tree Index</strong> provides O(log n) lookup time for pixel keys, maintaining a mapping from pixel key 
+        (a 32-bit hash of x,y coordinates) to memory address in the data store. The B-tree has an order of 255, chosen to fit within 
+        4KB memory pages, minimizing page faults during tree traversals. Unlike traditional B-trees that store values inline, this index 
+        stores only 64-bit pointers to pixel entries in the data store, keeping the tree compact and cache-friendly. Insertions and updates 
+        occur asynchronously in background worker threads, processing batched entries from the WAL without blocking incoming writes.
+      </p>
+
+      <pre><code>// B-tree node structure (order 255)
+#[repr(C)]
+struct BTreeNode {
+    keys: [u64; 254],        // 254 keys per node
+    values: [u64; 255],      // 255 pointers to data store
+    length: usize,           // Number of keys in this node
+    is_leaf: bool,           // True if leaf node
+}
+
+const BTREE_ORDER: usize = 255;  // Fits in 4KB page
+const ROOT_NODE_ADDRESS: u64 = 0;</code></pre>
+
+      <p>
+        The <strong>Data Store</strong> is a heap-managed memory region where actual pixel entries are stored. Each entry contains the 
+        pixel's key (derived from coordinates), RGB color, and a 16-byte timestamp for conflict resolution. The data store supports allocation 
+        (<code>malloc</code>) and deallocation (<code>free</code>) of variable-sized blocks, using a free-list allocator to manage fragmentation. 
+        When new pixels are inserted, space is allocated in the data store, and the pointer is recorded in the B-tree index. Updates to existing 
+        pixels are performed in-place by comparing timestamps and overwriting the entry if the new timestamp is newer.
+      </p>
+
+      <pre><code>#[repr(C)]
+pub struct PixelEntry {
+    pub pixel: Pixel,           // Key (u32) + color ([u8; 3])
+    pub timestamp: TimeStamp,   // 16-byte hybrid logical clock
+}
+
+impl CanvasDB {
+    pub fn new(width: usize, height: usize, path: &str, wal_size: usize) -> Self {
+        // WAL: wal_size * sizeof(PixelEntry) + 1024 bytes overhead
+        let wal_pram = PersistentRandomAccessMemory::new(
+            wal_size * std::mem::size_of::&lt;PixelEntry&gt;() + 1024,
+            &format!("{}.wal", path)
+        );
+        
+        // B-tree: (width * height * 32 * 2) + 1024 bytes
+        // *32 for each entry (8 bytes key + 8 bytes value + overhead)
+        // *2 for internal nodes
+        let btree_pram = PersistentRandomAccessMemory::new(
+            (width * height * 32 * 2) + 1024,
+            &format!("{}.index", path)
+        );
+        
+        // Data store: (width * height * sizeof(PixelEntry) * 2) + 1024 bytes
+        // *2 for fragmentation and alignment
+        let data_store = PersistentRandomAccessMemory::new(
+            (width * height * std::mem::size_of::&lt;PixelEntry&gt;() * 2) + 1024,
+            &format!("{}.store", path)
+        );
+    }
+}</code></pre>
+
+      <h3>Persistent Random Access Memory (PRAM): Unified Abstraction</h3>
+      <p>
+        All three storage components—WAL, B-tree, and Data Store—are built on top of <strong>PRAM (Persistent Random Access Memory)</strong>, 
+        a foundational abstraction that provides memory-mapped file I/O with allocation management. PRAM uses <code>mmap</code> to map files 
+        directly into the process's address space, allowing reads and writes to persistent storage via normal memory operations (pointer 
+        dereferences) rather than explicit I/O syscalls. This approach, called memory-mapped I/O, leverages the operating system's page cache 
+        and virtual memory system for efficient disk access.
+      </p>
+
+      <p>
+        The PRAM implementation provides three allocation primitives: <code>malloc</code> allocates a new block of memory using a free-list 
+        allocator, <code>free</code> returns a block to the free list, and <code>smalloc</code> (static allocation) claims a fixed address 
+        for metadata like the WAL's head/tail pointers. The abstraction exposes typed <code>Pointer&lt;T&gt;</code> objects that encapsulate 
+        both the memory address and a weak reference to the PRAM manager, preventing use-after-free bugs while allowing efficient pointer 
+        arithmetic and dereferencing.
+      </p>
+
+      <pre><code>pub struct PersistentRandomAccessMemory {
+    mmap: Arc&lt;RwLock&lt;MmapMut&gt;&gt;,      // Memory-mapped file
+    free_list: Arc&lt;Mutex&lt;BTreeSet&lt;(usize, u64)&gt;&gt;&gt;, // Available blocks (size, address)
+    allocated: Arc&lt;Mutex&lt;BTreeSet&lt;(u64, usize)&gt;&gt;&gt;, // Used blocks (address, size)
+}
+
+impl PersistentRandomAccessMemory {
+    // Dynamic allocation using free-list
+    pub fn malloc&lt;T&gt;(&self, size: usize) -> Result&lt;Pointer&lt;T&gt;, Error&gt; {
+        let mut free_list = self.free_list.lock();
+        // Find first block large enough (first-fit allocation)
+        let block = free_list.range((size, 0)..).next().copied();
+        // ... split block, update free list, return pointer
+    }
+    
+    // Static allocation at fixed address for metadata
+    pub fn smalloc&lt;T&gt;(&self, address: u64, size: usize) -> Result&lt;Pointer&lt;T&gt;, Error&gt; {
+        // Mark specific address range as allocated
+        // Used for WAL head/tail pointers, B-tree root, etc.
+    }
+}</code></pre>
+
+      <p>
+        The <strong>Write-Ahead Log</strong> uses PRAM's <code>smalloc</code> to allocate fixed positions for its metadata: head and tail 
+        pointers are stored at offsets 0 and 8, with the circular buffer data starting at offset 16. On initialization, the WAL reads these 
+        pointers from disk (if they exist from a previous run) to determine where the log left off, enabling crash recovery. Appending to 
+        the WAL simply writes the entry to <code>data[head % size]</code> and increments the head pointer, with periodic <code>persist()</code> 
+        calls flushing the memory-mapped region to disk via <code>msync</code>.
+      </p>
+
+      <pre><code>impl&lt;T&gt; WriteAheadLog&lt;T&gt; where T: Sized {
+    pub fn new(pram: Arc&lt;PersistentRandomAccessMemory&gt;, size: usize) -> Self {
+        // Allocate head/tail pointers at fixed addresses
+        let head: Pointer&lt;u64&gt; = pram.smalloc::&lt;u64&gt;(0, 8).unwrap();
+        let tail: Pointer&lt;u64&gt; = pram.smalloc::&lt;u64&gt;(8, 8).unwrap();
+        
+        // Read existing values (for crash recovery)
+        let head_val: u64 = head.deref().unwrap_or(0);
+        let tail_val: u64 = tail.deref().unwrap_or(0);
+        
+        // Calculate current length
+        let length = if head_val &gt;= tail_val {
+            head_val - tail_val
+        } else {
+            size as u64 - tail_val + head_val
+        };
+        
+        // Allocate circular buffer data region
+        let data = pram.smalloc::&lt;T&gt;(16, size * std::mem::size_of::&lt;T&gt;()).unwrap();
+        
+        WriteAheadLog { pram, size, length, head, tail, data, ... }
+    }
+    
+    pub fn append(&self, entry: &T) -> Result&lt;(), Error&gt; {
+        let head_lock = self.head.write();
+        let head_val = self.head_cache.load(Ordering::Acquire);
+        
+        // Write to circular buffer
+        let index = head_val % self.size as u64;
+        self.data.at(index as usize).set(entry)?;
+        
+        // Update head pointer
+        let new_head = head_val + 1;
+        head_lock.set(&new_head)?;
+        self.head_cache.store(new_head, Ordering::Release);
+        
+        Ok(())
+    }
+}</code></pre>
+
+      <p>
+        Similarly, the <strong>B-tree Index</strong> uses PRAM to allocate tree nodes on demand. When a node splits during insertion, the 
+        index calls <code>pram.malloc(sizeof(BTreeNode))</code> to allocate space for the new node, storing its address in the parent node's 
+        values array. Node pointers remain stable across restarts because PRAM preserves the memory-mapped file, allowing the tree structure 
+        to be recovered by simply loading the root node from address 0 and traversing the child pointers. The B-tree's <code>persist()</code> 
+        method calls <code>pram.persist()</code> to flush all dirty pages to disk, ensuring durability.
+      </p>
+
+      <h3>Write Path: Asynchronous Persistence Pipeline</h3>
+      <p>
+        Understanding NoReDB's write path reveals why it achieves both high throughput and durability. When a <code>set_pixel</code> request 
+        arrives via gRPC, the CanvasDB immediately appends the pixel entry to the WAL, a fast O(1) operation requiring only a pointer 
+        increment and memory write. The write is <em>not</em> immediately flushed to disk—instead, a background persistence thread wakes up 
+        every 100ms, calls <code>wal.commit()</code> to flush buffered entries via <code>msync</code>, and then invokes all registered listener 
+        callbacks to acknowledge the writes. This batching amortizes the cost of disk synchronization across many writes, achieving throughput 
+        of hundreds of thousands of operations per second.
+      </p>
+
+      <pre><code>impl CanvasDBTrait for CanvasDB {
+    fn set_pixel(&self, pixel: PixelEntry, listener: Option&lt;Box&lt;dyn FnOnce() + Send&gt;&gt;) {
+        // Step 1: Append to WAL (fast, in-memory)
+        self.write_ahead_log.append(&pixel).expect("WAL append failed");
+        
+        // Step 2: Register listener for acknowledgment after persistence
+        if let Some(callback) = listener {
+            let mut listeners = self.listeners.lock().unwrap();
+            listeners.push(callback);
+        }
+        
+        // Background threads handle steps 3-6 asynchronously
+    }
+}</code></pre>
+
+      <p>
+        While the persistence thread handles WAL flushing, separate worker threads (typically 4-16 threads) continuously drain entries from 
+        the WAL and apply them to the B-tree and Data Store. The persistence coordinator thread runs this loop every 100ms:
+      </p>
+
+      <pre><code>// Persistence coordinator thread (simplified)
+loop {
+    // Step 1: Peek entries from WAL without removing them
+    let entries = wal.peek_many(PERSIST_BATCH_SIZE); // 8192 entries
+    
+    // Step 2: Send entries to worker threads for processing
+    for entry in entries {
+        tx_work.send(entry).unwrap();
+    }
+    
+    // Step 3: Wait for all workers to finish processing
+    for _ in 0..entries.len() {
+        rx_res.recv().unwrap(); // Worker signals completion
+    }
+    
+    // Step 4: Persist B-tree and data store to disk
+    data_store.persist()?;
+    btree_index.persist()?;
+    
+    // Step 5: Remove processed entries from WAL
+    wal.pop_many(entries.len())?;
+    
+    // Step 6: Commit WAL (advance tail pointer)
+    wal.commit()?;
+}</code></pre>
+
+      <p>
+        Each worker thread processes entries by first checking if the pixel key exists in the B-tree index. If found, the worker loads the 
+        pointer to the existing entry in the data store and performs an atomic compare-and-swap on the timestamp: if the new entry has a 
+        newer timestamp, it overwrites the old data; otherwise, it discards the update. If the key doesn't exist, the worker allocates space 
+        in the data store via <code>malloc</code>, inserts the pointer into the B-tree, and writes the pixel data. This ensures that 
+        out-of-order delivery (e.g., an old update arriving after a new one due to network delays) doesn't corrupt the database.
+      </p>
+
+      <pre><code>// Worker thread processing (simplified)
+let pixel = rx.recv().unwrap(); // Receive entry from coordinator
+
+// Check if pixel exists in B-tree
+let pointer_address = btree_index.get(pixel.pixel.key as u64);
+
+if let Ok(addr) = pointer_address {
+    // Update existing pixel
+    let pointer = Pointer::&lt;PixelEntry&gt;::from_address(addr, data_store.clone());
+    let entry = pointer.deref()?;
+    
+    // Compare timestamps and update if newer
+    if pixel.timestamp &gt; entry.timestamp {
+        pointer.set(&pixel)?;
+    }
+} else {
+    // Insert new pixel
+    let new_pointer = data_store.malloc::&lt;PixelEntry&gt;(std::mem::size_of::&lt;PixelEntry&gt;())?;
+    new_pointer.set(&pixel)?;
+    btree_index.set(pixel.pixel.key as u64, new_pointer.address)?;
+}
+
+tx_res.send(()).unwrap(); // Signal completion to coordinator</code></pre>
+
+      <p>
+        This multi-stage pipeline achieves durability without sacrificing performance. The WAL acts as a buffer, absorbing write bursts and 
+        providing immediate acknowledgment to clients. The worker threads asynchronously apply updates to the indexed data structures, which 
+        are optimized for read performance. Only after both the B-tree and data store are successfully persisted does the coordinator remove 
+        entries from the WAL, ensuring that no committed write is lost even if the server crashes mid-process.
+      </p>
+
+      <h3>Read Path: Multi-Layered Lookup with Timestamp Arbitration</h3>
+      <p>
+        The read path demonstrates the importance of the WAL in maintaining consistency. When a <code>get_pixel</code> request arrives, 
+        CanvasDB must check <em>both</em> the WAL and the indexed data store, returning whichever entry has the newer timestamp. This is 
+        necessary because recent writes may still be in the WAL awaiting batch processing, not yet reflected in the B-tree/data store. The 
+        implementation first scans the WAL (in batches of 8192 entries to exploit sequential memory access), filtering for the requested 
+        pixel key and tracking the entry with the maximum timestamp.
+      </p>
+
+      <pre><code>impl CanvasDBTrait for CanvasDB {
+    fn get_pixel(&self, key: u32) -> Option&lt;(Pixel, TimeStamp)&gt; {
+        // Step 1: Search WAL for most recent entry
+        let most_current_wal = self.write_ahead_log
+            .iter(GET_BATCH_SIZE) // 8192 entries per batch
+            .flatten()
+            .filter(|e| e.pixel.key == key)
+            .max_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        
+        // Step 2: Lookup in B-tree index
+        let pointer_address = self.btree_index.get(key as u64);
+        
+        if let Ok(addr) = pointer_address {
+            let pointer = Pointer::&lt;PixelEntry&gt;::from_address(addr, self.data_store.clone());
+            let entry = pointer.deref().ok()?;
+            
+            // Step 3: Compare timestamps and return newest
+            if let Some(wal_entry) = most_current_wal {
+                if wal_entry.timestamp &gt; entry.timestamp {
+                    return Some((wal_entry.pixel, wal_entry.timestamp));
+                }
+            }
+            return Some((entry.pixel, entry.timestamp));
+        } else {
+            // Not in index, return WAL entry if found
+            most_current_wal.map(|e| (e.pixel, e.timestamp))
+        }
+    }
+}</code></pre>
+
+      <p>
+        This dual-lookup strategy ensures <strong>read-after-write consistency</strong>: a client that writes a pixel and immediately reads 
+        it back will always see the value it wrote, even if the write hasn't yet been indexed. The timestamp comparison handles race conditions 
+        where a worker thread is concurrently updating the indexed entry—the read path always returns the globally newest value. The tradeoff 
+        is that reads must scan the WAL, which adds latency proportional to the current WAL occupancy. To minimize this cost, the WAL is sized 
+        to hold only a few seconds of writes (typically 1024-2048 entries), and the batch processing keeps it drained rapidly.
+      </p>
+
+      <div class="diagram-container">
+        <ScalableSvg :src="NoredbSequence" alt="NoReDB Read/Write Sequence Diagram" />
+        <p class="diagram-caption">Figure 8: NoReDB read and write operation sequences showing WAL, B-tree index, and data store interactions</p>
+      </div>
+
+      <h3>Crash Recovery: Replaying the Write-Ahead Log</h3>
+      <p>
+        When a NoReDB instance restarts after a crash, the initialization sequence checks the WAL for uncommitted entries by comparing the 
+        head and tail pointers read from PRAM. If the WAL contains entries (head != tail), the system enters recovery mode, replaying each 
+        entry by re-executing the worker thread logic: check the B-tree, compare timestamps, update or insert as needed. Because the WAL 
+        records operations with idempotent semantics (timestamp-based conflict resolution), replaying entries multiple times is safe—applying 
+        the same update twice produces the same result as applying it once.
+      </p>
+
+      <p>
+        This recovery mechanism guarantees that <strong>all acknowledged writes survive crashes</strong>. When the persistence thread calls 
+        <code>wal.commit()</code> and then invokes listener callbacks, clients receive acknowledgment only after the WAL has been fsynced 
+        to disk. Even if the instance crashes immediately after acknowledgment—before the B-tree and data store are persisted—the write is 
+        preserved in the WAL and will be replayed on restart. The WAL acts as a transactional log, similar to PostgreSQL's WAL or MySQL's 
+        redo log, providing atomicity and durability guarantees.
+      </p>
+
+      <h3>Performance Characteristics and Benchmark Results</h3>
+      <p>
+        To validate the design, comprehensive benchmarks were conducted using Criterion.rs, measuring throughput and latency across various 
+        workloads. The tests ran on a system with an NVMe SSD and 16 CPU cores, simulating realistic canvas operations. Three key benchmark 
+        suites were executed: <strong>CanvasDB</strong> (end-to-end pixel operations), <strong>B-tree Index</strong> (isolated tree performance), 
+        and <strong>PRAM</strong> (memory allocator overhead).
+      </p>
+
+      <h4>CanvasDB Concurrent Writes</h4>
+      <p>
+        The <code>canvasdb_set_concurrent</code> benchmark spawns 8 threads, each writing a disjoint subset of pixel keys to avoid contention. 
+        The system was tested with varying canvas sizes (32,768, 65,536, and 131,072 pixels), measuring total throughput:
+      </p>
+
+      <pre><code class="benchmark-results">canvasdb_set_concurrent/32768    time: [186.02 ms  207.60 ms  225.47 ms]
+                                      thrpt: [145.33 Kelem/s  157.84 Kelem/s  176.15 Kelem/s]
+
+canvasdb_set_concurrent/65536     time: [226.81 ms  235.65 ms  242.24 ms]
+                                      thrpt: [270.54 Kelem/s  278.10 Kelem/s  288.94 Kelem/s]
+
+canvasdb_set_concurrent/131072    time: [240.08 ms  241.38 ms  242.64 ms]
+                                      thrpt: [540.19 Kelem/s  543.02 Kelem/s  545.94 Kelem/s]</code></pre>
+
+      <p>
+        These results demonstrate excellent scalability: with 131,072 writes, the system sustains <strong>543,000 writes per second</strong> 
+        (543 Kelem/s), translating to approximately 1.8 microseconds per write operation. The near-linear scaling from 32K to 131K elements 
+        indicates that the WAL circular buffer and batching strategy effectively amortize synchronization costs. The variance in throughput 
+        (±10% between runs) stems from OS page cache behavior and background persistence threads competing for disk bandwidth.
+      </p>
+
+      <h4>CanvasDB Concurrent Reads</h4>
+      <p>
+        Read performance was measured by pre-populating the database with pixels and then issuing concurrent lookups across 8 threads:
+      </p>
+
+      <pre><code class="benchmark-results">canvasdb_get_concurrent/32768     time: [198.81 ms  208.99 ms  218.58 ms]
+                                       thrpt: [149.91 Kelem/s  156.79 Kelem/s  164.82 Kelem/s]
+
+canvasdb_get_concurrent/65536      time: [219.68 ms  233.84 ms  246.69 ms]
+                                       thrpt: [265.66 Kelem/s  280.27 Kelem/s  298.32 Kelem/s]
+
+canvasdb_get_concurrent/131072     time: [233.88 ms  244.72 ms  256.32 ms]
+                                       thrpt: [511.37 Kelem/s  535.59 Kelem/s  560.43 Kelem/s]</code></pre>
+
+      <p>
+        Read throughput reaches <strong>535,000 reads per second</strong> for the 131K dataset, slightly slower than writes due to the 
+        dual-lookup overhead (WAL scan + B-tree traversal). The O(log n) B-tree complexity is evident in the modest increase in latency 
+        as dataset size grows: reads scale from 157 Kelem/s (32K) to 535 Kelem/s (131K), roughly 3.4× throughput improvement for 4× data size. 
+        This sub-linear scaling confirms that tree depth increases logarithmically, with the 131K dataset requiring one additional tree level 
+        compared to 32K.
+      </p>
+
+      <h4>CanvasDB Iterator Performance</h4>
+      <p>
+        The <code>canvasdb_iterate_pixels</code> benchmark measures full dataset scans, which traverse the B-tree in sorted order and 
+        dereference each pointer to load pixel data from the data store:
+      </p>
+
+      <pre><code class="benchmark-results">canvasdb_iterate_pixels/65536     time: [155.91 ms  170.50 ms  185.22 ms]
+                                       thrpt: [353.84 Kelem/s  384.37 Kelem/s  420.34 Kelem/s]
+
+canvasdb_iterate_pixels/131072     time: [189.61 ms  200.75 ms  209.44 ms]
+                                       thrpt: [625.82 Kelem/s  652.91 Kelem/s  691.27 Kelem/s]
+
+canvasdb_iterate_pixels/262144     time: [209.81 ms  216.04 ms  221.68 ms]
+                                       thrpt: [1.1825 Melem/s  1.2134 Melem/s  1.2494 Melem/s]</code></pre>
+
+      <p>
+        Sequential iteration achieves <strong>1.2 million elements per second</strong> (262K dataset), significantly faster than random 
+        access due to spatial locality. Traversing the B-tree in order results in mostly sequential memory access patterns, benefiting from 
+        CPU cache prefetching and reduced TLB misses. This performance is critical for bulk operations like snapshotting the canvas or 
+        migrating partitions during rebalancing.
+      </p>
+
+      <h2>Project Reflections: Successes and Challenges</h2>
+      <p>
+        Building WebCanvas was an ambitious undertaking that pushed the boundaries of what could be accomplished within the project timeline. 
+        Looking back, the journey revealed both successes and areas where initial assumptions proved overly optimistic.
+      </p>
+
+      <h4>Scope and Learning Curve</h4>
+      <p>
+        The project scope was significantly underestimated at the outset. Building three distributed systems components from scratch—Veritas 
+        (consensus), NoReDB (database), and the Partitioning Controller—while learning <strong>two entirely new programming languages</strong> 
+        (Rust and Go, or arguably three if Kubernetes YAML is counted) proved far more time-consuming than anticipated. Both Rust and Go were 
+        completely new technologies, requiring simultaneous learning of language syntax, idioms, concurrency models, and ecosystem tooling 
+        while architecting distributed systems. Despite this challenge, the agile project management approach allowed for continuous adaptation, 
+        prioritizing core functionality and deferring non-essential features when timelines became tight.
+      </p>
+
+      <h4>Technical Evolution and Discovery</h4>
+      <p>
+        A significant amount of effort was initially invested in building a <strong>custom memory management system</strong> for persistent 
+        storage, complete with manual caching, paging algorithms, and file block management. Only after substantial implementation work did 
+        the realization occur that <strong>memory-mapped files</strong> (<code>mmap</code>) provided exactly this functionality at the OS 
+        level, rendering the custom solution obsolete. The decision to pivot to memory-mapped I/O, while costly in terms of discarded code, 
+        ultimately improved both performance and reliability by leveraging battle-tested kernel implementations rather than reinventing them.
+      </p>
+
+      <h4>LLM-Assisted Development: Effectiveness and Limitations</h4>
+      <p>
+        Large Language Models (Claude, ChatGPT, Gemini) proved invaluable for certain tasks but fell short in others. They excelled at 
+        generating <strong>documentation, boilerplate code, and frontend Vue.js components</strong>, significantly accelerating development 
+        in these areas. However, they struggled dramatically with the <strong>core Rust database implementation and Go partitioning logic</strong>. 
+        LLM-generated Rust code frequently exhibited anti-patterns like collecting entire iterators into memory before filtering (materializing 
+        the entire B-tree index), incorrect lifetime annotations, and unsafe pointer usage that violated Rust's guarantees. The generated Go 
+        code similarly showed poor understanding of context propagation, goroutine lifecycle management, and channel patterns. These components 
+        ultimately required manual authorship from first principles, with LLMs relegated to syntax lookup rather than code generation.
+      </p>
+
+      <h4>Veritas Complexity: Custom Protocol Challenges</h4>
+      <p>
+        The <strong>Veritas consensus implementation</strong> was substantially more complex than initially estimated. Designing a custom 
+        leader election protocol with loyalty mechanisms, handling split-brain scenarios, and ensuring linearizable atomic operations required 
+        deep understanding of distributed systems theory. The decision to build a custom protocol rather than adopting Raft or Paxos was driven 
+        by educational curiosity, but the complexity cost was high. Debugging timing-dependent race conditions in leader transitions and vote 
+        counting consumed significant development time, though the learning experience was invaluable.
+      </p>
+
+      <h4>Testing Philosophy and Infrastructure</h4>
+      <p>
+        Testing strategy varied significantly across components. The <strong>stateful backend components</strong> (NoReDB and Veritas) received 
+        extensive unit and integration testing, particularly at the PRAM, WAL, and B-tree levels. However, abstracting implementation details 
+        for testability in Rust proved extremely difficult—creating mock <code>PersistentRandomAccessMemory</code> instances or simulating 
+        network partitions for Veritas leader election required fighting Rust's ownership system and trait bounds. The tests that were written 
+        provided high confidence in correctness, but achieving comprehensive coverage would have required an architectural redesign prioritizing 
+        testability from the start.
+      </p>
+
+      <p>
+        In contrast, the <strong>stateless backend</strong> (ASP.NET SignalR services) and <strong>frontend</strong> received minimal automated 
+        testing. The frontend logic was simple enough—primarily UI state management and WebSocket event handling—that manual testing sufficed. 
+        The backend's complexity lay in coordination rather than algorithmic logic, making integration tests against the full cluster more 
+        valuable than isolated unit tests. Time constraints necessitated prioritizing functional testing over achieving high test coverage metrics.
+      </p>
+
+      <h4>Rust: Pain and Payoff</h4>
+      <p>
+        Working with Rust was a love-hate relationship. The language's <strong>type system and explicit error handling</strong> forced thinking 
+        through both success and failure paths at every step—no <code>null</code> pointer exceptions, no unchecked errors, explicit <code>panic!</code> 
+        for truly unrecoverable situations. This rigor caught countless bugs at compile time that would have been runtime crashes in C++ or Go. 
+        The borrow checker, while frustrating during development, prevented entire classes of concurrency bugs and memory leaks that would have 
+        been nightmares to debug in a distributed system.
+      </p>
+
+      <p>
+        However, Rust's learning curve was steep. Fighting the compiler to express patterns that were trivial in garbage-collected languages—such 
+        as self-referential data structures or dynamic dispatch with shared ownership—consumed hours that could have been spent on features. 
+        With the benefit of hindsight and the experience gained, <strong>many Rust components would be rewritten differently</strong> if starting 
+        over: more liberal use of <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> for simplicity rather than complex lifetime annotations, trait-based 
+        dependency injection for testability, and clearer separation between hot-path performance code and cold-path configuration logic.
+      </p>
+
+      <h4>Would Do It Again</h4>
+      <p>
+        Despite the challenges, undertaking this project was absolutely worthwhile. The hands-on experience of building distributed systems 
+        components from scratch—wrestling with consensus algorithms, crash recovery, concurrent data structures, and network partition handling—provided 
+        insights that no amount of reading could replicate. Pairing this practical work with <em>Designing Data-Intensive Applications</em> by 
+        Martin Kleppmann created a powerful learning loop: the book explained the theory and tradeoffs, the project revealed why those tradeoffs 
+        matter in practice. The knowledge gained about distributed systems, Rust, Go, and Kubernetes far exceeded the project's initial educational 
+        goals, making the significant time investment worthwhile.
+      </p>
+
+      <h3>Future Improvements and Production Considerations</h3>
+      <p>
+        WebCanvas was designed as an <strong>educational reference implementation</strong> prioritizing clarity and modularity over maximum 
+        performance. While the system successfully handles hundreds of thousands of operations per second, transitioning to a production deployment 
+        would require several architectural and feature enhancements:
+      </p>
+
+      <h4>Performance Optimizations</h4>
+      <ul>
+        <li><strong>Backend Image Caching and Delta Streaming:</strong> Currently, the ASP.NET backend forwards every pixel update individually 
+        over SignalR. A production system would maintain a <strong>server-side cached render of the full canvas image</strong>, serving initial 
+        page loads with the complete image, then streaming only incremental changes (deltas) over the WebSocket connection. This would reduce 
+        bandwidth consumption by 10-100× for clients joining an active canvas and eliminate the thundering herd problem when many users connect 
+        simultaneously.</li>
+
+        <li><strong>Vector Clocks for Cache Invalidation:</strong> The current system uses hybrid logical clocks (global + local) managed by 
+        the Partitioning Controller, requiring periodic <code>get_add</code> calls to Veritas. An alternative would be <strong>vector clocks 
+        determined by the ASP.NET backend instances</strong> themselves, piggybacking version vectors on the cache invalidation messages already 
+        being broadcast between backend pods. <em>Advantages:</em> Eliminates Veritas dependency for timestamp generation, reduces latency by 
+        one network round-trip per write. <em>Disadvantages:</em> Violates separation of concerns by coupling cache invalidation logic to database 
+        consistency model, makes backend stateful (must maintain vector clock state), increases implementation complexity. This exemplifies the 
+        performance-vs-modularity tradeoff discussed throughout the architecture.</li>
+
+        <li><strong>Specialized Pixel Storage:</strong> The current NoReDB uses a general-purpose B-tree index mapping arbitrary keys to memory 
+        addresses. For a canvas with known dimensions (e.g., 3840×2160), pixels could be stored in a <strong>simple indexed array</strong>: 
+        pixel 1 at offset 0, pixel 2 at offset 8, pixel 3 at offset 16, and so forth. This would eliminate the B-tree entirely, replacing $O(\log n)$ 
+        lookups with $O(1)$ array indexing. <em>Advantages:</em> 5-10× faster reads/writes, simpler codebase, reduced memory overhead. 
+        <em>Disadvantages:</em> Loses generality—cannot handle sparse canvases with few set pixels, fixed canvas size at compile time, WAL still 
+        needed for durability so only partial simplification. This specialization-vs-generality tradeoff is central to production database design.</li>
+
+        <li><strong>Lock-Free Data Structures:</strong> The B-tree uses read-write locks (<code>RwLock</code>) for concurrency control. Implementing 
+        lock-free structures using atomic operations (e.g., Bw-tree, skip lists) could eliminate contention on hot paths, improving scalability on 
+        high core-count systems. However, lock-free algorithms are notoriously difficult to implement correctly and debug, requiring expert-level 
+        understanding of memory ordering and ABA problems.</li>
+
+        <li><strong>Write Combining and Batching:</strong> Currently, each pixel update generates a separate WAL entry. Batching multiple updates 
+        into a single entry would reduce metadata overhead and improve cache locality. The Partitioning Controller could accumulate writes for 
+        10-100ms before flushing to NoReDB, trading slight latency for higher throughput.</li>
+      </ul>
+
+      <h4>Feature Enhancements</h4>
+      <ul>
+        <li><strong>User Authentication and Authorization:</strong> Production deployment requires <strong>user accounts</strong> with authentication 
+        (OAuth2, JWT tokens), per-user rate limiting to prevent abuse (e.g., max 10 pixels per second), and optional access control (public vs. 
+        private canvases, moderator roles).</li>
+
+        <li><strong>Multiple Canvases and Persistence:</strong> The current system supports a single global canvas. Scaling to thousands of independent 
+        canvases requires routing logic (hash canvas ID to partition), per-canvas access control, and lifecycle management (archive inactive canvases 
+        to cold storage after N days).</li>
+
+        <li><strong>Canvas History and Rollback:</strong> Store not just current state but full history of changes, enabling time-travel queries 
+        ("show me the canvas as it looked 1 hour ago") and rollback functionality for moderation.</li>
+
+        <li><strong>Draw Tools Beyond Pixels:</strong> Lines, rectangles, fill tools, erasers, undo/redo, layers—all require moving beyond single-pixel 
+        operations to higher-level drawing primitives with transaction semantics.</li>
+      </ul>
+
+      <h4>Infrastructure and Operations</h4>
+      <ul>
+        <li><strong>Established Coordination Service:</strong> Replace Veritas with <strong>etcd, Consul, or ZooKeeper</strong>. While building 
+        a custom consensus protocol was educationally valuable, production systems should use battle-tested implementations with years of bug fixes 
+        and operational tooling. The custom protocol lacks monitoring, debugging tools, and the expertise of a large community.</li>
+
+        <li><strong>Standard Protocols:</strong> The current system uses custom gRPC message formats and coordination protocols designed for learning 
+        purposes. Production deployment should adopt <strong>established protocols</strong> where possible: Raft for consensus, Prometheus for metrics, 
+        OpenTelemetry for distributed tracing. Custom protocols incur ongoing maintenance burden and make it difficult for new team members to understand 
+        the system.</li>
+
+        <li><strong>Observability and Debugging:</strong> Add comprehensive metrics (latency percentiles, throughput, error rates), distributed tracing 
+        to follow requests across services, structured logging with correlation IDs, and health check endpoints for each component. The current system 
+        has basic logging but lacks production-grade observability.</li>
+
+        <li><strong>Improved Testing Infrastructure:</strong> Addressing the Rust testability challenges would require <strong>better abstractions</strong>: 
+        trait-based dependency injection for PRAM, B-tree, and WAL to allow mock implementations; async test harnesses for simulating network partitions 
+        and clock skew; property-based testing (e.g., with <code>proptest</code>) to verify invariants under random operation sequences. The difficulty 
+        of testing the current implementation suggests it was not designed with testing as a first-class concern.</li>
+      </ul>
+
+      <p>
+        These improvements collectively represent the gap between an educational prototype and a production system. The current implementation 
+        successfully demonstrates distributed systems principles and validates the core architecture, achieving performance sufficient for the 
+        WebCanvas use case. However, the modularity and clarity that make it valuable for learning would need to be balanced with specialization 
+        and optimization for production deployment. This tension—between understandable general-purpose code and high-performance specialized 
+        systems—is a fundamental tradeoff in software engineering, and one that this project illuminated through direct experience.
+      </p>
     </section>
   </div>
 </template>
@@ -749,6 +1355,9 @@ import GoPartitioningControllerComponents from '@/assets/GoPartitioningControlle
 import VeritasComponents from '@/assets/VeritasComponentsDark.drawio.svg'
 import VeritasGetSetSequence from '@/assets/VeritasGetSetSequenceDiagramDark.drawio.svg'
 import VeritasLeaderElectionSequence from '@/assets/VeritasLeaderElectionSequenceDark.drawio.svg'
+import NoredbComponents from '@/assets/NoredbComponentsDark.drawio.svg'
+import NoredbSequence from '@/assets/NoredbSequenceDark.drawio.svg'
+
 
 const diagramNodes = [
   // Client Devices

@@ -1,0 +1,100 @@
+PS E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\dev-console> cargo bench canvasdb
+   Compiling general v0.1.0 (E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\general)
+   Compiling noredb v0.1.0 (E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\noredb)
+   Compiling dev-console v0.1.0 (E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\dev-console)
+    Finished `bench` profile [optimized] target(s) in 22.80s                                                                             
+     Running unittests src\main.rs (E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\target\release\deps\dev_console-a2330a13aa17bc8d.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches\btree.rs (E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\target\release\deps\btree-ccfd395e9c8c65d5.exe)      
+Gnuplot not found, using plotters backend
+     Running benches\canvasdb.rs (E:\IUBscSoftProjWebCanvas\WebCanvas\BackendStatefull\target\release\deps\canvasdb-cc1a493321c864c5.exe)
+Gnuplot not found, using plotters backend
+Benchmarking canvasdb_iterate_pixels/65536: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 15.0s. You may wish to increase target time to 43.3s, or reduce sample count to 10.
+canvasdb_iterate_pixels/65536
+                        time:   [155.91 ms 170.50 ms 185.22 ms]
+                        thrpt:  [353.84 Kelem/s 384.37 Kelem/s 420.34 Kelem/s]
+                 change:
+                        time:   [-24.565% -16.801% -8.9689%] (p = 0.00 < 0.05)
+                        thrpt:  [+9.8525% +20.193% +32.565%]
+                        Performance has improved.
+Benchmarking canvasdb_iterate_pixels/131072: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 15.0s. You may wish to increase target time to 44.1s, or reduce sample count to 10.
+canvasdb_iterate_pixels/131072
+                        time:   [189.61 ms 200.75 ms 209.44 ms]
+                        thrpt:  [625.82 Kelem/s 652.91 Kelem/s 691.27 Kelem/s]
+                 change:
+                        time:   [-6.3148% +1.1869% +9.5488%] (p = 0.78 > 0.05)
+                        thrpt:  [-8.7165% -1.1730% +6.7405%]
+                        No change in performance detected.
+Found 1 outliers among 16 measurements (6.25%)
+  1 (6.25%) low severe
+Benchmarking canvasdb_iterate_pixels/262144: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 15.0s. You may wish to increase target time to 43.9s, or reduce sample count to 10.
+canvasdb_iterate_pixels/262144
+                        time:   [209.81 ms 216.04 ms 221.68 ms]
+                        thrpt:  [1.1825 Melem/s 1.2134 Melem/s 1.2494 Melem/s]
+                 change:
+                        time:   [+12.559% +21.586% +31.162%] (p = 0.00 < 0.05)
+                        thrpt:  [-23.759% -17.754% -11.158%]
+                        Performance has regressed.
+Found 1 outliers among 16 measurements (6.25%)
+  1 (6.25%) low mild
+
+Benchmarking canvasdb_get_concurrent/32768: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 15.0s. You may wish to increase target time to 44.1s, or reduce sample count to 10.
+canvasdb_get_concurrent/32768
+                        time:   [198.81 ms 208.99 ms 218.58 ms]
+                        thrpt:  [149.91 Kelem/s 156.79 Kelem/s 164.82 Kelem/s]
+                 change:
+                        time:   [-3.1535% +4.6121% +13.556%] (p = 0.27 > 0.05)
+                        thrpt:  [-11.938% -4.4088% +3.2562%]
+                        No change in performance detected.
+Benchmarking canvasdb_get_concurrent/65536: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 15.0s. You may wish to increase target time to 43.9s, or reduce sample count to 10.
+canvasdb_get_concurrent/65536
+                        time:   [219.68 ms 233.84 ms 246.69 ms]
+                        thrpt:  [265.66 Kelem/s 280.27 Kelem/s 298.32 Kelem/s]
+                 change:
+                        time:   [-6.8217% +2.2756% +11.651%] (p = 0.62 > 0.05)
+                        thrpt:  [-10.435% -2.2250% +7.3211%]
+                        No change in performance detected.
+Benchmarking canvasdb_get_concurrent/131072: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 15.0s. You may wish to increase target time to 44.7s, or reduce sample count to 10.
+canvasdb_get_concurrent/131072
+                        time:   [233.88 ms 244.72 ms 256.32 ms]
+                        thrpt:  [511.37 Kelem/s 535.59 Kelem/s 560.43 Kelem/s]
+                 change:
+                        time:   [-18.165% -13.016% -7.4110%] (p = 0.00 < 0.05)
+                        thrpt:  [+8.0041% +14.963% +22.198%]
+                        Performance has improved.
+
+Benchmarking canvasdb_set_concurrent/32768: Warming up for 3.0000 s
+Warning: Unable to complete 16 samples in 20.0s. You may wish to increase target time to 54.0s, or reduce sample count to 10.
+canvasdb_set_concurrent/32768
+                        time:   [186.02 ms 207.60 ms 225.47 ms]
+                        thrpt:  [145.33 Kelem/s 157.84 Kelem/s 176.15 Kelem/s]
+                 change:
+                        time:   [+12.982% +27.208% +40.755%] (p = 0.00 < 0.05)
+                        thrpt:  [-28.955% -21.389% -11.490%]
+                        Performance has regressed.
+canvasdb_set_concurrent/65536
+                        time:   [226.81 ms 235.65 ms 242.24 ms]
+                        thrpt:  [270.54 Kelem/s 278.10 Kelem/s 288.94 Kelem/s]
+                 change:
+                        time:   [-7.4968% -2.8031% +1.9681%] (p = 0.28 > 0.05)
+                        thrpt:  [-1.9301% +2.8839% +8.1044%]
+                        No change in performance detected.
+Found 2 outliers among 16 measurements (12.50%)
+  2 (12.50%) low severe
+canvasdb_set_concurrent/131072
+                        time:   [240.08 ms 241.38 ms 242.64 ms]
+                        thrpt:  [540.19 Kelem/s 543.02 Kelem/s 545.94 Kelem/s]
+                 change:
+                        time:   [-7.8530% -6.6403% -5.4448%] (p = 0.00 < 0.05)
+                        thrpt:  [+5.7583% +7.1126% +8.5223%]
+                        Performance has improved.

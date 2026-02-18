@@ -318,7 +318,7 @@
                 disableButtons(true);
 
                 connection = new signalR.HubConnectionBuilder()
-                    .withUrl("/canvas")
+                    .withUrl("http://localhost:8080/canvas")
                     .withAutomaticReconnect()
                     .configureLogging(signalR.LogLevel.Information)
                     .build();
