@@ -1,0 +1,486 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>WebCanvas Debug Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            color: #569cd6;
+            margin-bottom: 10px;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-weight: bold;
+        }
+        
+        .status.disconnected {
+            background: #3a1d1d;
+            color: #f48771;
+        }
+        
+        .status.connecting {
+            background: #3a331d;
+            color: #dcdcaa;
+        }
+        
+        .status.connected {
+            background: #1d3a1d;
+            color: #4ec9b0;
+        }
+        
+        .control-panel {
+            background: #252526;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #3e3e42;
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #9cdcfe;
+            font-weight: 500;
+        }
+        
+        input[type="number"], input[type="text"] {
+            width: 100%;
+            padding: 8px 12px;
+            background: #3c3c3c;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: #d4d4d4;
+            font-size: 14px;
+        }
+        
+        input[type="number"]:focus, input[type="text"]:focus {
+            outline: none;
+            border-color: #007acc;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .btn-primary {
+            background: #0e639c;
+            color: white;
+        }
+        
+        .btn-primary:hover:not(:disabled) {
+            background: #1177bb;
+        }
+        
+        .btn-secondary {
+            background: #3e3e42;
+            color: #d4d4d4;
+        }
+        
+        .btn-secondary:hover:not(:disabled) {
+            background: #505050;
+        }
+        
+        .btn-success {
+            background: #107c10;
+            color: white;
+        }
+        
+        .btn-success:hover:not(:disabled) {
+            background: #13a213;
+        }
+        
+        .logs {
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+            padding: 15px;
+            height: 500px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 13px;
+        }
+        
+        .log-entry {
+            padding: 6px 8px;
+            margin-bottom: 4px;
+            border-radius: 3px;
+            border-left: 3px solid transparent;
+        }
+        
+        .log-info {
+            border-left-color: #569cd6;
+            background: #1e2a35;
+        }
+        
+        .log-success {
+            border-left-color: #4ec9b0;
+            background: #1e352e;
+        }
+        
+        .log-error {
+            border-left-color: #f48771;
+            background: #3a1d1d;
+        }
+        
+        .log-warn {
+            border-left-color: #dcdcaa;
+            background: #3a331d;
+        }
+        
+        .log-time {
+            color: #808080;
+            margin-right: 10px;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .stats {
+            background: #252526;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #3e3e42;
+        }
+        
+        .stats-label {
+            color: #9cdcfe;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        
+        .stats-value {
+            color: #4ec9b0;
+            font-size: 24px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 WebCanvas Debug Tool</h1>
+        <div id="status" class="status disconnected">● Disconnected</div>
+        
+        <div class="grid">
+            <div class="stats">
+                <div class="stats-label">Pixels Set</div>
+                <div class="stats-value" id="pixelsSet">0</div>
+            </div>
+            <div class="stats">
+                <div class="stats-label">Pixels Received</div>
+                <div class="stats-value" id="pixelsReceived">0</div>
+            </div>
+            <div class="stats">
+                <div class="stats-label">Total Messages</div>
+                <div class="stats-value" id="totalMessages">0</div>
+            </div>
+        </div>
+        
+        <div class="control-panel">
+            <h2 style="margin-bottom: 15px; color: #4ec9b0;">Set Pixel</h2>
+            
+            <div class="grid">
+                <div class="control-group">
+                    <label for="xInput">X Coordinate</label>
+                    <input type="number" id="xInput" placeholder="0" min="0" value="0">
+                </div>
+                
+                <div class="control-group">
+                    <label for="yInput">Y Coordinate</label>
+                    <input type="number" id="yInput" placeholder="0" min="0" value="0">
+                </div>
+                
+                <div class="control-group">
+                    <label for="colorInput">Color (hex)</label>
+                    <input type="text" id="colorInput" placeholder="#FFFFFF" value="#FF0000">
+                </div>
+            </div>
+            
+            <div class="button-group">
+                <button id="setPixelBtn" class="btn-primary" onclick="setPixel()">Set Pixel</button>
+                <button id="getPixelBtn" class="btn-secondary" onclick="getPixel()">Get Pixel</button>
+                <button id="streamBtn" class="btn-secondary" onclick="streamCanvas()">Stream Canvas</button>
+                <button id="clearLogsBtn" class="btn-secondary" onclick="clearLogs()">Clear Logs</button>
+                <button id="connectBtn" class="btn-success" onclick="connect()">Reconnect</button>
+            </div>
+        </div>
+        
+        <h2 style="margin-bottom: 10px; color: #4ec9b0;">Logs</h2>
+        <div id="logs" class="logs"></div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <script>
+        let connection = null;
+        let pixelsSet = 0;
+        let pixelsReceived = 0;
+        let totalMessages = 0;
+
+        function log(message, type = 'info') {
+            const logsDiv = document.getElementById('logs');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            
+            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+            entry.innerHTML = `<span class="log-time">[${time}]</span>${message}`;
+            
+            logsDiv.appendChild(entry);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+            
+            totalMessages++;
+            updateStats();
+        }
+
+        function updateStats() {
+            document.getElementById('pixelsSet').textContent = pixelsSet;
+            document.getElementById('pixelsReceived').textContent = pixelsReceived;
+            document.getElementById('totalMessages').textContent = totalMessages;
+        }
+
+        function setStatus(status) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = `status ${status}`;
+            
+            const statusText = {
+                'disconnected': '● Disconnected',
+                'connecting': '● Connecting...',
+                'connected': '● Connected'
+            };
+            
+            statusDiv.textContent = statusText[status] || status;
+        }
+
+        function disableButtons(disabled) {
+            document.getElementById('setPixelBtn').disabled = disabled;
+            document.getElementById('getPixelBtn').disabled = disabled;
+            document.getElementById('streamBtn').disabled = disabled;
+        }
+
+        function hexToRgb(hex) {
+            hex = hex.replace('#', '');
+            
+            const r = parseInt(hex.substring(0, 2), 16);
+            const g = parseInt(hex.substring(2, 4), 16);
+            const b = parseInt(hex.substring(4, 6), 16);
+            
+            return { R: r, G: g, B: b };
+        }
+
+        async function connect() {
+            try {
+                log('Initializing SignalR connection to /canvas...', 'info');
+                setStatus('connecting');
+                disableButtons(true);
+
+                connection = new signalR.HubConnectionBuilder()
+                    .withUrl("http://localhost:8080/canvas")
+                    .withAutomaticReconnect()
+                    .configureLogging(signalR.LogLevel.Information)
+                    .build();
+
+                // Register event handlers
+                connection.on("PixelReceived", (pixel) => {
+                    pixelsReceived++;
+                    log(`🎨 Pixel Received: (${pixel.x}, ${pixel.y}) = ${pixel.color.r}, ${pixel.color.g}, ${pixel.color.b}`, 'success');
+                });
+
+                connection.on("PixelUpdated", (response) => {
+                    // Handle both camelCase (r,g,b) and PascalCase (R,G,B) from SignalR
+                    const r = response.color.r ?? response.color.R ?? 0;
+                    const g = response.color.g ?? response.color.G ?? 0;
+                    const b = response.color.b ?? response.color.B ?? 0;
+                    
+                    const colorHex = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`.toUpperCase();
+                    log(`🔄 Pixel Updated: (${response.x}, ${response.y}) = ${colorHex} [R:${r}, G:${g}, B:${b}]`, 'success');
+                });
+
+                connection.on("CanvasStreamComplete", (count) => {
+                    log(`✅ Canvas stream complete: ${count} pixels received`, 'success');
+                });
+
+                connection.on("CanvasStreamFailed", (error) => {
+                    log(`❌ Canvas stream failed: ${error}`, 'error');
+                });
+
+                connection.onreconnecting(() => {
+                    log('⚠️ Connection lost, reconnecting...', 'warn');
+                    setStatus('connecting');
+                    disableButtons(true);
+                });
+
+                connection.onreconnected(() => {
+                    log('✅ Reconnected successfully', 'success');
+                    setStatus('connected');
+                    disableButtons(false);
+                });
+
+                connection.onclose((error) => {
+                    log(`❌ Connection closed: ${error || 'No error details'}`, 'error');
+                    setStatus('disconnected');
+                    disableButtons(true);
+                });
+
+                // Start connection
+                await connection.start();
+                log('✅ Connected successfully to CanvasHub', 'success');
+                setStatus('connected');
+                disableButtons(false);
+
+            } catch (error) {
+                log(`❌ Connection failed: ${error.message}`, 'error');
+                setStatus('disconnected');
+                disableButtons(true);
+            }
+        }
+
+        async function setPixel() {
+            const x = parseInt(document.getElementById('xInput').value);
+            const y = parseInt(document.getElementById('yInput').value);
+            const color = document.getElementById('colorInput').value;
+
+            if (isNaN(x) || isNaN(y)) {
+                log('❌ Invalid X or Y coordinate', 'error');
+                return;
+            }
+
+            if (!color || !color.match(/^#[0-9A-Fa-f]{6}$/)) {
+                log('❌ Invalid color format. Use hex format like #FF0000', 'error');
+                return;
+            }
+
+            try {
+                log(`📤 Setting pixel (${x}, ${y}) to ${color}...`, 'info');
+
+                const rgb = hexToRgb(color);
+                log(`   Converting ${color} to RGB(${rgb.R}, ${rgb.G}, ${rgb.B})`, 'info');
+
+                await connection.invoke("SetPixel", {
+                    x: x,
+                    y: y,
+                    color: rgb
+                });
+                
+                pixelsSet++;
+                log(`✅ Pixel set successfully: (${x}, ${y}) = ${color}`, 'success');
+                updateStats();
+
+            } catch (error) {
+                log(`❌ Failed to set pixel: ${error.message}`, 'error');
+            }
+        }
+
+        async function getPixel() {
+            const x = parseInt(document.getElementById('xInput').value);
+            const y = parseInt(document.getElementById('yInput').value);
+
+            if (isNaN(x) || isNaN(y)) {
+                log('❌ Invalid X or Y coordinate', 'error');
+                return;
+            }
+
+            try {
+                log(`📤 Getting pixel (${x}, ${y})...`, 'info');
+                
+                const result = await connection.invoke("GetPixel", {
+                    x: x,
+                    y: y
+                });
+                
+                if (result.success) {
+                    log(`✅ Pixel retrieved: (${result.x}, ${result.y}) = [${result.color.r}, ${result.color.g}, ${result.color.b}]`, 'success');
+                } else {
+                    log(`⚠️ Pixel not found: ${result.errorMessage}`, 'warn');
+                }
+
+            } catch (error) {
+                log(`❌ Failed to get pixel: ${error.message}`, 'error');
+            }
+        }
+
+        async function streamCanvas() {
+            try {
+                log(`📤 Requesting canvas stream...`, 'info');
+                log(`⏳ Streaming canvas data (may take a while for large canvases)...`, 'info');
+                
+                await connection.invoke("StreamCanvas");
+                
+            } catch (error) {
+                log(`❌ Failed to stream canvas: ${error.message}`, 'error');
+            }
+        }
+
+        function clearLogs() {
+            document.getElementById('logs').innerHTML = '';
+            log('Logs cleared', 'info');
+        }
+
+        // Auto-connect on page load
+        window.addEventListener('load', () => {
+            log('🚀 WebCanvas Debug Tool initialized', 'info');
+            connect();
+        });
+
+        // Handle Enter key in input fields
+        document.addEventListener('DOMContentLoaded', () => {
+            const inputs = [
+                document.getElementById('xInput'),
+                document.getElementById('yInput'),
+                document.getElementById('colorInput')
+            ];
+
+            inputs.forEach(input => {
+                input.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        setPixel();
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>

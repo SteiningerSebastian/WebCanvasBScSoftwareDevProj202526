@@ -141,6 +141,8 @@ builder.Services.AddHttpLogging();
 
 var app = builder.Build();
 
+app.UseDefaultFiles();
+
 app.UseCors("SignalRPolicy");
 
 // Enable HTTP logging
@@ -156,6 +158,7 @@ app.MapHub<CanvasHub>("/canvas").RequireCors("SignalRPolicy");
 
 // Health check endpoint
 app.MapGet("/health", () => "WebCanvas is running.");
-app.MapGet("/", () => Results.Redirect("/index.html"));
+
+app.MapFallbackToFile("index.html");
 
 app.Run();
